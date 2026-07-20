@@ -153,7 +153,12 @@ impl CertificateAuthority {
             .map(|s| san_for_name(s))
             .collect::<Result<Vec<_>>>()?;
 
-        params.distinguished_name = build_dn(common_name, &self.organization, &self.country);
+        // The X.509 CommonName is limited to 64 characters (ub-common-name).
+        // A deep host used as the base can exceed that; the CN is cosmetic
+        // (clients validate against the SANs), so clamp it to the longest
+        // trailing label sequence that fits rather than fail issuance.
+        let cn = clamp_common_name(common_name);
+        params.distinguished_name = build_dn(cn, &self.organization, &self.country);
 
         let now = OffsetDateTime::now_utc();
         params.not_before = now - Duration::hours(1); // tolerate minor clock skew
@@ -187,6 +192,38 @@ pub struct IssuedCertificate {
     pub chain_pem: String,
     /// PEM PKCS#8 private key for on-disk persistence.
     pub key_pem: String,
+}
+
+/// The X.509 `ub-common-name` upper bound (RFC 5280): a CommonName may be at
+/// most 64 characters.
+const MAX_COMMON_NAME_LEN: usize = 64;
+
+/// Clamp a host to a valid CommonName. Names within the limit pass through; an
+/// over-long host is trimmed from the left on a label boundary to the longest
+/// trailing suffix that fits (so the CN stays a real, recognizable domain
+/// suffix). Falls back to a hard byte-truncation only if a single label is
+/// itself longer than the limit. The CN is cosmetic — clients validate the SANs.
+fn clamp_common_name(host: &str) -> &str {
+    if host.len() <= MAX_COMMON_NAME_LEN {
+        return host;
+    }
+    let mut cur = host;
+    while cur.len() > MAX_COMMON_NAME_LEN {
+        match cur.split_once('.') {
+            Some((_, rest)) => cur = rest,
+            None => break,
+        }
+    }
+    if cur.len() <= MAX_COMMON_NAME_LEN {
+        cur
+    } else {
+        // A single label longer than 64 chars: truncate on a char boundary.
+        let mut end = MAX_COMMON_NAME_LEN;
+        while !cur.is_char_boundary(end) {
+            end -= 1;
+        }
+        &cur[..end]
+    }
 }
 
 /// Build a distinguished name, omitting empty organization/country fields.
@@ -234,4 +271,41 @@ fn write_private_key(path: &Path, pem: &str) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_name_within_limit_passes_through() {
+        assert_eq!(clamp_common_name("b.a.example.com"), "b.a.example.com");
+        let exactly_64 = "a".repeat(60) + ".com"; // 64 chars
+        assert_eq!(exactly_64.len(), 64);
+        assert_eq!(clamp_common_name(&exactly_64), exactly_64);
+    }
+
+    #[test]
+    fn over_long_host_is_trimmed_to_a_label_boundary() {
+        // Many short labels then a registrable domain; the CN should drop leading
+        // labels until it fits, staying a valid domain suffix (<= 64).
+        let host = format!("{}.example.com", vec!["sub"; 30].join("."));
+        assert!(host.len() > MAX_COMMON_NAME_LEN);
+        let cn = clamp_common_name(&host);
+        assert!(cn.len() <= MAX_COMMON_NAME_LEN);
+        assert!(
+            host.ends_with(cn),
+            "CN must be a trailing suffix of the host"
+        );
+        // Trimmed on a label boundary → still ends at "example.com".
+        assert!(cn.ends_with("example.com"));
+        assert!(!cn.starts_with('.'));
+    }
+
+    #[test]
+    fn single_over_long_label_is_hard_truncated() {
+        let label = "x".repeat(100);
+        let cn = clamp_common_name(&label);
+        assert_eq!(cn.len(), MAX_COMMON_NAME_LEN);
+    }
 }

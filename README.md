@@ -72,6 +72,53 @@ target; it only sets the upstream TLS server name for `tls`/`ech`. A connection
 routed to a reflecting route that carries no SNI/Host is closed (there is
 nothing to reflect).
 
+## Certificate issuance modes
+
+Every per-SNI leaf is anchored at the **registrable domain**, so one
+`certs/<registrable>.crt` serves a whole domain and `[issuance] mode` chooses how
+much of it a request contributes. For an inbound SNI of `b.a.example.com`
+(registrable `example.com`):
+
+| `mode`     | key (`certs/<key>.crt`) | names this host contributes                          |
+|------------|-------------------------|------------------------------------------------------|
+| `exact`    | `example.com`           | `b.a.example.com`                                     |
+| `wildcard` | `example.com`           | `*.a.example.com`                                     |
+| `ladder`   | `example.com`           | `*.a.example.com`, `*.example.com`, `example.com`     |
+
+The only wildcard that usefully covers a host `H` is `*.parent(H)` — `*.H` would
+cover subdomains a leaf host usually never has. So a level's `*.X` wildcard is
+emitted **only when some accessed host actually has `X` as its parent**: a CDN
+leaf like `rr5.googlevideo.com` never yields the useless `*.rr5.googlevideo.com`.
+`wildcard` contributes just the parent wildcard (host + siblings); `ladder`
+contributes the whole ancestor chain (host, every ancestor domain, and their
+siblings). `exact` contributes only the bare host.
+
+**One certificate per registrable domain, accumulating, never re-signed for a
+name it already covers.** Before signing, the resolver checks whether the anchor's
+cached/persisted certificate already covers the host; if so it is reused. If not,
+the host's names are **merged** into it and it is re-issued — so siblings
+(`c.a.example.com`, `www.example.com`, …) and even deeper new branches all fold
+into the one `example.com.crt` rather than each minting a redundant leaf. All
+modes share one `certs/` directory and switching modes is seamless (a certificate
+that does not cover the host is just re-issued). Leaves stay small — bounded by
+the distinct sub-hierarchies actually seen.
+
+The registrable domain is computed from the public-suffix list's **ICANN section
+only**. Real registry suffixes (`co.uk`, `co.jp`) remain boundaries, so `*.co.jp`
+is never issued; private-section entries (`github.io`, `withgoogle.com`) are
+treated as ordinary registrable domains, so `csp.withgoogle.com` is served by
+`withgoogle.com.crt` (`{*.withgoogle.com, withgoogle.com}`). IP literals and hosts
+with no registrable domain always fall back to `exact`. The wildcard is never
+lifted above the registrable domain, so `*.com` can never be produced.
+
+```toml
+[issuance]
+mode = "wildcard"   # exact | wildcard | ladder
+```
+
+The legacy boolean `wildcard = true|false` is still accepted (`true` → `wildcard`,
+`false` → `exact`) and is ignored when `mode` is set.
+
 ## Hierarchical configuration
 
 Overridable settings resolve from the most specific scope outward, with each

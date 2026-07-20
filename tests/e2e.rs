@@ -10,6 +10,9 @@
 //!     reflected as the dial target, with the configured port.
 //!   * named template: a route that carries only `match_sni` + `use` inherits
 //!     its `type`/`upstream` from a `[templates.*]` bundle and still works.
+//!   * ladder issuance: `[issuance] mode = "ladder"` anchors one leaf at the
+//!     registrable domain (compact ancestor-wildcard SANs); a sibling reuses it
+//!     with no second signature, persisted as a single `certs/<registrable>.crt`.
 //!   * WebSocket-style half-close: a request that half-closes still receives a
 //!     full response back (the regression fixed in the proxy splice).
 
@@ -206,6 +209,92 @@ addr = "127.0.0.1:{listen}"
 }
 
 #[test]
+fn ladder_issuance_mode_end_to_end() {
+    // `[issuance] mode = "ladder"` anchors ONE certificate at the registrable
+    // domain, covering the ancestor chain with compact parent wildcards (no
+    // useless `*.leaf`). Prove end-to-end: a deep-SNI handshake succeeds and the
+    // leaf carries the compact ladder; a sibling reuses it with no second
+    // signature; a deeper new branch is MERGED into the same certificate; and it
+    // is persisted as a single `certs/<registrable>.crt` (no per-host file, no
+    // mode subdirectory).
+    let dir = tempdir();
+    let (backend, _bh) = spawn_mock_backend();
+    let listen = free_port();
+    let config = format!(
+        r#"
+[global]
+resolver = "system"
+unmatched = "close"
+[ca]
+cert_path = "ca/ca.crt"
+key_path = "ca/ca.key"
+common_name = "E2E CA"
+leaf_validity_days = 90
+[issuance]
+mode = "ladder"
+[store]
+enabled = true
+dir = "certs"
+renew_margin_days = 30
+[cache.psl]
+source = "embedded"
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "web"
+  type = "http"
+  match_sni = [".deep.example"]
+  upstream = "127.0.0.1:{backend}"
+"#
+    );
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    let ca_path = dir.path().join("ca").join("ca.crt");
+    let sans = drive_tls_collect_sans(listen, &ca_path, "b.a.deep.example");
+    // Compact ladder anchored at the registrable domain (deep.example): a
+    // wildcard per ancestor level plus the bare apex — and crucially NO
+    // `*.b.a.deep.example` leaf wildcard.
+    let mut got = sans.clone();
+    got.sort();
+    let mut want = vec!["*.a.deep.example", "*.deep.example", "deep.example"];
+    want.sort();
+    assert_eq!(got, want, "unexpected ladder SANs");
+    assert!(
+        !sans.iter().any(|s| s == "*.b.a.deep.example"),
+        "must not emit the useless leaf wildcard"
+    );
+
+    // A sibling under the same registrable domain reuses the SAME certificate
+    // (covered by *.a.deep.example): its handshake succeeds, no re-sign.
+    drive_tls_http(listen, &ca_path, "c.a.deep.example");
+
+    // A deeper, previously-uncovered branch is merged into the SAME cert file:
+    // after it, the leaf carries both `*.a.deep.example` and `*.x.deep.example`.
+    let merged = drive_tls_collect_sans(listen, &ca_path, "q.x.deep.example");
+    for expected in ["*.a.deep.example", "*.x.deep.example", "*.deep.example"] {
+        assert!(
+            merged.iter().any(|s| s == expected),
+            "expected accumulated SAN {expected:?}, got {merged:?}"
+        );
+    }
+
+    // Exactly one certificate, keyed by the registrable domain, directly under
+    // `certs/` (no per-host file, no mode subdirectory).
+    let certs_dir = dir.path().join("certs");
+    let crt_files: Vec<_> = std::fs::read_dir(&certs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n.ends_with(".crt"))
+        .collect();
+    assert_eq!(
+        crt_files,
+        vec!["deep.example.crt".to_string()],
+        "expected a single registrable-anchored cert, got {crt_files:?}"
+    );
+}
+
+#[test]
 fn template_supplies_type_and_upstream_end_to_end() {
     // A `[templates.web]` provides `type` and `upstream`; the route carries only
     // `match_sni` + `use`. Proves templates flow through the real binary and its
@@ -289,6 +378,70 @@ fn drive_tls_http(listen: u16, ca_path: &std::path::Path, sni: &'static str) {
         let resp = String::from_utf8_lossy(&resp);
         assert!(resp.contains("200 OK"), "TLS route response: {resp:?}");
     });
+}
+
+/// Connect over TLS presenting `sni` (trusting the CA at `ca_path`), complete
+/// the handshake, and return the DNS SANs of the leaf the gateway issued. Proves
+/// the issuance mode's coverage against the real, signed certificate.
+fn drive_tls_collect_sans(
+    listen: u16,
+    ca_path: &std::path::Path,
+    sni: &'static str,
+) -> Vec<String> {
+    use std::sync::Arc;
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::TlsConnector;
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+
+    for _ in 0..100 {
+        if ca_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ca_pem = std::fs::read(ca_path).expect("CA cert generated");
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen))
+            .await
+            .unwrap();
+        let name = ServerName::try_from(sni).unwrap();
+        let tls = connector
+            .connect(name, tcp)
+            .await
+            .expect("TLS handshake (cert issued + trusted)");
+
+        let leaf = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .expect("server presented a leaf certificate")
+            .clone();
+
+        let (_, cert) = X509Certificate::from_der(leaf.as_ref()).expect("parse leaf DER");
+        let mut out = Vec::new();
+        if let Ok(Some(san)) = cert.subject_alternative_name() {
+            for gn in &san.value.general_names {
+                if let GeneralName::DNSName(d) = gn {
+                    out.push((*d).to_string());
+                }
+            }
+        }
+        out
+    })
 }
 
 /// Minimal temp-dir helper (avoids a dev-dependency).

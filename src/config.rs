@@ -436,16 +436,52 @@ pub struct CaConfig {
     pub install_to_system_root: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IssuanceConfig {
-    #[serde(default = "default_true")]
-    pub wildcard: bool,
+/// What set of names a per-SNI leaf certificate should cover. Evaluated against
+/// the registrable domain via the public-suffix list; IP literals and hosts with
+/// no registrable domain always fall back to [`IssuanceMode::Exact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IssuanceMode {
+    /// Only the requested host itself — no wildcard.
+    Exact,
+    /// The host and its direct subdomains: `{host, *.host}`. The default.
+    #[default]
+    Wildcard,
+    /// The host and every ancestor domain up to the registrable domain, each
+    /// with its single-level wildcard (e.g. `b.a.example.com` →
+    /// `{b.a.example.com, *.b.a.example.com, a.example.com, *.a.example.com,
+    /// example.com, *.example.com}`).
+    Ladder,
 }
 
-impl Default for IssuanceConfig {
-    fn default() -> Self {
-        Self { wildcard: true }
+/// Per-SNI issuance policy. Prefer `mode`; the boolean `wildcard` is retained
+/// for backward compatibility (`true` → `wildcard`, `false` → `exact`) and is
+/// ignored when `mode` is set explicitly.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuanceConfig {
+    /// Name-coverage mode. When unset, derived from `wildcard` for back-compat.
+    #[serde(default)]
+    pub mode: Option<IssuanceMode>,
+
+    /// Legacy switch. `None` (unset) keeps the default; `Some(true/false)` maps
+    /// to `wildcard`/`exact` only when `mode` is not given.
+    #[serde(default)]
+    pub wildcard: Option<bool>,
+}
+
+impl IssuanceConfig {
+    /// The effective issuance mode, resolving `mode` first and otherwise the
+    /// legacy `wildcard` flag, defaulting to [`IssuanceMode::Wildcard`].
+    pub fn resolved_mode(&self) -> IssuanceMode {
+        if let Some(m) = self.mode {
+            return m;
+        }
+        match self.wildcard {
+            Some(true) => IssuanceMode::Wildcard,
+            Some(false) => IssuanceMode::Exact,
+            None => IssuanceMode::default(),
+        }
     }
 }
 
@@ -1628,6 +1664,28 @@ addr = "0.0.0.0:443"
 "#,
         );
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn issuance_mode_resolution_and_backcompat() {
+        // Explicit mode wins.
+        let c: IssuanceConfig = toml::from_str(r#"mode = "ladder""#).unwrap();
+        assert_eq!(c.resolved_mode(), IssuanceMode::Ladder);
+        // Explicit mode wins even if the legacy flag disagrees.
+        let c: IssuanceConfig = toml::from_str(
+            r#"mode = "exact"
+wildcard = true"#,
+        )
+        .unwrap();
+        assert_eq!(c.resolved_mode(), IssuanceMode::Exact);
+        // Legacy flag maps: true → wildcard, false → exact.
+        let c: IssuanceConfig = toml::from_str(r#"wildcard = true"#).unwrap();
+        assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
+        let c: IssuanceConfig = toml::from_str(r#"wildcard = false"#).unwrap();
+        assert_eq!(c.resolved_mode(), IssuanceMode::Exact);
+        // Neither set → default is wildcard.
+        let c = IssuanceConfig::default();
+        assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
     }
 
     #[test]

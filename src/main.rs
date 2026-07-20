@@ -123,6 +123,8 @@ async fn run(cfg: Config) -> Result<()> {
     let suffix = psl_source::load(&cfg.cache.psl).context("initializing public suffix list")?;
     psl_source::spawn_refresher(&cfg.cache.psl, suffix.clone());
 
+    let issuance_mode = cfg.issuance.resolved_mode();
+
     let store = if cfg.store.enabled {
         let s = CertStore::new(cfg.store.dir.clone(), cfg.store.renew_margin_days);
         s.init().context("initializing certificate store")?;
@@ -135,7 +137,7 @@ async fn run(cfg: Config) -> Result<()> {
         ca,
         suffix,
         store,
-        wildcard: cfg.issuance.wildcard,
+        mode: issuance_mode,
         cache_capacity: cfg.cache.capacity,
         cache_ttl: Duration::from_secs(cfg.cache.ttl_secs),
     }));

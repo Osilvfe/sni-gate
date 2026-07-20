@@ -1,9 +1,13 @@
 //! On-disk persistence of issued certificates.
 //!
 //! Each certificate is stored as a `<base>.crt` (PEM chain, leaf first) and a
-//! `<base>.key` (PEM PKCS#8 private key) pair, keyed by the wildcard base name.
-//! Because a base is a registrable domain or a subdomain (never a wildcard or
-//! IP with path-unsafe characters), it maps directly to a safe file stem.
+//! `<base>.key` (PEM PKCS#8 private key) pair, keyed by the certificate base —
+//! the coverage anchor (the registrable domain in `ladder` mode, else the host).
+//! A base is always a plain name (never a wildcard or path-unsafe IP), so it maps
+//! directly to a safe file stem. All modes share one directory: a stored
+//! certificate is only reused when it actually covers the requested host (see
+//! [`crate::suffix::host_covered_by`]), so a mode switch can never serve a
+//! certificate whose coverage no longer fits — it is simply re-issued.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +27,9 @@ pub struct StoredCertificate {
     pub chain: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
     pub not_after: OffsetDateTime,
+    /// The leaf's subject alternative names, used to decide whether this
+    /// certificate covers the requested host before reusing it.
+    pub sans: Vec<String>,
 }
 
 impl CertStore {
@@ -81,13 +88,14 @@ impl CertStore {
             .context("parsing persisted private key")?
             .context("persisted key file contains no private key")?;
 
-        let not_after =
-            leaf_not_after(&chain[0]).context("reading persisted certificate expiry")?;
+        let (not_after, sans) =
+            leaf_metadata(&chain[0]).context("reading persisted certificate metadata")?;
 
         Ok(StoredCertificate {
             chain,
             key,
             not_after,
+            sans,
         })
     }
 
@@ -106,13 +114,48 @@ impl CertStore {
     }
 }
 
-/// Extract the `notAfter` time from a DER-encoded certificate.
-fn leaf_not_after(der: &CertificateDer<'_>) -> Result<OffsetDateTime> {
-    use x509_parser::prelude::FromDer;
+/// Extract the `notAfter` time and the DNS/IP subject-alternative-names from a
+/// DER-encoded certificate, so a reload knows both when it expires and which
+/// hosts it covers.
+fn leaf_metadata(der: &CertificateDer<'_>) -> Result<(OffsetDateTime, Vec<String>)> {
+    use x509_parser::prelude::{FromDer, GeneralName};
     let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
         .map_err(|e| anyhow::anyhow!("parsing certificate DER: {e}"))?;
+
     let ts = cert.validity().not_after.timestamp();
-    OffsetDateTime::from_unix_timestamp(ts).context("certificate notAfter out of range")
+    let not_after =
+        OffsetDateTime::from_unix_timestamp(ts).context("certificate notAfter out of range")?;
+
+    let mut sans = Vec::new();
+    if let Ok(Some(ext)) = cert.subject_alternative_name() {
+        for gn in &ext.value.general_names {
+            match gn {
+                GeneralName::DNSName(d) => sans.push((*d).to_string()),
+                GeneralName::IPAddress(bytes) => {
+                    if let Some(ip) = ip_from_bytes(bytes) {
+                        sans.push(ip);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((not_after, sans))
+}
+
+/// Render a SAN IP-address octet string (4 or 16 bytes) back to its textual form.
+fn ip_from_bytes(bytes: &[u8]) -> Option<String> {
+    match bytes.len() {
+        4 => {
+            let a: [u8; 4] = bytes.try_into().ok()?;
+            Some(std::net::Ipv4Addr::from(a).to_string())
+        }
+        16 => {
+            let a: [u8; 16] = bytes.try_into().ok()?;
+            Some(std::net::Ipv6Addr::from(a).to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Atomically write `bytes` to `path` via a temporary file + rename.

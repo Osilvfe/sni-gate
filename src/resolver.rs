@@ -19,8 +19,9 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 use crate::ca::CertificateAuthority;
+use crate::config::IssuanceMode;
 use crate::store::CertStore;
-use crate::suffix::SuffixList;
+use crate::suffix::{host_covered_by, SuffixList};
 
 /// Resolves a server certificate per SNI, issuing on demand and caching the
 /// result by wildcard base name.
@@ -36,12 +37,19 @@ impl std::fmt::Debug for DynamicResolver {
     }
 }
 
+/// A cached certificate plus the names it covers, so a sibling host can reuse it
+/// (via [`host_covered_by`]) instead of triggering a redundant signature.
+struct CachedCert {
+    certified: Arc<CertifiedKey>,
+    sans: Arc<[String]>,
+}
+
 struct Inner {
     ca: CertificateAuthority,
     suffix: Arc<SuffixList>,
     store: Option<CertStore>,
-    wildcard: bool,
-    cache: moka::sync::Cache<String, Arc<CertifiedKey>>,
+    mode: IssuanceMode,
+    cache: moka::sync::Cache<String, Arc<CachedCert>>,
     /// Per-base locks providing single-flight issuance.
     locks: moka::sync::Cache<String, Arc<std::sync::Mutex<()>>>,
 }
@@ -51,7 +59,7 @@ pub struct ResolverParams {
     pub ca: CertificateAuthority,
     pub suffix: Arc<SuffixList>,
     pub store: Option<CertStore>,
-    pub wildcard: bool,
+    pub mode: IssuanceMode,
     pub cache_capacity: u64,
     pub cache_ttl: Duration,
 }
@@ -71,54 +79,78 @@ impl DynamicResolver {
                 ca: params.ca,
                 suffix: params.suffix,
                 store: params.store,
-                wildcard: params.wildcard,
+                mode: params.mode,
                 cache,
                 locks,
             }),
         }
     }
 
-    /// Return a certificate for `sni_host`, from cache, disk, or fresh issuance.
+    /// Return a certificate valid for `sni_host`, reusing the registrable
+    /// domain's cached or persisted certificate whenever it already covers the
+    /// host. On a miss, the host's required names are **merged** into that
+    /// certificate and it is re-issued, so one `<registrable>.crt` accumulates
+    /// coverage for the whole domain and an already-covered host is never
+    /// re-signed.
     fn get_or_issue(&self, sni_host: &str) -> anyhow::Result<Arc<CertifiedKey>> {
         let inner = &self.inner;
 
-        // Compute the wildcard base (or exact name when wildcards are off).
-        let certificand = if inner.wildcard {
-            inner.suffix.wildcard_base(sni_host)
-        } else {
-            crate::suffix::Certificand::exact(sni_host)
-        };
+        // Plan the anchor (cache/store key = registrable domain) and the names
+        // this host needs. `host` is the normalized SNI we check coverage for.
+        let certificand = inner.suffix.plan(sni_host, inner.mode);
         let base = certificand.base.clone();
+        let host = sni_host.trim_end_matches('.').to_ascii_lowercase();
 
         if let Some(existing) = inner.cache.get(&base) {
-            return Ok(existing);
+            if host_covered_by(&existing.sans[..], &host) {
+                return Ok(existing.certified.clone());
+            }
         }
 
-        // Single-flight: only one task issues for a given base at a time.
+        // Single-flight: only one task issues for a given anchor at a time.
         let lock = inner
             .locks
             .get_with(base.clone(), || Arc::new(std::sync::Mutex::new(())));
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Another task may have populated the cache while we waited.
-        if let Some(existing) = inner.cache.get(&base) {
-            return Ok(existing);
-        }
+        // Seed the accumulator from the freshest prior coverage for this anchor
+        // (cache, else the on-disk store), so re-issuance never drops names the
+        // certificate already covered.
+        let mut sans: Vec<String> = Vec::new();
 
-        // Try the on-disk store before signing anew.
-        if let Some(store) = &inner.store {
+        if let Some(existing) = inner.cache.get(&base) {
+            if host_covered_by(&existing.sans[..], &host) {
+                return Ok(existing.certified.clone());
+            }
+            sans = existing.sans.to_vec();
+        } else if let Some(store) = &inner.store {
             if let Some(stored) = store.load(&base) {
-                let key = any_ecdsa_type(&stored.key)
-                    .map_err(|e| anyhow::anyhow!("loading persisted key for {base}: {e}"))?;
-                let certified = Arc::new(CertifiedKey::new(stored.chain, key));
-                inner.cache.insert(base.clone(), certified.clone());
-                tracing::info!(base = %base, "loaded certificate from store");
-                return Ok(certified);
+                if host_covered_by(&stored.sans, &host) {
+                    let key = any_ecdsa_type(&stored.key)
+                        .map_err(|e| anyhow::anyhow!("loading persisted key for {base}: {e}"))?;
+                    let certified = Arc::new(CertifiedKey::new(stored.chain, key));
+                    inner.cache.insert(
+                        base.clone(),
+                        Arc::new(CachedCert {
+                            certified: certified.clone(),
+                            sans: stored.sans.into(),
+                        }),
+                    );
+                    tracing::info!(base = %base, "loaded certificate from store");
+                    return Ok(certified);
+                }
+                sans = stored.sans;
             }
         }
 
-        // Issue fresh.
-        let issued = inner.ca.issue(&base, &certificand.sans)?;
+        // Merge in this host's required names (dedup) and (re)issue the anchor.
+        for name in &certificand.sans {
+            if !sans.iter().any(|s| s == name) {
+                sans.push(name.clone());
+            }
+        }
+
+        let issued = inner.ca.issue(&base, &sans)?;
         let key = any_ecdsa_type(&PrivateKeyDer::Pkcs8(issued.key_der.clone().into()))
             .map_err(|e| anyhow::anyhow!("loading issued key for {base}: {e}"))?;
         let certified = Arc::new(CertifiedKey::new(issued.chain.clone(), key));
@@ -130,8 +162,14 @@ impl DynamicResolver {
             }
         }
 
-        inner.cache.insert(base.clone(), certified.clone());
-        tracing::info!(base = %base, sans = ?certificand.sans, "issued certificate");
+        tracing::info!(base = %base, sans = ?sans, "issued certificate");
+        inner.cache.insert(
+            base,
+            Arc::new(CachedCert {
+                certified: certified.clone(),
+                sans: sans.into(),
+            }),
+        );
         Ok(certified)
     }
 }
