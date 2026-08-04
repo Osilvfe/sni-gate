@@ -315,11 +315,9 @@ fn build_route(
     let (host, port) = config::resolved_upstream_from(upstream_spec, listener.addr.port())
         .ok_or_else(|| anyhow::anyhow!("route {}: invalid upstream", route.label()))?;
 
-    // SNI presented upstream: route → template (deeper wins).
-    let override_sni = route
-        .override_sni
-        .clone()
-        .or_else(|| rt_tpl.and_then(|t| t.override_sni.clone()));
+    // SNI presented upstream: route → template (deeper wins). A present-but-blank
+    // value means "send no SNI extension" rather than "inherit".
+    let sni_policy = route.sni_policy(rt_tpl);
 
     // NAT64 disabled in ipv6-only mode.
     let nat64 = match (&eff.nat64_prefix, eff.address_family) {
@@ -343,6 +341,9 @@ fn build_route(
             eff_ech.clone(),
             port,
             eff.require_ech,
+            // RFC 9849 permits an inner hello with no SNI; `override_sni = ""`
+            // asks for exactly that.
+            sni_policy != config::SniPolicy::Omit,
             ech_resolver,
             root_store.clone(),
             eff.ech_refresh,
@@ -384,7 +385,7 @@ fn build_route(
         route_type,
         upstream_host: host,
         upstream_port: port,
-        override_sni,
+        sni_policy,
         http2: eff_http2.enabled,
         require_ech: eff.require_ech,
         max_retries: eff_ech.max_retries,

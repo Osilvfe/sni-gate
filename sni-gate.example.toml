@@ -146,7 +146,14 @@ connect_timeout = "5s"
   type = "ech"
   match_sni = [".site-a.example"]    # exact | *.x | .x (suffix) | ~regex
   upstream = "edge.example:443"
-  # override_sni = "real.inner.example" # inner (protected) SNI; unset = inbound SNI
+  # override_sni: inner (protected) SNI for ech, upstream SNI for tls.
+  #   (omitted)  reflect the inbound SNI verbatim
+  #   "name"     send exactly that name
+  #   ""         send NO SNI extension at all (RFC 9849 §5 allows a
+  #              ClientHelloInner with no SNI; for ech the ECHConfig public name
+  #              is still sent in the outer hello). The upstream certificate is
+  #              still verified against the name that would have been sent.
+  # override_sni = "real.inner.example"
   # nat64_prefix / addr_resolver / ech_resolver may be set here, per route.
 
     [listener.route.ech]
@@ -174,6 +181,16 @@ connect_timeout = "5s"
   match_sni = ["*.direct.example"]
   upstream = "127.0.0.1:8866"
   override_sni = "backend.internal"
+
+  # Plain TLS upstream with NO SNI sent (override_sni = ""). Useful for a backend
+  # addressed by IP, or one that keys only off the certificate it serves. The
+  # upstream cert is still verified against the reflected inbound name.
+  [[listener.route]]
+  name = "no-sni"
+  type = "tls"
+  match_sni = ["*.nosni.example"]
+  upstream = "127.0.0.1:8867"
+  override_sni = ""
 
   # Cleartext HTTP upstream.
   [[listener.route]]

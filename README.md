@@ -48,9 +48,32 @@ It merges two capabilities:
 | `http` | (cleartext in)          | yes (if TLS) | cleartext HTTP                   | h2 in → h2c out           |
 | `raw`  | no                      | no           | bare TCP byte-pump               | n/a (never terminates)    |
 
-`override_sni` works for **all** terminating types: unset = use the inbound SNI
-verbatim; set = force that name. For `ech` it is the inner (protected) name; for
-`tls` it is the SNI presented to the upstream.
+`override_sni` works for **all** terminating types. For `ech` it is the inner
+(protected) name; for `tls` it is the SNI presented to the upstream:
+
+| `override_sni`  | SNI sent upstream                        |
+|-----------------|------------------------------------------|
+| *(omitted)*     | the inbound SNI verbatim                 |
+| `"name"`        | exactly `name`                           |
+| `""`            | **none** — no `server_name` extension    |
+
+The empty string is deliberately distinct from omitting the field: it suppresses
+the extension entirely. That is useful for an upstream addressed by IP or one
+that keys only off the certificate it serves, and for ECH, where [RFC 9849 §5]
+explicitly allows a ClientHelloInner to carry no SNI. With ECH the ECHConfig's
+public name is still sent in the *outer* hello (the client-facing server needs
+it); only the protected inner hello omits its `server_name`.
+
+Suppressing SNI changes what is **transmitted**, not what is **trusted**: the
+upstream certificate is still verified against the name the route would otherwise
+have sent (the fixed name, or the reflected inbound one). An `ech` route with
+`override_sni = ""` on a connection that carries no SNI/Host therefore has no
+inner name to verify against and is closed.
+
+Because resolution keys on *presence*, a route can blank out a name inherited
+from its template with `override_sni = ""`.
+
+[RFC 9849 §5]: https://www.rfc-editor.org/rfc/rfc9849.html#section-5
 
 ## Upstream address
 

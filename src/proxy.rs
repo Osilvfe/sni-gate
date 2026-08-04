@@ -44,7 +44,7 @@ use tokio::time::timeout;
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
-use crate::config::{AddressFamily, FailPolicy, RouteType};
+use crate::config::{AddressFamily, FailPolicy, RouteType, SniPolicy};
 use crate::dns::resolve_upstream;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
@@ -61,7 +61,9 @@ pub struct RouteRuntime {
     /// (the port-stripped routing key) per connection.
     pub upstream_host: Option<String>,
     pub upstream_port: u16,
-    pub override_sni: Option<String>,
+    /// What SNI to present upstream: reflect the inbound name, force a fixed
+    /// one, or send no `server_name` extension at all.
+    pub sni_policy: SniPolicy,
     /// Allow HTTP/2 on this route. Always false for `raw`.
     pub http2: bool,
     pub require_ech: bool,
@@ -156,10 +158,12 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, state: &ListenerState) ->
     };
     let rt = &state.routes[id];
 
-    // Effective inner/override name: explicit override_sni, else the inbound key.
-    let sni = match rt.override_sni.as_deref() {
-        Some(fixed) => Some(fixed.to_string()),
-        None => key.map(strip_port),
+    // Effective inner/override name. This is the name the upstream certificate
+    // is verified against, so `Omit` still resolves one (the inbound key) — the
+    // policy only decides whether it is *transmitted* as an SNI extension.
+    let sni = match &rt.sni_policy {
+        SniPolicy::Fixed(fixed) => Some(fixed.clone()),
+        SniPolicy::Reflect | SniPolicy::Omit => key.map(strip_port),
     };
 
     // Effective dial host: the fixed upstream host, else the matched source
@@ -333,8 +337,14 @@ async fn serve_mirrored(
             dial_tls(upstream_addr, &name, rt, &client_offer).await?
         }
         RouteType::Ech => {
+            // An inner name is required even when it will not be *sent*: it is
+            // what the upstream certificate is verified against.
             let inner = sni.clone().ok_or_else(|| {
-                anyhow!("ech route {} has no SNI/Host and no override_sni", rt.name)
+                anyhow!(
+                    "ech route {}: the connection carried no SNI/Host to use as \
+                     the inner name, and no override_sni supplies one",
+                    rt.name
+                )
             })?;
             dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
         }
@@ -418,8 +428,14 @@ where
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Ech => {
+            // An inner name is required even when it will not be *sent*: it is
+            // what the upstream certificate is verified against.
             let inner = sni.clone().ok_or_else(|| {
-                anyhow!("ech route {} has no SNI/Host and no override_sni", rt.name)
+                anyhow!(
+                    "ech route {}: the connection carried no SNI/Host to use as \
+                     the inner name, and no override_sni supplies one",
+                    rt.name
+                )
             })?;
             let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
             splice(inbound, up, rt.idle_timeout).await
@@ -440,6 +456,11 @@ async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> 
 
 /// Dial a plain-TLS upstream, verifying the presented `server_name` and offering
 /// `alpn` (empty = no ALPN extension).
+///
+/// `server_name` is always used to **verify** the upstream certificate. Whether
+/// it is also **sent** as an SNI extension depends on the route's
+/// [`SniPolicy`]: `Omit` clears `enable_sni`, so the handshake carries no
+/// `server_name` while the certificate is still checked against that name.
 async fn dial_tls(
     addr: SocketAddr,
     server_name: &str,
@@ -448,6 +469,9 @@ async fn dial_tls(
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut config = plain_tls_config(rt.root_store.clone());
     config.alpn_protocols = alpn.to_vec();
+    if rt.sni_policy == SniPolicy::Omit {
+        config.enable_sni = false;
+    }
     let connector = TlsConnector::from(Arc::new(config));
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid upstream SNI {server_name:?}"))?;

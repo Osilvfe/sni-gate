@@ -20,6 +20,9 @@
 //!     the same client is still answered with http/1.1 (h2 is opt-in).
 //!   * the h2c startup probe: `require` aborts startup against an HTTP/1.1-only
 //!     backend, while the default `warn` logs and keeps serving with h2 enabled.
+//!   * `override_sni`: all three cases asserted against the actual upstream
+//!     ClientHello — omitted reflects the inbound name, a fixed value is sent
+//!     verbatim, and `""` sends no `server_name` extension at all.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -731,13 +734,186 @@ fn http2_probe_warn_keeps_serving_an_h1_backend() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// override_sni = "" (suppress the SNI extension)
+// ---------------------------------------------------------------------------
+
+/// A backend that captures the first bytes of the connection it receives and
+/// reports the SNI found in them, then drops the connection.
+///
+/// The upstream ClientHello's `server_name` extension is plaintext, so the
+/// handshake never has to complete (and no upstream cert is needed) to observe
+/// what the gateway put on the wire. Returns a channel yielding the SNI the
+/// gateway sent: `None` means no `server_name` extension was present at all.
+fn spawn_client_hello_recorder() -> (u16, std::sync::mpsc::Receiver<Option<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                // A ClientHello arrives in one segment in practice; read once.
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(sni_from_client_hello(&buf[..n]));
+            });
+        }
+    });
+    (port, rx)
+}
+
+/// Extract the SNI host_name from a TLS ClientHello record, or `None` when the
+/// `server_name` extension is absent. A deliberately small, test-local parser
+/// (walks record → handshake → extensions); returns `None` on anything
+/// unexpected rather than panicking.
+fn sni_from_client_hello(b: &[u8]) -> Option<String> {
+    if b.len() < 5 || b[0] != 0x16 {
+        return None;
+    }
+    let mut p = 5usize; // skip record header
+    if b.get(p)? != &0x01 {
+        return None; // not a ClientHello
+    }
+    p += 4; // handshake header
+    p += 2 + 32; // client_version + random
+    let sid_len = *b.get(p)? as usize;
+    p += 1 + sid_len;
+    let cs_len = u16::from_be_bytes([*b.get(p)?, *b.get(p + 1)?]) as usize;
+    p += 2 + cs_len;
+    let comp_len = *b.get(p)? as usize;
+    p += 1 + comp_len;
+    let ext_total = u16::from_be_bytes([*b.get(p)?, *b.get(p + 1)?]) as usize;
+    p += 2;
+    let ext_end = (p + ext_total).min(b.len());
+    while p + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([b[p], b[p + 1]]);
+        let ext_len = u16::from_be_bytes([b[p + 2], b[p + 3]]) as usize;
+        p += 4;
+        if ext_type == 0x0000 {
+            // server_name: list_len(2) name_type(1) name_len(2) name
+            let body = b.get(p..p + ext_len)?;
+            let name_len = u16::from_be_bytes([*body.get(3)?, *body.get(4)?]) as usize;
+            let name = body.get(5..5 + name_len)?;
+            return String::from_utf8(name.to_vec()).ok();
+        }
+        p += ext_len;
+    }
+    None
+}
+
+/// Config for one `tls` route, with `override_sni` rendered verbatim so a test
+/// can pass an empty string, a name, or omit the line entirely.
+fn tls_route_config(listen: u16, backend: u16, override_line: &str) -> String {
+    format!(
+        r#"
+[global]
+resolver = "system"
+unmatched = "close"
+[ca]
+cert_path = "ca/ca.crt"
+key_path = "ca/ca.key"
+common_name = "E2E CA"
+leaf_validity_days = 90
+[cache.psl]
+source = "embedded"
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "up"
+  type = "tls"
+  match_sni = [".sni.test"]
+  upstream = "127.0.0.1:{backend}"
+{override_line}
+"#
+    )
+}
+
+/// Drive one TLS connection through the gateway, ignoring the outcome. The
+/// upstream handshake is expected to fail (the recorder never replies); all we
+/// care about is what the gateway *sent* upstream.
+fn poke_tls(listen: u16, ca_path: &std::path::Path, sni: &'static str) {
+    for _ in 0..100 {
+        if ca_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = drive_tls_alpn(listen, ca_path, sni, Vec::new(), |_tls| {
+        Box::pin(async move { Vec::new() })
+    });
+}
+
+#[test]
+fn empty_override_sni_sends_no_sni_extension_upstream() {
+    // `override_sni = ""` must suppress the extension entirely...
+    let dir = tempdir();
+    let (backend, rx) = spawn_client_hello_recorder();
+    let listen = free_port();
+    let config = tls_route_config(listen, backend, "  override_sni = \"\"");
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    poke_tls(listen, &dir.path().join("ca").join("ca.crt"), "a.sni.test");
+    let observed = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("upstream never saw a ClientHello");
+    assert_eq!(
+        observed, None,
+        "expected no server_name extension upstream, got {observed:?}"
+    );
+}
+
+#[test]
+fn omitted_override_sni_reflects_the_inbound_name_upstream() {
+    // ...while omitting the field keeps the existing reflect behavior. Together
+    // these pin down that "" is distinct from unset.
+    let dir = tempdir();
+    let (backend, rx) = spawn_client_hello_recorder();
+    let listen = free_port();
+    let config = tls_route_config(listen, backend, "");
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    poke_tls(listen, &dir.path().join("ca").join("ca.crt"), "a.sni.test");
+    let observed = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("upstream never saw a ClientHello");
+    assert_eq!(observed.as_deref(), Some("a.sni.test"));
+}
+
+#[test]
+fn fixed_override_sni_is_sent_upstream() {
+    let dir = tempdir();
+    let (backend, rx) = spawn_client_hello_recorder();
+    let listen = free_port();
+    let config = tls_route_config(listen, backend, "  override_sni = \"backend.internal\"");
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    poke_tls(listen, &dir.path().join("ca").join("ca.crt"), "a.sni.test");
+    let observed = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("upstream never saw a ClientHello");
+    assert_eq!(observed.as_deref(), Some("backend.internal"));
+}
+
 /// Minimal temp-dir helper (avoids a dev-dependency).
 fn tempdir() -> TempDir {
-    let mut base = std::env::temp_dir();
-    // Unique-ish name without rand: pid + a counter via addr of a local.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    // pid + a process-wide monotonic counter. The counter matters: tests run in
+    // parallel threads, and a per-call stack address (the previous scheme) can
+    // repeat across threads with identical stack layouts — two tests then shared
+    // one directory and each read the other's CA, failing with BadSignature.
     let pid = std::process::id();
-    let uniq = &base as *const _ as usize;
-    base.push(format!("sni-gate-e2e-{pid}-{uniq}"));
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut base = std::env::temp_dir();
+    base.push(format!("sni-gate-e2e-{pid}-{n}"));
+    // A leftover directory from a previous run would carry a stale CA.
+    let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     TempDir(base)
 }

@@ -143,6 +143,41 @@ pub enum RouteType {
     Raw,
 }
 
+/// What SNI to present on the upstream handshake (`tls` / `ech` routes).
+///
+/// Resolved from `override_sni` by [`SniPolicy::resolve`]. The empty-string case
+/// is deliberately distinct from "unset": omitting the field means *reflect*,
+/// whereas writing `override_sni = ""` is an explicit request to send no SNI
+/// extension at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SniPolicy {
+    /// Present the inbound SNI/Host verbatim (the default).
+    Reflect,
+    /// Present this fixed name.
+    Fixed(String),
+    /// Send no `server_name` extension.
+    ///
+    /// Legal and useful: RFC 9849 §5 allows a ClientHelloInner to carry no SNI,
+    /// and for a plain `tls` upstream that is addressed by IP (or one that keys
+    /// only off the certificate it serves) an SNI is not always wanted. The
+    /// upstream certificate is still verified against the name the route would
+    /// otherwise have sent — suppressing SNI changes what is *transmitted*, not
+    /// what is *trusted*.
+    Omit,
+}
+
+impl SniPolicy {
+    /// Map a raw `override_sni` value onto a policy. A value that is present but
+    /// blank (empty or all whitespace) selects [`SniPolicy::Omit`].
+    pub fn resolve(override_sni: Option<&str>) -> Self {
+        match override_sni {
+            None => SniPolicy::Reflect,
+            Some(s) if s.trim().is_empty() => SniPolicy::Omit,
+            Some(s) => SniPolicy::Fixed(s.trim().to_string()),
+        }
+    }
+}
+
 /// One SNI/Host-matched forwarding rule.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,9 +218,13 @@ pub struct Route {
     #[serde(default)]
     pub upstream: Option<String>,
 
-    /// SNI sent to the upstream. Unset = use the inbound SNI verbatim. For
-    /// `ech` routes this is the inner (protected) name; for `tls` the SNI on
-    /// the upstream handshake. Ignored for `http`/`raw`.
+    /// SNI sent to the upstream. For `ech` routes this is the inner (protected)
+    /// name; for `tls` the SNI on the upstream handshake. Ignored for
+    /// `http`/`raw`. Three cases, see [`SniPolicy`]:
+    ///
+    ///   * *(omitted)*  — reflect the inbound SNI/Host verbatim.
+    ///   * `"name"`     — send exactly `name`.
+    ///   * `""`         — send **no** SNI extension at all.
     #[serde(default)]
     pub override_sni: Option<String>,
 
@@ -336,7 +375,8 @@ pub struct Template {
     #[serde(default)]
     pub upstream: Option<String>,
 
-    /// SNI presented to the upstream (see [`Route::override_sni`]).
+    /// SNI presented to the upstream (see [`Route::override_sni`]); `""` sends
+    /// no SNI extension.
     #[serde(default)]
     pub override_sni: Option<String>,
 
@@ -1121,19 +1161,25 @@ impl Route {
             )));
         }
 
-        if let Some(ov) = self
-            .override_sni
-            .as_deref()
-            .or_else(|| tpl.and_then(|t| t.override_sni.as_deref()))
-        {
-            if ov.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "route {}: override_sni, when set, must not be empty",
-                    self.label()
-                )));
-            }
-        }
+        // `override_sni` needs no validation: every value is meaningful. A blank
+        // one is an explicit "send no SNI extension" (see `SniPolicy`), not the
+        // mistake it was once treated as.
         Ok(())
+    }
+
+    /// The upstream SNI policy for this route, taking the route's own
+    /// `override_sni` first and otherwise its template's.
+    ///
+    /// The two scopes are resolved on *presence*, so a route may deliberately
+    /// blank out a name inherited from its template by setting
+    /// `override_sni = ""` — that reads as [`SniPolicy::Omit`], not as "unset,
+    /// fall through to the template".
+    pub fn sni_policy(&self, tpl: Option<&Template>) -> SniPolicy {
+        SniPolicy::resolve(
+            self.override_sni
+                .as_deref()
+                .or_else(|| tpl.and_then(|t| t.override_sni.as_deref())),
+        )
     }
 }
 
@@ -1841,6 +1887,81 @@ wildcard = true"#,
         // Neither set → default is wildcard.
         let c = IssuanceConfig::default();
         assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
+    }
+
+    // -----------------------------------------------------------------------
+    // override_sni / SniPolicy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sni_policy_resolution() {
+        // Omitted reflects; a name is used verbatim (trimmed).
+        assert_eq!(SniPolicy::resolve(None), SniPolicy::Reflect);
+        assert_eq!(
+            SniPolicy::resolve(Some("inner.example")),
+            SniPolicy::Fixed("inner.example".into())
+        );
+        assert_eq!(
+            SniPolicy::resolve(Some("  inner.example  ")),
+            SniPolicy::Fixed("inner.example".into())
+        );
+        // Present-but-blank means "send no SNI", distinct from unset.
+        assert_eq!(SniPolicy::resolve(Some("")), SniPolicy::Omit);
+        assert_eq!(SniPolicy::resolve(Some("   ")), SniPolicy::Omit);
+    }
+
+    #[test]
+    fn empty_override_sni_is_accepted_and_means_omit() {
+        // Previously a load-time error; now the way to suppress SNI entirely.
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "no-sni"
+  type = "tls"
+  match_sni = [".a.com"]
+  override_sni = ""
+"#,
+        );
+        cfg.validate().unwrap();
+        let r = &cfg.listeners[0].routes[0];
+        assert_eq!(r.sni_policy(None), SniPolicy::Omit);
+    }
+
+    #[test]
+    fn route_can_blank_out_a_templates_override_sni() {
+        // Resolution is on *presence*, so an explicit "" at the deeper scope wins
+        // over a name from the template rather than falling through to it.
+        let cfg = parse(
+            r#"
+[templates.edge]
+type = "tls"
+override_sni = "from-template.example"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "inherits"
+  use = "edge"
+  match_sni = [".a.com"]
+
+  [[listener.route]]
+  name = "blanks-it"
+  use = "edge"
+  match_sni = [".b.com"]
+  override_sni = ""
+"#,
+        );
+        cfg.validate().unwrap();
+        let l = &cfg.listeners[0];
+        let tpl = cfg.template_for(&l.routes[0].use_template).unwrap();
+        assert_eq!(
+            l.routes[0].sni_policy(tpl),
+            SniPolicy::Fixed("from-template.example".into())
+        );
+        let tpl2 = cfg.template_for(&l.routes[1].use_template).unwrap();
+        assert_eq!(l.routes[1].sni_policy(tpl2), SniPolicy::Omit);
     }
 
     // -----------------------------------------------------------------------

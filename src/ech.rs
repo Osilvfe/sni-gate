@@ -50,6 +50,12 @@ pub struct EchProvider {
     /// Fixed upstream port, used for RFC 9460 port-prefix HTTPS lookups.
     upstream_port: u16,
     require_ech: bool,
+    /// Whether the protected ClientHelloInner carries a `server_name`
+    /// extension. False when the route sets `override_sni = ""`; RFC 9849 §5
+    /// permits an inner hello with no SNI. The ECHConfig's public name is still
+    /// sent in the *outer* hello either way (the client-facing server needs it),
+    /// and the upstream certificate is still verified against the inner name.
+    enable_sni: bool,
     resolver: Arc<TokioResolver>,
     root_store: Arc<RootCertStore>,
     refresh_bound: Duration,
@@ -62,10 +68,12 @@ pub struct EchClient {
 }
 
 impl EchProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         settings: EffectiveEch,
         upstream_port: u16,
         require_ech: bool,
+        enable_sni: bool,
         resolver: Arc<TokioResolver>,
         root_store: Arc<RootCertStore>,
         refresh_bound: Duration,
@@ -74,6 +82,7 @@ impl EchProvider {
             settings,
             upstream_port,
             require_ech,
+            enable_sni,
             resolver,
             root_store,
             refresh_bound,
@@ -260,11 +269,12 @@ impl EchProvider {
 
     fn assemble_client_config(&self, ech_mode: EchMode) -> Result<ClientConfig, EchError> {
         let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let config = ClientConfig::builder_with_provider(provider.into())
+        let mut config = ClientConfig::builder_with_provider(provider.into())
             .with_ech(ech_mode)
             .map_err(EchError::Rustls)?
             .with_root_certificates(self.root_store.as_ref().clone())
             .with_no_client_auth();
+        config.enable_sni = self.enable_sni;
         Ok(config)
     }
 }
