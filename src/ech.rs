@@ -26,10 +26,21 @@ use tracing::{debug, warn};
 use crate::config::{EchMode as SourceMode, EffectiveEch};
 use crate::error::EchError;
 
-/// A resolved ECH client config plus its refresh deadline.
+/// A resolved ECH mode plus its refresh deadline, and the `ClientConfig`s
+/// assembled from it so far.
+///
+/// The ECHConfigList is fetched once per inner name, but the ALPN protocols we
+/// offer upstream vary per connection (they are the intersection of what the
+/// client offered and what the route allows — see the ALPN mirroring path in
+/// `proxy.rs`). Since ALPN is a `ClientConfig` field, each distinct offer needs
+/// its own config. We therefore keep the expensive part (the resolved
+/// [`EchMode`], which required a DoH lookup) and memoize the cheap assembly
+/// keyed by the ALPN list. The key space is tiny and bounded: `[]`, `[h2]`,
+/// `[http/1.1]`, `[h2, http/1.1]`.
 #[derive(Clone)]
 struct Cached {
-    client_config: Arc<ClientConfig>,
+    ech_mode: EchMode,
+    configs: HashMap<Vec<Vec<u8>>, Arc<ClientConfig>>,
     refresh_at: Instant,
 }
 
@@ -70,41 +81,76 @@ impl EchProvider {
         }
     }
 
-    /// Return a client config with ECH set up for `inner_name`, (re)building from
-    /// the source when the cached entry is missing or stale. On refresh failure
-    /// the previous good entry is kept.
-    pub async fn client(&self, inner_name: &str) -> Result<EchClient, EchError> {
+    /// Return a client config with ECH set up for `inner_name` offering `alpn`
+    /// upstream, (re)building from the source when the cached entry is missing or
+    /// stale. On refresh failure the previous good entry is kept.
+    ///
+    /// `alpn` is the ALPN protocol list to advertise to the upstream (empty for
+    /// no ALPN extension at all). Configs are memoized per (inner name, ALPN), so
+    /// varying ALPN never triggers a redundant DoH lookup.
+    pub async fn client(&self, inner_name: &str, alpn: &[Vec<u8>]) -> Result<EchClient, EchError> {
+        // Fast path: a fresh entry that has already assembled this ALPN offer.
         {
             let guard = self.cache.read().await;
             if let Some(c) = guard.get(inner_name) {
                 if Instant::now() < c.refresh_at {
-                    return Ok(c.into());
+                    if let Some(cfg) = c.configs.get(alpn) {
+                        return Ok(EchClient {
+                            client_config: cfg.clone(),
+                        });
+                    }
                 }
             }
         }
 
         let mut guard = self.cache.write().await;
-        if let Some(c) = guard.get(inner_name) {
+        if let Some(c) = guard.get_mut(inner_name) {
             if Instant::now() < c.refresh_at {
-                return Ok(c.into());
+                // Fresh ECH config, but this ALPN offer is new: assemble it from
+                // the already-resolved mode without re-fetching.
+                return Ok(EchClient {
+                    client_config: self.config_for(c, alpn)?,
+                });
             }
         }
 
         match self.build(inner_name).await {
             Ok(fresh) => {
-                let out = (&fresh).into();
+                // Replace any stale entry outright: the ECHConfig (and therefore
+                // every config assembled from it) is superseded.
                 guard.insert(inner_name.to_string(), fresh);
-                Ok(out)
+                let entry = guard.get_mut(inner_name).expect("just inserted this entry");
+                let client_config = self.config_for(entry, alpn)?;
+                Ok(EchClient { client_config })
             }
             Err(e) => {
                 if let Some(c) = guard.get_mut(inner_name) {
                     warn!(inner = %inner_name, error = %e, "ECH refresh failed; keeping cached config");
                     c.refresh_at = Instant::now() + Duration::from_secs(30);
-                    return Ok((&*c).into());
+                    return Ok(EchClient {
+                        client_config: self.config_for(c, alpn)?,
+                    });
                 }
                 Err(e)
             }
         }
+    }
+
+    /// Get (or assemble and memoize) the `ClientConfig` for `alpn` from an
+    /// already-resolved cache entry.
+    fn config_for(
+        &self,
+        cached: &mut Cached,
+        alpn: &[Vec<u8>],
+    ) -> Result<Arc<ClientConfig>, EchError> {
+        if let Some(cfg) = cached.configs.get(alpn) {
+            return Ok(cfg.clone());
+        }
+        let mut config = self.assemble_client_config(cached.ech_mode.clone())?;
+        config.alpn_protocols = alpn.to_vec();
+        let config = Arc::new(config);
+        cached.configs.insert(alpn.to_vec(), Arc::clone(&config));
+        Ok(config)
     }
 
     /// Evict the cached config for `inner_name` so the next `client()` call
@@ -128,15 +174,15 @@ impl EchProvider {
             }
         };
 
-        let client_config = Arc::new(self.assemble_client_config(mode)?);
         let refresh = ttl
             .map(|t| t.min(self.refresh_bound))
             .unwrap_or(self.refresh_bound)
             .max(Duration::from_secs(5));
 
-        debug!(inner = %inner_name, real_ech, refresh_secs = refresh.as_secs(), "assembled ECH client config");
+        debug!(inner = %inner_name, real_ech, refresh_secs = refresh.as_secs(), "resolved ECH mode");
         Ok(Cached {
-            client_config,
+            ech_mode: mode,
+            configs: HashMap::new(),
             refresh_at: Instant::now() + refresh,
         })
     }
@@ -220,14 +266,6 @@ impl EchProvider {
             .with_root_certificates(self.root_store.as_ref().clone())
             .with_no_client_auth();
         Ok(config)
-    }
-}
-
-impl From<&Cached> for EchClient {
-    fn from(c: &Cached) -> Self {
-        EchClient {
-            client_config: c.client_config.clone(),
-        }
     }
 }
 

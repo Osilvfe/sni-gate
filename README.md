@@ -41,12 +41,12 @@ It merges two capabilities:
 
 ## Route types
 
-| Type   | Terminates inbound TLS? | Issues cert? | Upstream                         |
-|--------|-------------------------|--------------|----------------------------------|
-| `ech`  | yes                     | yes          | TLS 1.3 + Encrypted Client Hello |
-| `tls`  | yes                     | yes          | plain TLS (optional override SNI)|
-| `http` | (cleartext in)          | yes (if TLS) | cleartext HTTP                   |
-| `raw`  | no                      | no           | bare TCP byte-pump               |
+| Type   | Terminates inbound TLS? | Issues cert? | Upstream                         | HTTP/2                    |
+|--------|-------------------------|--------------|----------------------------------|---------------------------|
+| `ech`  | yes                     | yes          | TLS 1.3 + Encrypted Client Hello | mirrors upstream ALPN     |
+| `tls`  | yes                     | yes          | plain TLS (optional override SNI)| mirrors upstream ALPN     |
+| `http` | (cleartext in)          | yes (if TLS) | cleartext HTTP                   | h2 in → h2c out           |
+| `raw`  | no                      | no           | bare TCP byte-pump               | n/a (never terminates)    |
 
 `override_sni` works for **all** terminating types: unset = use the inbound SNI
 verbatim; set = force that name. For `ech` it is the inner (protected) name; for
@@ -135,6 +135,10 @@ An unset value at a deeper scope inherits the next one out. This applies to
 policy. So you can set, say, a different `addr_resolver` or `nat64_prefix` on a
 single route while everything else inherits the global value.
 
+The **`[http2]` block** inherits field-by-field along this same ladder, so
+`enabled` / `probe` / `probe_timeout` each resolve independently — see
+[HTTP/2](#http2).
+
 The entire **`[ech]` block inherits field-by-field along the same ladder**:
 `mode`, `config`, `ech_domain`, `max_retries` (and `require_ech` / `ech_refresh`
 / `ech_resolver`) each resolve independently. Put the shared parts in
@@ -215,6 +219,79 @@ web-PKI roots. `require_ech` (default true) fails closed unless ECH is
 negotiated. **ECH retry**: if the server rejects ECH (its key rotated), the
 cached config is invalidated, a fresh one is fetched, and the handshake is
 retried up to `max_retries` times before the fail policy applies.
+
+## HTTP/2
+
+HTTP/2 is opt-in per route via an inheriting `[http2]` block:
+
+```toml
+[global.http2]
+enabled = false        # opt-in
+probe = "warn"         # off | warn | require   (http routes only)
+probe_timeout = "3s"
+
+[[listener.route]]
+type = "http"
+match_sni = [".web.example"]
+upstream = "127.0.0.1:8080"
+  [listener.route.http2]
+  enabled = true
+```
+
+**Inbound and upstream always speak the same protocol.** sni-gate splices bytes
+rather than parsing HTTP, so it cannot translate between framings: there is no
+"HTTP/2 in, HTTP/1.1 out" mode. `enabled` is a single coupled switch. (Doing
+otherwise would mean reassembling requests, remapping streams and handling
+trailers, upgrades and CONNECT — a different program.) In exchange, the data path
+stays a transparent byte pump, so WebSockets and other upgrades keep working.
+
+How the protocol is chosen depends on whether the upstream speaks ALPN:
+
+- **`tls` / `ech` — ALPN mirroring.** The upstream is dialed *first*, offering
+  the intersection of what the client offered and what sni-gate can carry
+  (`h2`, `http/1.1`). Whatever the upstream selects is then advertised verbatim
+  on the inbound handshake. A mismatch is structurally impossible, and an
+  upstream that only does HTTP/1.1 transparently downgrades that connection —
+  decided per connection against the live upstream, never from a cached guess.
+  Note this dials the upstream slightly earlier in the connection's life than a
+  non-HTTP/2 route does.
+- **`http` — the client decides.** The upstream is cleartext and has no ALPN to
+  mirror, so `[h2, http/1.1]` is offered inbound (h2 preferred). If the client
+  picks h2, the decrypted bytes are spliced to the backend as **prior-knowledge
+  h2c** (RFC 9113 §3.4), which is byte-identical to h2 over TLS. The backend must
+  therefore be configured for h2c.
+- **`raw`** never terminates TLS, so there is no ALPN to negotiate. Enabling
+  `http2` on a `raw` route is a load-time error; a value merely *inherited* from
+  a broader scope is ignored, so a global `enabled = true` coexists fine with
+  `raw` routes.
+
+### The h2c probe
+
+Because nothing in the `http` data path can discover that a backend only speaks
+HTTP/1.1, that one case is checked at startup: sni-gate opens a connection,
+sends the HTTP/2 preface, and expects a `SETTINGS` frame back.
+
+The probe **validates; it never decides.** No mode silently downgrades a route to
+HTTP/1.1 — a probe result goes stale the moment the backend is reconfigured (an
+`nginx reload` that drops `http2 on` would leave a cached verdict quietly wrong),
+and a silent downgrade would hide exactly the misconfiguration this exists to
+surface.
+
+| `probe`   | On failure                                                        |
+|-----------|-------------------------------------------------------------------|
+| `off`     | no probe                                                          |
+| `warn`    | log loudly, keep HTTP/2 enabled as configured *(default)*         |
+| `require` | fail startup                                                      |
+
+`warn` is the default so that a backend which merely has not started yet cannot
+stop the gateway from booting. Backends are deduplicated, probed concurrently,
+and each is bounded by `probe_timeout`. Routes that reflect the source SNI/Host
+have no fixed upstream at startup and are skipped.
+
+Cleartext (non-TLS) inbound connections cannot use HTTP/2: a prior-knowledge h2c
+request carries its `:authority` in HPACK-compressed HEADERS, which cannot be
+read without decoder state, so there is no routing key. Such connections carry no
+key and fall through to `default_route`.
 
 ## Download
 

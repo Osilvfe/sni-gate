@@ -10,6 +10,25 @@
 //!    (with retry), `tls` over plain TLS (optional override SNI), `http` as
 //!    cleartext.
 //! 4. No route and no default_route → apply the fail policy.
+//!
+//! # HTTP/2
+//!
+//! Because step 3 *splices bytes* rather than parsing HTTP, the inbound and
+//! upstream framing must be the same protocol — there is no h2↔h1 translation.
+//! HTTP/2 is therefore a single coupled switch per route, and is negotiated two
+//! different ways depending on whether the upstream speaks ALPN:
+//!
+//! * `tls` / `ech` — **ALPN mirroring**. The upstream is dialed *first*, offering
+//!   the intersection of what the client offered and what the route allows;
+//!   whatever it selects is then advertised verbatim on the inbound handshake.
+//!   A protocol mismatch is structurally impossible, and falling back to
+//!   HTTP/1.1 happens per connection against the live upstream rather than
+//!   against a cached guess. See [`serve_mirrored`].
+//! * `http` — the upstream is cleartext and has no ALPN, so the client's own
+//!   preference decides. An h2 connection is spliced to the backend as
+//!   prior-knowledge h2c (RFC 9113 §3.4), which is byte-identical to h2 over
+//!   TLS. A startup probe (`src/probe.rs`) validates that the backend really
+//!   speaks h2c, but never silently downgrades the route.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,6 +62,8 @@ pub struct RouteRuntime {
     pub upstream_host: Option<String>,
     pub upstream_port: u16,
     pub override_sni: Option<String>,
+    /// Allow HTTP/2 on this route. Always false for `raw`.
+    pub http2: bool,
     pub require_ech: bool,
     pub max_retries: u32,
     pub connect_timeout: Duration,
@@ -58,13 +79,38 @@ pub struct RouteRuntime {
     pub root_store: Arc<rustls::RootCertStore>,
 }
 
+/// The inbound `ServerConfig`s, which differ *only* in the ALPN protocols they
+/// advertise. All share one cert resolver (issuing per-SNI certs from the CA),
+/// one ticketer and one session cache.
+///
+/// Sharing resumption state across them is safe: rustls warns that configs
+/// sharing a ticketer/session store should have equivalent `verifier` and
+/// `cert_resolver` (a session originated under one must not be resumed under a
+/// weaker one) — and here those are literally the same objects. Only
+/// `alpn_protocols` differs, which does not affect session security.
+///
+/// Pre-building the handful of variants at startup keeps the per-connection cost
+/// to an `Arc` clone; the alternative (cloning and mutating a `ServerConfig` per
+/// connection) would copy the whole config on every handshake.
+pub struct ServerConfigs {
+    /// No ALPN extension at all — used when the client offered none.
+    pub none: Arc<ServerConfig>,
+    /// `["http/1.1"]`. The default for every route without HTTP/2 enabled.
+    pub h1: Arc<ServerConfig>,
+    /// `["h2"]` — the upstream selected HTTP/2, so we mirror exactly that.
+    pub h2: Arc<ServerConfig>,
+    /// `["h2", "http/1.1"]`, h2 preferred. Used by `http` routes, where there is
+    /// no upstream ALPN to mirror and the client's preference decides.
+    pub h2h1: Arc<ServerConfig>,
+}
+
 /// Immutable per-listener state shared with every connection task.
 pub struct ListenerState {
     pub addr: SocketAddr,
     pub router: Router,
     pub routes: Vec<Arc<RouteRuntime>>,
-    /// Server config whose cert resolver issues per-SNI certs from the CA.
-    pub tls_server_config: Arc<ServerConfig>,
+    /// Inbound server configs, selected per connection by negotiated ALPN.
+    pub server_configs: Arc<ServerConfigs>,
     /// Fail policy for connections matching no route and no default_route.
     pub unmatched: FailPolicy,
 }
@@ -133,7 +179,16 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, state: &ListenerState) ->
 
     // Everything else terminates inbound TLS (plaintext HTTP is spliced as-is).
     let result = if inbound.is_tls() {
-        serve_terminated(client, peer, rt, state, sni, dial_host).await
+        // With HTTP/2 allowed on a TLS-upstream route we must know what the
+        // upstream negotiates before answering the client, which inverts the
+        // usual order (upstream first, then inbound handshake). Every other case
+        // keeps the original ordering and the plain http/1.1 config.
+        let mirror = rt.http2 && matches!(rt.route_type, RouteType::Tls | RouteType::Ech);
+        if mirror {
+            serve_mirrored(client, peer, rt, state, sni, dial_host).await
+        } else {
+            serve_terminated(client, peer, rt, state, sni, dial_host).await
+        }
     } else {
         // Cleartext inbound: no TLS to terminate; forward per route type.
         serve_plaintext(client, peer, rt, sni, dial_host).await
@@ -147,8 +202,100 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, state: &ListenerState) ->
     Ok(())
 }
 
+/// The ALPN protocols this gateway can carry, most preferred first. Anything
+/// else the client offers is ignored: we can only splice a protocol whose
+/// framing we pass through unchanged, and these are the two that matter.
+const SUPPORTED_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
+/// Narrow a client's ALPN offer to what this gateway can splice, ordered by our
+/// own preference (h2 first) so the upstream always sees a stable offer.
+///
+/// An empty result means "send no ALPN extension upstream" — either the client
+/// offered none, or it offered only protocols we cannot carry.
+fn negotiable_alpn(client_offer: Option<Vec<&[u8]>>) -> Vec<Vec<u8>> {
+    let Some(offered) = client_offer else {
+        return Vec::new();
+    };
+    SUPPORTED_ALPN
+        .iter()
+        .filter(|ours| offered.iter().any(|theirs| theirs == *ours))
+        .map(|p| p.to_vec())
+        .collect()
+}
+
+/// Which inbound ALPN to advertise, given what the upstream selected and what
+/// the client originally offered. This is the mirroring rule.
+fn mirror_choice<'a>(
+    configs: &'a ServerConfigs,
+    upstream_selected: Option<&[u8]>,
+    client_offered_any: bool,
+) -> &'a Arc<ServerConfig> {
+    match upstream_selected {
+        Some(b"h2") => &configs.h2,
+        Some(b"http/1.1") => &configs.h1,
+        // The upstream named nothing. With no client offer either, answer
+        // without an ALPN extension. If the client did offer, it must have been
+        // something the upstream declined to name, so settle on HTTP/1.1 — the
+        // implicit default both ends already understand.
+        _ if !client_offered_any => &configs.none,
+        _ => &configs.h1,
+    }
+}
+
 /// Terminate inbound TLS with the dynamic-cert server config, then re-originate.
+///
+/// The original ordering: the inbound handshake completes first, then the
+/// upstream is dialed. Used whenever HTTP/2 is not in play, so the default path
+/// is unchanged — `http/1.1` is advertised and no extra work is done.
 async fn serve_terminated(
+    client: TcpStream,
+    peer: SocketAddr,
+    rt: &RouteRuntime,
+    state: &ListenerState,
+    sni: Option<String>,
+    dial_host: Option<String>,
+) -> Result<()> {
+    // `http` routes with HTTP/2 enabled offer both protocols and let the client
+    // choose: the cleartext upstream has no ALPN of its own to mirror, and an h2
+    // stream is spliced onward as prior-knowledge h2c.
+    let config = if rt.http2 && rt.route_type == RouteType::Http {
+        state.server_configs.h2h1.clone()
+    } else {
+        state.server_configs.h1.clone()
+    };
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client);
+    let start = acceptor.await?;
+    let tls = start.into_stream(config).await?;
+    if let Some(p) = tls.get_ref().1.alpn_protocol() {
+        debug!(%peer, route = %rt.name, alpn = %String::from_utf8_lossy(p), "inbound ALPN");
+    }
+    forward(tls, peer, rt, sni, dial_host).await
+}
+
+/// Terminate inbound TLS **after** dialing the upstream, advertising exactly the
+/// protocol the upstream selected. Used for `tls`/`ech` routes with HTTP/2
+/// enabled.
+///
+/// Ordering matters here. We read the client's ALPN offer from the ClientHello
+/// without committing to a `ServerConfig`, dial the upstream with the subset of
+/// that offer we support, observe what it actually chose, and only then finish
+/// the inbound handshake announcing that same protocol. The two sides therefore
+/// cannot disagree, and an upstream that only speaks HTTP/1.1 transparently
+/// downgrades this connection without any configuration or cached probe result.
+///
+/// Two consequences of the inversion, both deliberate:
+///
+/// * The upstream is dialed slightly earlier in the connection's life than on
+///   the default path (before the inbound handshake rather than after).
+/// * If the upstream dial fails we hold a `StartHandshake`, whose ClientHello
+///   bytes have already been consumed by the acceptor — so the stream can no
+///   longer be spliced elsewhere and a `passthrough` fail policy is not
+///   applicable. This is not a regression: terminating routes never applied a
+///   fail policy (it is reached only for unmatched connections and `raw`
+///   upstream failures), and the observable result — the connection is dropped
+///   and the error logged — is exactly what the default path already does when
+///   its upstream is unreachable.
+async fn serve_mirrored(
     client: TcpStream,
     peer: SocketAddr,
     rt: &RouteRuntime,
@@ -158,8 +305,60 @@ async fn serve_terminated(
 ) -> Result<()> {
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client);
     let start = acceptor.await?;
-    let tls = start.into_stream(state.tls_server_config.clone()).await?;
-    forward(tls, peer, rt, sni, dial_host).await
+
+    // What the client is willing to speak, narrowed to what we can splice.
+    let client_offer = negotiable_alpn(start.client_hello().alpn().map(Iterator::collect));
+
+    let host = dial_host.ok_or_else(|| {
+        anyhow!(
+            "route {} reflects the source SNI/Host upstream, but the connection \
+             presented none",
+            rt.name
+        )
+    })?;
+    let upstream_addr = resolve_upstream(
+        &rt.addr_resolver,
+        &host,
+        rt.upstream_port,
+        rt.address_family,
+        rt.nat64.as_ref(),
+    )
+    .await
+    .with_context(|| format!("resolving upstream {host}"))?;
+
+    // Dial first, so the upstream's choice can drive the inbound handshake.
+    let up = match rt.route_type {
+        RouteType::Tls => {
+            let name = sni.clone().unwrap_or_else(|| host.clone());
+            dial_tls(upstream_addr, &name, rt, &client_offer).await?
+        }
+        RouteType::Ech => {
+            let inner = sni.clone().ok_or_else(|| {
+                anyhow!("ech route {} has no SNI/Host and no override_sni", rt.name)
+            })?;
+            dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
+        }
+        RouteType::Http | RouteType::Raw => {
+            unreachable!("mirroring only applies to tls/ech routes")
+        }
+    };
+
+    let selected = up.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    let config = mirror_choice(
+        &state.server_configs,
+        selected.as_deref(),
+        !client_offer.is_empty(),
+    )
+    .clone();
+    debug!(
+        %peer,
+        route = %rt.name,
+        upstream_alpn = %selected.as_deref().map_or("<none>".into(), |p| String::from_utf8_lossy(p).into_owned()),
+        "mirroring upstream ALPN to the client"
+    );
+
+    let tls = start.into_stream(config).await?;
+    splice(tls, up, rt.idle_timeout).await
 }
 
 /// Forward a cleartext inbound connection (no inbound TLS).
@@ -210,16 +409,19 @@ where
             let up = dial(upstream_addr, rt.connect_timeout).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
+        // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
+        // where inbound was negotiated as http/1.1 — so offer nothing upstream
+        // and let it default to HTTP/1.1 too, exactly as before.
         RouteType::Tls => {
             let name = sni.clone().unwrap_or_else(|| host.clone());
-            let up = dial_tls(upstream_addr, &name, rt).await?;
+            let up = dial_tls(upstream_addr, &name, rt, &[]).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Ech => {
             let inner = sni.clone().ok_or_else(|| {
                 anyhow!("ech route {} has no SNI/Host and no override_sni", rt.name)
             })?;
-            let up = dial_ech(upstream_addr, &inner, peer, rt).await?;
+            let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Raw => unreachable!("raw handled before termination"),
@@ -236,13 +438,16 @@ async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> 
     Ok(up)
 }
 
-/// Dial a plain-TLS upstream, verifying the presented `server_name`.
+/// Dial a plain-TLS upstream, verifying the presented `server_name` and offering
+/// `alpn` (empty = no ALPN extension).
 async fn dial_tls(
     addr: SocketAddr,
     server_name: &str,
     rt: &RouteRuntime,
+    alpn: &[Vec<u8>],
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let config = plain_tls_config(rt.root_store.clone());
+    let mut config = plain_tls_config(rt.root_store.clone());
+    config.alpn_protocols = alpn.to_vec();
     let connector = TlsConnector::from(Arc::new(config));
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid upstream SNI {server_name:?}"))?;
@@ -254,12 +459,13 @@ async fn dial_tls(
     Ok(tls)
 }
 
-/// Dial an ECH upstream for `inner`, with retry on ECH rejection.
+/// Dial an ECH upstream for `inner` offering `alpn`, with retry on ECH rejection.
 async fn dial_ech(
     addr: SocketAddr,
     inner: &str,
     peer: SocketAddr,
     rt: &RouteRuntime,
+    alpn: &[Vec<u8>],
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let ech = rt
         .ech
@@ -272,7 +478,7 @@ async fn dial_ech(
     let mut attempt = 0u32;
     loop {
         let client = ech
-            .client(inner)
+            .client(inner, alpn)
             .await
             .context("assembling ECH client config")?;
         let connector = TlsConnector::from(client.client_config.clone());
@@ -559,6 +765,81 @@ mod tests {
 
         upstream_task.await.unwrap();
         spliced.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn negotiable_alpn_filters_and_reorders() {
+        fn v<'a>(s: &[&'a str]) -> Option<Vec<&'a [u8]>> {
+            Some(s.iter().map(|x| x.as_bytes()).collect())
+        }
+        // Our preference wins over the client's ordering.
+        assert_eq!(
+            negotiable_alpn(v(&["http/1.1", "h2"])),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        // Unsupported protocols are dropped.
+        assert_eq!(
+            negotiable_alpn(v(&["h3", "spdy/3", "http/1.1"])),
+            vec![b"http/1.1".to_vec()]
+        );
+        // Nothing we can carry, and no extension at all, both yield an empty
+        // offer — meaning "send no ALPN extension upstream".
+        assert!(negotiable_alpn(v(&["h3"])).is_empty());
+        assert!(negotiable_alpn(None).is_empty());
+    }
+
+    /// The mirroring rule: the inbound answer always follows the upstream.
+    #[test]
+    fn mirror_choice_follows_the_upstream() {
+        let configs = test_configs();
+        let picked = |sel: Option<&[u8]>, offered: bool| {
+            let c = mirror_choice(&configs, sel, offered);
+            c.alpn_protocols.clone()
+        };
+
+        // Upstream chose h2 -> we advertise h2. Upstream chose http/1.1 -> h1,
+        // even though the client would have preferred h2. This is the whole
+        // point: no mismatch is possible.
+        assert_eq!(picked(Some(b"h2"), true), vec![b"h2".to_vec()]);
+        assert_eq!(picked(Some(b"http/1.1"), true), vec![b"http/1.1".to_vec()]);
+
+        // Upstream named nothing but the client did offer -> settle on http/1.1.
+        assert_eq!(picked(None, true), vec![b"http/1.1".to_vec()]);
+        // Neither side used ALPN -> answer with no ALPN extension.
+        assert!(picked(None, false).is_empty());
+        // An unrecognized upstream selection is treated like "nothing named".
+        assert_eq!(picked(Some(b"h3"), true), vec![b"http/1.1".to_vec()]);
+    }
+
+    /// Build the four ALPN variants over a dummy cert resolver, mirroring how
+    /// `main.rs` assembles them.
+    fn test_configs() -> ServerConfigs {
+        #[derive(Debug)]
+        struct NoCerts;
+        impl rustls::server::ResolvesServerCert for NoCerts {
+            fn resolve(
+                &self,
+                _hello: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                None
+            }
+        }
+        // `main()` installs this process-wide; tests must do it themselves.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let base = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoCerts));
+        let with = |p: Vec<Vec<u8>>| {
+            let mut c = base.clone();
+            c.alpn_protocols = p;
+            Arc::new(c)
+        };
+        ServerConfigs {
+            none: with(Vec::new()),
+            h1: with(vec![b"http/1.1".to_vec()]),
+            h2: with(vec![b"h2".to_vec()]),
+            h2h1: with(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+        }
     }
 
     #[test]

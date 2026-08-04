@@ -33,6 +33,30 @@ ech_refresh = "1h"                             # ECH config refresh bound
 #           { mode = "passthrough", addr = "127.0.0.1:80" }
 unmatched = "close"
 
+# Shared [http2] defaults, inherited field-by-field like [ech]. HTTP/2 is opt-in.
+#
+# sni-gate splices bytes rather than parsing HTTP, so inbound and upstream always
+# speak the SAME protocol — there is no "h2 in, http/1.1 out". `enabled` is one
+# coupled switch:
+#   tls / ech   the upstream is dialed first and whatever ALPN it selects is
+#               mirrored back to the client (so an http/1.1-only upstream simply
+#               downgrades that connection; no mismatch is possible)
+#   http        [h2, http/1.1] is offered inbound and an h2 stream is spliced to
+#               the cleartext backend as prior-knowledge h2c (backend must do h2c)
+#   raw         never terminates TLS; enabling http2 on a raw route is an error,
+#               but an inherited value here is simply ignored by raw routes
+[global.http2]
+enabled = false
+# The startup h2c check for `http` routes. It VALIDATES, it never DECIDES: no
+# mode silently downgrades a route to HTTP/1.1, because a probe result goes stale
+# as soon as the backend is reconfigured.
+#   "off"      no probe
+#   "warn"     log loudly, keep HTTP/2 enabled  (default — a backend that simply
+#              hasn't started yet must not stop the gateway from booting)
+#   "require"  fail startup
+probe = "warn"
+# probe_timeout = "3s"
+
 # Shared [ech] defaults, inherited field-by-field by every ECH route that does
 # not override them. A route may then omit [ech] entirely or set just one field.
 [global.ech]
@@ -157,6 +181,25 @@ connect_timeout = "5s"
   type = "http"
   match_sni = ["plain.example"]
   upstream = "127.0.0.1:8080"
+
+  # Same, but with HTTP/2 end to end: clients negotiate h2, and the decrypted h2
+  # stream is spliced to the backend as prior-knowledge h2c. The backend must be
+  # configured for h2c (nginx `listen 8081 http2;`, caddy `h2c://`, …), which is
+  # what the startup probe checks.
+  [[listener.route]]
+  name = "plain-h2"
+  type = "http"
+  match_sni = ["h2.example"]
+  upstream = "127.0.0.1:8081"
+
+    [listener.route.http2]
+    enabled = true
+    # Inherits probe = "warn" from [global.http2]: a backend that cannot do h2c
+    # is reported loudly but does not stop the gateway from starting. Once you
+    # know the backend really does speak h2c, tighten it to "require" so that a
+    # later regression (someone drops `http2 on`) fails fast instead of quietly
+    # breaking this route at runtime:
+    # probe = "require"
 
   # Catch-all for SNI/Host matching no route above.
   [listener.default_route]

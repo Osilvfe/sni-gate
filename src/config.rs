@@ -78,6 +78,10 @@ pub struct Global {
     #[serde(default)]
     pub ech: Option<EchConfig>,
 
+    /// Outermost `[http2]` defaults, inherited field-by-field by every route.
+    #[serde(default)]
+    pub http2: Option<Http2Config>,
+
     /// Policy for connections matching no route and no default_route.
     #[serde(default)]
     pub unmatched: FailPolicy,
@@ -106,6 +110,10 @@ pub struct Listener {
     /// Listener-scope `[ech]` defaults, between `[global.ech]` and per-route.
     #[serde(default)]
     pub ech: Option<EchConfig>,
+
+    /// Listener-scope `[http2]` defaults, between `[global.http2]` and per-route.
+    #[serde(default)]
+    pub http2: Option<Http2Config>,
 
     /// Routes matched by inbound SNI/Host.
     #[serde(default, rename = "route")]
@@ -185,6 +193,10 @@ pub struct Route {
     #[serde(default)]
     pub ech: Option<EchConfig>,
 
+    /// HTTP/2 settings (deepest scope).
+    #[serde(default)]
+    pub http2: Option<Http2Config>,
+
     /// Optional PEM cert chain pinned for local termination when this route's
     /// name is presented. Falls back to the dynamic CA issuer.
     #[serde(default)]
@@ -237,6 +249,56 @@ pub struct EchConfig {
     pub ech_resolver: Option<String>,
 }
 
+/// Per-scope HTTP/2 settings (deepest scope for HTTP/2-related overrides).
+///
+/// Every field is `Option`; `None` means "inherit from the enclosing scope". The
+/// block resolves field-by-field along the same five-tier ladder as [`EchConfig`].
+///
+/// HTTP/2 here is a *coupled* switch: sni-gate splices bytes rather than parsing
+/// HTTP, so the inbound and upstream framing are necessarily the same protocol.
+/// See [`Http2Config::enabled`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http2Config {
+    /// Allow HTTP/2 on this route. Inherits; default false.
+    ///
+    /// For `tls`/`ech` the upstream's own ALPN choice is mirrored back to the
+    /// client, so enabling this only *permits* h2 — it is used when the upstream
+    /// actually selects it. For `http` the negotiated protocol is spliced to the
+    /// cleartext backend as prior-knowledge h2c. Meaningless for `raw` (which
+    /// never terminates TLS), where setting it explicitly is a load-time error.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// What a failed startup h2c probe does. Only applies to `http` routes
+    /// (`tls`/`ech` mirror the live upstream and need no probe).
+    #[serde(default)]
+    pub probe: Option<H2Probe>,
+
+    /// Per-backend timeout for the startup h2c probe. Default 3s.
+    #[serde(default, with = "humantime_serde::option")]
+    pub probe_timeout: Option<Duration>,
+}
+
+/// What a failed startup h2c probe should do.
+///
+/// The probe *validates*, it never *decides*: no mode silently downgrades a route
+/// to HTTP/1.1, because a probe result goes stale the moment the backend is
+/// reconfigured. A wrong config should be visible, not quietly absorbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum H2Probe {
+    /// Do not probe at all.
+    Off,
+    /// Log a loud warning and keep HTTP/2 enabled as configured. The default:
+    /// it surfaces a misconfigured backend without coupling startup to backend
+    /// availability (which would make boot order fragile).
+    #[default]
+    Warn,
+    /// Fail startup outright when the backend does not speak h2c.
+    Require,
+}
+
 /// How the ECHConfigList for a route is sourced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -287,6 +349,10 @@ pub struct Template {
     /// ECH settings; merged field-by-field into the ECH ladder at this scope.
     #[serde(default)]
     pub ech: Option<EchConfig>,
+
+    /// HTTP/2 settings; merged field-by-field into the HTTP/2 ladder here.
+    #[serde(default)]
+    pub http2: Option<Http2Config>,
 
     /// Overridable knobs; inserted into the fallback ladder at this scope.
     #[serde(flatten)]
@@ -599,6 +665,15 @@ pub struct EffectiveEch {
     pub max_retries: u32,
 }
 
+/// The fully-resolved `[http2]` block for one route, after merging the five tiers
+/// of the ladder field-by-field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveHttp2 {
+    pub enabled: bool,
+    pub probe: H2Probe,
+    pub probe_timeout: Duration,
+}
+
 impl Config {
     /// Load and validate a configuration file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -644,11 +719,13 @@ impl Config {
                 let rt_tpl = self.template_for(&r.use_template)?;
                 r.validate(false, port, rt_tpl)?;
                 self.validate_ech(a, r, rt_tpl, ln_tpl)?;
+                self.validate_http2(r, rt_tpl)?;
             }
             if let Some(d) = &a.default_route {
                 let rt_tpl = self.template_for(&d.use_template)?;
                 d.validate(true, port, rt_tpl)?;
                 self.validate_ech(a, d, rt_tpl, ln_tpl)?;
+                self.validate_http2(d, rt_tpl)?;
             }
         }
         if self.ca.leaf_validity_days < 1 {
@@ -847,6 +924,78 @@ impl Config {
             ech_domain: tiers.iter().find_map(|e| e.ech_domain.clone()),
             max_retries: tiers.iter().find_map(|e| e.max_retries).unwrap_or(2),
         }
+    }
+
+    /// The five HTTP/2 tiers in deepest→shallowest order, exactly mirroring
+    /// [`ech_tiers`](Self::ech_tiers).
+    fn http2_tiers<'a>(
+        &'a self,
+        listener: &'a Listener,
+        route: &'a Route,
+        rt_tpl: Option<&'a Template>,
+        ln_tpl: Option<&'a Template>,
+    ) -> Vec<&'a Http2Config> {
+        [
+            route.http2.as_ref(),
+            rt_tpl.and_then(|t| t.http2.as_ref()),
+            listener.http2.as_ref(),
+            ln_tpl.and_then(|t| t.http2.as_ref()),
+            self.global.http2.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The fully-resolved HTTP/2 block for `route`, merging the five tiers
+    /// field-by-field.
+    ///
+    /// `raw` routes never terminate TLS, so there is no ALPN to negotiate and no
+    /// bytes to reframe: `enabled` is forced to false for them. An *explicit*
+    /// route-scope opt-in on a `raw` route is rejected at load time
+    /// ([`validate_http2`](Self::validate_http2)); this only silently drops a
+    /// value the route merely *inherited* from a broader scope, which is what
+    /// makes a global `enabled = true` usable alongside `raw` routes.
+    pub fn effective_http2(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+        ln_tpl: Option<&Template>,
+    ) -> EffectiveHttp2 {
+        let tiers = self.http2_tiers(listener, route, rt_tpl, ln_tpl);
+        let is_raw = Self::effective_route_type(route, rt_tpl) == Some(RouteType::Raw);
+        EffectiveHttp2 {
+            enabled: !is_raw && tiers.iter().find_map(|h| h.enabled).unwrap_or(false),
+            probe: tiers.iter().find_map(|h| h.probe).unwrap_or_default(),
+            probe_timeout: tiers
+                .iter()
+                .find_map(|h| h.probe_timeout)
+                .unwrap_or_else(default_probe_timeout),
+        }
+    }
+
+    /// Reject an *explicit* HTTP/2 opt-in on a `raw` route. Only the two
+    /// route-scope tiers count: a value inherited from the listener or global
+    /// scope is a broad default that `raw` routes simply ignore, whereas writing
+    /// `enabled = true` on the route itself (or on the template it `use`s) can
+    /// only be a mistake.
+    fn validate_http2(&self, route: &Route, rt_tpl: Option<&Template>) -> Result<(), ConfigError> {
+        if Self::effective_route_type(route, rt_tpl) != Some(RouteType::Raw) {
+            return Ok(());
+        }
+        let explicit = [route.http2.as_ref(), rt_tpl.and_then(|t| t.http2.as_ref())]
+            .into_iter()
+            .flatten()
+            .any(|h| h.enabled == Some(true));
+        if explicit {
+            return Err(ConfigError::Invalid(format!(
+                "route {}: http2 cannot be enabled on a `raw` route (raw never \
+                 terminates TLS, so there is no ALPN to negotiate)",
+                route.label()
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve the concrete protocol type for `route`, taking the route's own
@@ -1128,6 +1277,12 @@ fn default_idle_timeout() -> Duration {
     // WebSocket/streaming connections that are quiet between messages while
     // still reaping genuinely dead ones. Set `idle_timeout = "0s"` to disable.
     Duration::from_secs(300)
+}
+fn default_probe_timeout() -> Duration {
+    // The probe is a single TCP connect plus one frame exchange against a local
+    // or nearby backend; 3s is generous while keeping startup snappy when a
+    // backend is unreachable.
+    Duration::from_secs(3)
 }
 fn default_psl_source() -> PslSource {
     PslSource::Embedded
@@ -1686,6 +1841,146 @@ wildcard = true"#,
         // Neither set → default is wildcard.
         let c = IssuanceConfig::default();
         assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP/2 field-by-field inheritance
+    // -----------------------------------------------------------------------
+
+    /// Resolve the effective HTTP/2 block of listener 0's route `idx`.
+    fn route_http2(cfg: &Config, idx: usize) -> EffectiveHttp2 {
+        let l = &cfg.listeners[0];
+        let r = &l.routes[idx];
+        let rt = cfg.template_for(&r.use_template).unwrap();
+        let lt = cfg.template_for(&l.use_template).unwrap();
+        cfg.effective_http2(l, r, rt, lt)
+    }
+
+    #[test]
+    fn http2_inherits_field_by_field() {
+        let cfg = parse(
+            r#"
+[global.http2]
+enabled = true
+probe = "require"
+probe_timeout = "9s"
+
+[[listener]]
+addr = "0.0.0.0:443"
+
+  [listener.http2]
+  probe = "off"
+
+  [[listener.route]]
+  name = "a"
+  type = "http"
+  match_sni = [".a.com"]
+    [listener.route.http2]
+    probe_timeout = "1s"
+
+  [[listener.route]]
+  name = "b"
+  type = "http"
+  match_sni = [".b.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+
+        // Route a: enabled from global, probe from the listener (nearer than
+        // global), probe_timeout from the route's own [http2].
+        let a = route_http2(&cfg, 0);
+        assert!(a.enabled);
+        assert_eq!(a.probe, H2Probe::Off);
+        assert_eq!(a.probe_timeout, Duration::from_secs(1));
+
+        // Route b has no [http2] block at all yet still resolves the full config.
+        let b = route_http2(&cfg, 1);
+        assert!(b.enabled);
+        assert_eq!(b.probe, H2Probe::Off);
+        assert_eq!(b.probe_timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn http2_defaults_when_unconfigured() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "http"
+  match_sni = [".a.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+        let a = route_http2(&cfg, 0);
+        assert!(!a.enabled, "http2 must be opt-in");
+        assert_eq!(a.probe, H2Probe::Warn, "probe defaults to warn");
+        assert_eq!(a.probe_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn http2_explicitly_enabled_on_raw_route_is_an_error() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "raw"
+  match_sni = [".a.com"]
+    [listener.route.http2]
+    enabled = true
+"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn http2_enabled_on_a_raw_routes_template_is_an_error() {
+        let cfg = parse(
+            r#"
+[templates.rawtpl]
+type = "raw"
+  [templates.rawtpl.http2]
+  enabled = true
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  use = "rawtpl"
+  match_sni = [".a.com"]
+"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn http2_inherited_by_a_raw_route_is_ignored_not_an_error() {
+        // The whole point of an inheriting block: a global opt-in must coexist
+        // with raw routes, which simply ignore it.
+        let cfg = parse(
+            r#"
+[global.http2]
+enabled = true
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "raw"
+  type = "raw"
+  match_sni = [".raw.com"]
+
+  [[listener.route]]
+  name = "web"
+  type = "http"
+  match_sni = [".web.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+        assert!(!route_http2(&cfg, 0).enabled, "raw ignores inherited http2");
+        assert!(route_http2(&cfg, 1).enabled, "http route still gets it");
     }
 
     #[test]

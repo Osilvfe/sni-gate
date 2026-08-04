@@ -12,6 +12,7 @@ mod ech;
 mod error;
 mod nat64;
 mod peek;
+mod probe;
 mod proxy;
 mod psl_source;
 mod resolver;
@@ -29,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rustls::{RootCertStore, ServerConfig};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::ca::{CaParams, CertificateAuthority};
@@ -37,13 +38,30 @@ use crate::config::{Config, Listener, Route, RouteType};
 use crate::dns::ResolverSpec;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
-use crate::proxy::{ListenerState, RouteRuntime};
+use crate::proxy::{ListenerState, RouteRuntime, ServerConfigs};
 use crate::resolver::{DynamicResolver, ResolverParams};
 use crate::router::Router;
 use crate::store::CertStore;
 
 /// Resolver cache key: (spec string, address family).
 type ResolverCache = HashMap<(String, config::AddressFamily), Arc<hickory_resolver::TokioResolver>>;
+
+/// One `http` route whose backend should be checked for h2c at startup.
+///
+/// Collected while building routes (the only place the effective HTTP/2 policy
+/// and the resolved upstream are both in hand) and consumed once, before the
+/// listeners start accepting. Kept out of `RouteRuntime` because none of it is
+/// needed on the data path.
+struct ProbeTarget {
+    route: String,
+    host: String,
+    port: u16,
+    policy: config::H2Probe,
+    budget: Duration,
+    resolver: Arc<hickory_resolver::TokioResolver>,
+    family: config::AddressFamily,
+    nat64: Option<Nat64Prefix>,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -142,16 +160,29 @@ async fn run(cfg: Config) -> Result<()> {
         cache_ttl: Duration::from_secs(cfg.cache.ttl_secs),
     }));
 
-    // One server config for local termination; the resolver issues for any SNI.
+    // One base server config for local termination; the resolver issues for any
+    // SNI. It is then cloned into the ALPN variants the data path selects
+    // between (see `ServerConfigs`): the clones share the cert resolver,
+    // ticketer and session cache, and differ only in `alpn_protocols`.
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(dyn_resolver);
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     if let Ok(t) = rustls::crypto::aws_lc_rs::Ticketer::new() {
         server_config.ticketer = t;
     }
     server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(8192);
-    let tls_server_config = Arc::new(server_config);
+
+    let with_alpn = |protocols: Vec<Vec<u8>>| {
+        let mut c = server_config.clone();
+        c.alpn_protocols = protocols;
+        Arc::new(c)
+    };
+    let server_configs = Arc::new(ServerConfigs {
+        none: with_alpn(Vec::new()),
+        h1: with_alpn(vec![b"http/1.1".to_vec()]),
+        h2: with_alpn(vec![b"h2".to_vec()]),
+        h2h1: with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    });
 
     // Shared web-PKI roots for upstream TLS verification.
     let root_store = Arc::new(RootCertStore {
@@ -159,6 +190,7 @@ async fn run(cfg: Config) -> Result<()> {
     });
 
     let mut resolver_cache: ResolverCache = HashMap::new();
+    let mut probe_targets: Vec<ProbeTarget> = Vec::new();
 
     // --- Build every listener ---
     let mut listener_states: Vec<Arc<ListenerState>> = Vec::new();
@@ -166,12 +198,16 @@ async fn run(cfg: Config) -> Result<()> {
         let state = build_listener(
             &cfg,
             listener,
-            tls_server_config.clone(),
+            server_configs.clone(),
             root_store.clone(),
             &mut resolver_cache,
+            &mut probe_targets,
         )?;
         listener_states.push(Arc::new(state));
     }
+
+    // --- Validate h2c backends before serving ---
+    run_probes(probe_targets).await?;
 
     // --- Spawn all listeners ---
     let mut set = tokio::task::JoinSet::new();
@@ -201,9 +237,10 @@ async fn run(cfg: Config) -> Result<()> {
 fn build_listener(
     cfg: &Config,
     listener: &Listener,
-    tls_server_config: Arc<ServerConfig>,
+    server_configs: Arc<ServerConfigs>,
     root_store: Arc<RootCertStore>,
     resolver_cache: &mut ResolverCache,
+    probe_targets: &mut Vec<ProbeTarget>,
 ) -> Result<ListenerState> {
     let mut runtimes: Vec<Arc<RouteRuntime>> = Vec::new();
     let mut patterns: Vec<Vec<String>> = Vec::new();
@@ -215,6 +252,7 @@ fn build_listener(
             route,
             &root_store,
             resolver_cache,
+            probe_targets,
         )?));
         patterns.push(route.match_sni.clone());
     }
@@ -227,6 +265,7 @@ fn build_listener(
             d,
             &root_store,
             resolver_cache,
+            probe_targets,
         )?));
         patterns.push(Vec::new());
         Some(id)
@@ -241,7 +280,7 @@ fn build_listener(
         addr: listener.addr,
         router,
         routes: runtimes,
-        tls_server_config,
+        server_configs,
         unmatched: cfg.global.unmatched.clone(),
     })
 }
@@ -254,6 +293,7 @@ fn build_route(
     route: &Route,
     root_store: &Arc<RootCertStore>,
     resolver_cache: &mut ResolverCache,
+    probe_targets: &mut Vec<ProbeTarget>,
 ) -> Result<RouteRuntime> {
     // Templates were validated at load, so name lookups cannot fail here.
     let rt_tpl = cfg.template_for(&route.use_template)?;
@@ -311,12 +351,41 @@ fn build_route(
         None
     };
 
+    let eff_http2 = cfg.effective_http2(listener, route, rt_tpl, ln_tpl);
+
+    // Only `http` routes need the h2c probe: tls/ech mirror the upstream's live
+    // ALPN choice and so cannot be wrong about it.
+    if eff_http2.enabled && route_type == RouteType::Http && eff_http2.probe != config::H2Probe::Off
+    {
+        match &host {
+            Some(h) => probe_targets.push(ProbeTarget {
+                route: route.label(),
+                host: h.clone(),
+                port,
+                policy: eff_http2.probe,
+                budget: eff_http2.probe_timeout,
+                resolver: addr_resolver.clone(),
+                family: eff.address_family,
+                nat64,
+            }),
+            // A reflecting route has no fixed upstream host at startup — the
+            // target is whichever name each connection carries — so there is
+            // nothing to probe.
+            None => debug!(
+                route = %route.label(),
+                "skipping h2c probe: the route reflects the source SNI/Host, so \
+                 it has no fixed upstream to probe at startup"
+            ),
+        }
+    }
+
     Ok(RouteRuntime {
         name: route.label(),
         route_type,
         upstream_host: host,
         upstream_port: port,
         override_sni,
+        http2: eff_http2.enabled,
         require_ech: eff.require_ech,
         max_retries: eff_ech.max_retries,
         connect_timeout: eff.connect_timeout,
@@ -328,6 +397,79 @@ fn build_route(
         ech,
         root_store: root_store.clone(),
     })
+}
+
+/// Resolve and probe every collected h2c target concurrently, then apply each
+/// one's policy.
+///
+/// Backends are deduplicated by resolved address, so several routes pointing at
+/// the same upstream cost one probe. A `require` failure aborts startup; a `warn`
+/// failure is logged loudly and startup continues with HTTP/2 still enabled — the
+/// probe validates, it never decides (see [`probe`]).
+async fn run_probes(targets: Vec<ProbeTarget>) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for t in targets {
+        set.spawn(async move {
+            // Resolution shares the route's own resolver/family/NAT64 settings so
+            // the probe reaches exactly the address the data path would dial.
+            let resolved =
+                dns::resolve_upstream(&t.resolver, &t.host, t.port, t.family, t.nat64.as_ref())
+                    .await
+                    .with_context(|| format!("resolving h2c probe target {}:{}", t.host, t.port));
+            let outcome = match resolved {
+                Ok(addr) => probe::probe_h2c(addr, t.budget).await,
+                Err(e) => Err(e),
+            };
+            (t.route, t.host, t.port, t.policy, outcome)
+        });
+    }
+
+    // Deduplicate by (host, port): routes sharing a backend need only one verdict.
+    let mut seen: std::collections::HashSet<(String, u16)> = std::collections::HashSet::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    while let Some(joined) = set.join_next().await {
+        let (route, host, port, policy, outcome) = joined.context("h2c probe task panicked")?;
+        if !seen.insert((host.clone(), port)) {
+            continue;
+        }
+        match outcome {
+            Ok(()) => info!(route = %route, upstream = %format!("{host}:{port}"), "h2c probe ok"),
+            Err(e) => {
+                let detail = format!("{e:#}");
+                match policy {
+                    config::H2Probe::Require => failures.push(format!(
+                        "route {route}: upstream {host}:{port} failed the h2c probe: {detail}"
+                    )),
+                    // Keep HTTP/2 enabled: the config says the backend speaks it,
+                    // and a transient failure at boot (backend not up yet) must
+                    // not silently reshape the running configuration.
+                    config::H2Probe::Warn => tracing::warn!(
+                        route = %route,
+                        upstream = %format!("{host}:{port}"),
+                        error = %detail,
+                        "h2c probe failed; HTTP/2 stays enabled for this route as configured. \
+                         If the backend really cannot do h2c, either enable HTTP/2 on it or set \
+                         http2.enabled = false for this route. If it simply had not started yet, \
+                         this warning is harmless."
+                    ),
+                    config::H2Probe::Off => unreachable!("off targets are never collected"),
+                }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "h2c probe failed with probe = \"require\":\n  {}",
+            failures.join("\n  ")
+        ));
+    }
+    Ok(())
 }
 
 /// Get or build a resolver for `spec` under `family`.
