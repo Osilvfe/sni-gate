@@ -39,6 +39,24 @@ It merges two capabilities:
    upstream per the route type. `raw` splices the untouched TCP stream through.
 4. No route and no `default_route` → apply the global `unmatched` policy.
 
+## Listener address
+
+Each `[[listener]]` must have an `addr` field. Three accepted forms:
+
+| Form | Example | Result |
+|---|---|---|
+| Full IPv4 socket address | `"0.0.0.0:443"` | bind exactly as written |
+| Full IPv6 socket address | `"[::]:443"` | bind exactly as written |
+| Bare port (string or integer) | `"443"` or `443` | `0.0.0.0:<port>` |
+
+The bare-port shorthand binds the **IPv4 wildcard only**, matching nginx's
+`listen 443` semantics. On a dual-stack host, add a second listener on
+`"[::]:443"` to also accept IPv6 connections. Hostnames are not accepted;
+use a literal IP address.
+
+`"443"` and `"0.0.0.0:443"` normalize to the same address, so writing both
+in the same config is caught as a duplicate-listener error at startup.
+
 ## Route types
 
 | Type   | Terminates inbound TLS? | Issues cert? | Upstream                         | HTTP/2                    |

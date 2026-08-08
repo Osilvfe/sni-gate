@@ -19,7 +19,7 @@
 //! one route so the data path never has to re-walk the hierarchy.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -104,7 +104,21 @@ pub struct Global {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
-    /// Address to accept on, e.g. "0.0.0.0:443".
+    /// Address to accept on.
+    ///
+    /// Either a full socket address — `"0.0.0.0:443"`, `"127.0.0.1:8443"`,
+    /// `"[::]:443"` (IPv6 in brackets) — or, as shorthand, a bare port written
+    /// as a string or an integer: `"443"` and `443` both mean `0.0.0.0:443`.
+    ///
+    /// The shorthand binds the **IPv4** wildcard, which is exactly what nginx's
+    /// `listen 443` does. It is not "every interface": a dual-stack deployment
+    /// still needs a second listener on `"[::]:443"`, just as nginx needs a
+    /// second `listen [::]:443`.
+    ///
+    /// Shorthand is normalized here, at parse time, so the duplicate-address
+    /// check in [`Config::validate`] sees `"443"` and `"0.0.0.0:443"` as the
+    /// same bind and rejects the pair.
+    #[serde(deserialize_with = "de_listen_addr")]
     pub addr: SocketAddr,
 
     /// Name of a `[templates.<name>]` bundle whose settings apply to this
@@ -224,7 +238,10 @@ pub struct Route {
     /// matched on (the inbound SNI/Host, port-stripped) — resolved per
     /// connection. `override_sni` does not affect the dial target; it only sets
     /// the upstream TLS server name for `tls`/`ech`.
-    #[serde(default)]
+    ///
+    /// Accepts a string or an integer port number: `upstream = 8443` is
+    /// identical to `upstream = "8443"`.
+    #[serde(default, deserialize_with = "de_option_upstream")]
     pub upstream: Option<String>,
 
     /// SNI sent to the upstream. For `ech` routes this is the inner (protected)
@@ -381,7 +398,8 @@ pub struct Template {
     pub route_type: Option<RouteType>,
 
     /// Upstream to dial (see [`Route::upstream`] for the accepted forms).
-    #[serde(default)]
+    /// Accepts a string or an integer port: `upstream = 443` == `upstream = "443"`.
+    #[serde(default, deserialize_with = "de_option_upstream")]
     pub upstream: Option<String>,
 
     /// SNI presented to the upstream (see [`Route::override_sni`]); `""` sends
@@ -488,7 +506,8 @@ pub struct ResolverDef {
     ///
     /// Unlike a route's `upstream`, the host is never omitted-to-reflect: there
     /// is no inbound connection to reflect.
-    #[serde(default)]
+    /// Accepts a string or an integer port: `upstream = 443` == `upstream = "443"`.
+    #[serde(default, deserialize_with = "de_option_upstream")]
     pub upstream: Option<String>,
 
     /// TLS server name presented to the endpoint. Same three cases as a route's
@@ -1808,6 +1827,157 @@ pub fn resolved_upstream_from(
 }
 
 // ---------------------------------------------------------------------------
+// upstream deserialization (Option<String> that also accepts integers)
+// ---------------------------------------------------------------------------
+
+/// Deserialize an optional upstream spec, accepting both string and integer
+/// values. An integer is treated as a bare port and stored as its decimal
+/// string so that the existing [`parse_upstream`] path handles it unchanged.
+///
+/// `upstream = 443` is therefore identical to `upstream = "443"`, both
+/// meaning "use the matched source SNI/Host as the dial host and port 443".
+/// The value is validated as a `u16` at deserialization, before `parse_upstream`
+/// gets to it, so an out-of-range integer is caught with a clear message.
+fn de_option_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Outer;
+
+    impl<'de> serde::de::Visitor<'de> for Outer {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "an upstream string or port number, or absent")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> Result<Option<String>, D2::Error> {
+            d.deserialize_any(Inner).map(Some)
+        }
+    }
+
+    struct Inner;
+
+    impl<'de> serde::de::Visitor<'de> for Inner {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "an upstream string or port number")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<String, E> {
+            u16::try_from(v)
+                .map_err(|_| E::custom(format!("port {v} out of range (0..=65535)")))?;
+            Ok(v.to_string())
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<String, E> {
+            u16::try_from(v)
+                .map_err(|_| E::custom(format!("port {v} out of range (0..=65535)")))?;
+            Ok(v.to_string())
+        }
+    }
+
+    deserializer.deserialize_option(Outer)
+}
+
+// ---------------------------------------------------------------------------
+// Listener address deserialization
+// ---------------------------------------------------------------------------
+
+/// Deserialize a listener bind address.
+///
+/// Accepts three forms:
+///
+/// * Full socket address strings: `"0.0.0.0:443"`, `"[::]:443"`.
+/// * Bare port **string**: `"443"` → `0.0.0.0:443`.
+/// * Bare port **integer**: `443` → `0.0.0.0:443`.
+///
+/// The bare-port shorthand binds the IPv4 wildcard only, matching
+/// nginx's `listen 443` semantics. Normalising here means the
+/// duplicate-address check in [`Config::validate`] sees `"443"` and
+/// `"0.0.0.0:443"` as the same address and correctly rejects the pair.
+fn de_listen_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = SocketAddr;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "a socket address (\"ip:port\", \"[v6]:port\") \
+                 or a bare port number (\"443\" or 443)"
+            )
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SocketAddr, E> {
+            parse_listen_addr(v).map_err(E::custom)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SocketAddr, E> {
+            let port = u16::try_from(v)
+                .map_err(|_| E::custom(format!("port {v} out of range (0..=65535)")))?;
+            Ok(SocketAddr::new(
+                std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port,
+            ))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<SocketAddr, E> {
+            let port = u16::try_from(v)
+                .map_err(|_| E::custom(format!("port {v} out of range (0..=65535)")))?;
+            Ok(SocketAddr::new(
+                std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port,
+            ))
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
+}
+
+/// Parse a listener address string.
+///
+/// * Bare decimal port (`"443"`) → `0.0.0.0:<port>`.
+/// * Full socket address (`"ip:port"`, `"[v6]:port"`) → passed through.
+/// * Anything else (hostname, bare IPv6, colon-only) → error.
+pub fn parse_listen_addr(s: &str) -> Result<SocketAddr, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("listener addr must not be empty".to_string());
+    }
+    // All-digit string: bare port shorthand.
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        let port: u16 = s
+            .parse()
+            .map_err(|_| format!("port {s:?} out of range (0..=65535)"))?;
+        return Ok(SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port,
+        ));
+    }
+    // Full socket address; no hostname resolution.
+    s.parse::<SocketAddr>().map_err(|_| {
+        "invalid socket address (expected \"ip:port\", \"[v6]:port\", or a bare port)".to_string()
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
@@ -2598,6 +2768,170 @@ addr = "0.0.0.0:443"
 "#,
         );
         assert!(cfg.validate().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_listen_addr / bare-port shorthand
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // upstream integer shorthand
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upstream_integer_equals_string() {
+        // Integer form must parse to the same value as the equivalent string.
+        let with_int = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "raw"
+  match_sni = [".a.com"]
+  upstream = 8443
+"#,
+        );
+        let with_str = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "raw"
+  match_sni = [".a.com"]
+  upstream = "8443"
+"#,
+        );
+        with_int.validate().unwrap();
+        with_str.validate().unwrap();
+        assert_eq!(
+            with_int.listeners[0].routes[0].upstream,
+            with_str.listeners[0].routes[0].upstream,
+        );
+    }
+
+    #[test]
+    fn upstream_integer_in_template() {
+        let cfg = parse(
+            r#"
+[templates.web]
+type = "http"
+upstream = 8080
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  use = "web"
+  match_sni = [".a.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.templates["web"].upstream.as_deref(), Some("8080"));
+    }
+
+    #[test]
+    fn upstream_integer_out_of_range_is_rejected() {
+        let result = toml::from_str::<Config>(&format!(
+            "{CA}[[listener]]\naddr = \"0.0.0.0:443\"\n[[listener.route]]\nname = \"a\"\ntype = \"raw\"\nmatch_sni = [\".a.com\"]\nupstream = 99999\n"
+        ));
+        assert!(result.is_err(), "port 99999 must be rejected");
+    }
+
+    #[test]
+    fn listen_addr_bare_port_string() {
+        let unspec = std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            parse_listen_addr("443").unwrap(),
+            SocketAddr::new(unspec, 443)
+        );
+        assert_eq!(
+            parse_listen_addr("8443").unwrap(),
+            SocketAddr::new(unspec, 8443)
+        );
+        // Port 0 is valid (OS picks a free port).
+        assert_eq!(parse_listen_addr("0").unwrap(), SocketAddr::new(unspec, 0));
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            parse_listen_addr("  443  ").unwrap(),
+            SocketAddr::new(unspec, 443)
+        );
+    }
+
+    #[test]
+    fn listen_addr_full_forms_pass_through() {
+        assert_eq!(
+            parse_listen_addr("127.0.0.1:443").unwrap(),
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen_addr("[::1]:443").unwrap(),
+            "[::1]:443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen_addr("[::]:8443").unwrap(),
+            "[::]:8443".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen_addr("0.0.0.0:443").unwrap(),
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn listen_addr_port_out_of_range() {
+        assert!(parse_listen_addr("65536").is_err());
+        assert!(parse_listen_addr("99999").is_err());
+    }
+
+    #[test]
+    fn listen_addr_rejected_forms() {
+        // Hostname — no DNS resolution at parse time.
+        assert!(parse_listen_addr("localhost:443").is_err());
+        // Leading colon without IP.
+        assert!(parse_listen_addr(":443").is_err());
+        // Bare unbracketed IPv6 (ambiguous colons).
+        assert!(parse_listen_addr("::1:443").is_err());
+        assert!(parse_listen_addr("::1").is_err());
+        // Empty.
+        assert!(parse_listen_addr("").is_err());
+        // Nonsense.
+        assert!(parse_listen_addr("not-an-addr").is_err());
+    }
+
+    /// `"443"` and `"0.0.0.0:443"` must normalize to the same address so
+    /// the duplicate-listener check in [`Config::validate`] catches the pair.
+    #[test]
+    fn listen_addr_shorthand_deduplication() {
+        let shorthand = parse_listen_addr("443").unwrap();
+        let explicit: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        assert_eq!(
+            shorthand, explicit,
+            "shorthand must equal the explicit form"
+        );
+
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "443"
+  [[listener.route]]
+  name = "a"
+  type = "raw"
+  match_sni = [".a.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "b"
+  type = "raw"
+  match_sni = [".b.com"]
+"#,
+        );
+        assert!(
+            cfg.validate().is_err(),
+            "duplicate listeners must be rejected"
+        );
     }
 
     #[test]

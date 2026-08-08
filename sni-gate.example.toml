@@ -127,6 +127,10 @@ source = "embedded"           # embedded | file | network
 # Listener 1 — HTTPS on 443
 # ===========================================================================
 [[listener]]
+# `addr` accepts a full socket address ("0.0.0.0:443", "[::]:443") or a bare
+# port ("443" or integer 443), which expands to 0.0.0.0:<port> — the IPv4
+# wildcard, matching nginx's `listen 443` semantics. For dual-stack, add a
+# second listener on "[::]:443".
 addr = "0.0.0.0:443"
 connect_timeout = "5s"
 
@@ -223,7 +227,7 @@ connect_timeout = "5s"
   type = "tls"
   upstream = "127.0.0.1:443"
   require_ech = false
-  fail = { mode = "close" }
+  fail = "close"
 
 # ===========================================================================
 # Listener 2 — 8443, raw passthrough (no termination, no cert issued)
