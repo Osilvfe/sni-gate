@@ -84,7 +84,7 @@ impl ResolverSpec {
     /// Build a shared Tokio resolver honoring `family` for A/AAAA strategy.
     pub fn build(&self, family: AddressFamily) -> Result<Arc<TokioResolver>> {
         let config = match self {
-            ResolverSpec::System => system_config()?,
+            ResolverSpec::System => system_resolver_config()?,
             ResolverSpec::Doh {
                 ip,
                 server_name,
@@ -207,7 +207,7 @@ async fn lookup_v6(resolver: &TokioResolver, host: &str) -> Result<Ipv6Addr> {
         .ok_or_else(|| anyhow!("no AAAA record for {host}"))
 }
 
-fn strategy_for(family: AddressFamily) -> LookupIpStrategy {
+pub fn strategy_for(family: AddressFamily) -> LookupIpStrategy {
     match family {
         AddressFamily::Dual => LookupIpStrategy::Ipv6thenIpv4,
         AddressFamily::Ipv4 => LookupIpStrategy::Ipv4Only,
@@ -221,7 +221,7 @@ fn strategy_for(family: AddressFamily) -> LookupIpStrategy {
 /// available; to keep `system` dependable everywhere we resolve through a
 /// well-known public resolver (Cloudflare) over UDP+TCP. Deployments that need
 /// the exact OS resolver can point `resolver` at a specific server instead.
-fn system_config() -> Result<ResolverConfig> {
+pub fn system_resolver_config() -> Result<ResolverConfig> {
     let ns = NameServerConfig::udp_and_tcp(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
     Ok(ResolverConfig::from_parts(None, vec![], vec![ns]))
 }

@@ -200,6 +200,8 @@ applies when the template is used by a *route* (listeners have no upstream).
 
 ## DNS resolvers
 
+### Quick reference: Inline resolver specs
+
 A resolver spec may appear at any scope and takes one of these forms:
 
 | Form                              | Meaning                         |
@@ -207,11 +209,182 @@ A resolver spec may appear at any scope and takes one of these forms:
 | `system`                          | the OS resolver                 |
 | `https://host[:port]/dns-query`   | DoH                             |
 | `tls://host[:port]`               | DoT                             |
-| `udp://ip[:port]` / bare `ip[:port]` | plain DNS to an IP           |
+| `udp://host[:port]` or `tcp://host[:port]` | plain DNS with hostname (requires bootstrap) |
+| `ip[:port]` (bare IP)             | plain DNS to an IP              |
 
 `resolver` is the generic default. `ech_resolver` overrides it for ECH
 HTTPS-record lookups; `addr_resolver` overrides it for upstream A/AAAA. Each is
 independently overridable per scope.
+
+### Named resolvers: `[resolvers.<name>]`
+
+**Named resolvers** let you declare DNS resolvers as first-class configuration
+entities with full transport control, including bootstrap chains, upstream
+overrides, and ECH-on-ECH protection. Reference them by name anywhere a resolver
+spec is accepted.
+
+#### Why named resolvers?
+
+1. **Bootstrap chains** — When the resolver endpoint itself is blocked or
+   requires circumvention, resolve its hostname through a different resolver:
+   ```toml
+   [resolvers.bootstrap]
+   endpoint = "1.1.1.1"
+   
+   [resolvers.primary]
+   endpoint = "https://dns.blocked.example/dns-query"
+   bootstrap = "bootstrap"  # Resolve dns.blocked.example via bootstrap
+   ```
+
+2. **Upstream override (CDN fronting)** — Dial a CDN edge while presenting the
+   real resolver's TLS server name:
+   ```toml
+   [resolvers.fronted]
+   endpoint = "https://dns.blocked.example/dns-query"
+   upstream = "cdn-edge.cloudfront.net"
+   # Dials cdn-edge.cloudfront.net, but TLS SNI remains dns.blocked.example
+   ```
+
+3. **ECH-on-ECH** — Protect the resolver's own TLS handshake with Encrypted
+   Client Hello:
+   ```toml
+   [resolvers.secure]
+   endpoint = "https://doh.example/dns-query"
+   bootstrap = "bootstrap"
+     [resolvers.secure.ech]
+     mode = "doh"
+     require_ech = true
+   ```
+
+#### Configuration reference
+
+```toml
+[resolvers.<name>]
+endpoint = "..."           # Required: transport spec (see formats below)
+upstream = "..."           # Optional: override dial target (host, port, or both)
+override_sni = "..."       # Optional: TLS server name (omit=reflect, "name"=fixed, ""=suppress)
+bootstrap = "..."          # Optional: resolver name or inline spec for endpoint resolution
+address_family = "..."     # Optional: dual/ipv4/ipv6 (inherits from [global])
+nat64_prefix = "..."       # Optional: e.g. "64:ff9b::/96" (inherits from [global])
+connect_timeout = "..."    # Optional: per-query timeout (inherits from [global])
+
+[resolvers.<name>.ech]     # Optional: ECH for this resolver's handshake
+mode = "doh"               # or "static", "doh-with-fallback"
+config = "<base64>"        # Required for static/fallback modes
+ech_domain = "..."         # Override HTTPS lookup name
+require_ech = true         # Fail rather than GREASE (default: true)
+max_retries = 2            # ECH rejection retry budget
+ech_refresh = "1h"         # Proactive rotation interval
+ech_resolver = "..."       # Who fetches this resolver's ECH config
+```
+
+#### Endpoint formats
+
+- `system` or `""` — OS resolver (default bootstrap)
+- `https://host[:port][/path]` — DNS-over-HTTPS (default port 443, path `/dns-query`)
+- `tls://host[:port]` — DNS-over-TLS (default port 853)
+- `udp://hostname:port` or `tcp://hostname:port` — Plain DNS with hostname (resolved via bootstrap)
+- `ip[:port]` — Plain DNS to literal IP address (default port 53, no bootstrap needed)
+
+**Note:** Bare words (without prefix) must be IP addresses to avoid collision with
+resolver references. Use `udp://` or `tcp://` prefix to specify a hostname.
+
+#### Using named resolvers
+
+Reference by name anywhere a resolver spec is accepted:
+
+```toml
+[global]
+resolver = "my-doh"          # Default for everything
+addr_resolver = "fast"       # Override for A/AAAA lookups
+ech_resolver = "secure"      # Override for HTTPS/ECH lookups
+
+[resolvers.my-doh]
+endpoint = "https://1.1.1.1/dns-query"
+
+[resolvers.fast]
+endpoint = "1.1.1.1"
+address_family = "ipv4"
+
+[resolvers.secure]
+endpoint = "https://dns.google/dns-query"
+```
+
+**Fallback order:**
+- `addr_resolver` → `resolver` → system
+- `ech_resolver` → `addr_resolver` → `resolver` → system
+
+#### Inheritance rules
+
+| Setting | Inherits from `[global]` | Notes |
+|---------|--------------------------|-------|
+| `address_family` | ✅ Yes | IP version preference |
+| `nat64_prefix` | ✅ Yes | IPv6 synthesis |
+| `connect_timeout` | ✅ Yes | Per-query timeout |
+| `[ech]` fields | ✅ Yes (field-by-field) | Only if `[ech]` block declared |
+| `[ech]` presence | ❌ No | Must opt-in explicitly |
+| `bootstrap` | ❌ No | Dependency edge, never inherited |
+| `ech_resolver` | ❌ No | Dependency edge, never inherited |
+
+**Dependency edges** (`bootstrap`, `ech_resolver`) are never inherited to prevent
+implicit cycles. The `[ech]` block itself must be explicitly declared, but its
+fields then inherit from `[global.ech]` field-by-field.
+
+#### Validation
+
+Named resolvers are validated at load time:
+
+- **Cycle detection**: `a → b → a` dependency cycles are rejected
+- **Unknown references**: `bootstrap = "typo"` when no such resolver exists
+- **Self-bootstrap**: `bootstrap = "self"` is rejected
+- **Name collision**: Resolver names cannot look like inline specs (e.g., can't name a resolver "1.1.1.1")
+
+#### Advanced example: Multi-layer bootstrap chain
+
+```toml
+[global]
+resolver = "layer-3"
+
+# Layer 1: IP-addressed, no dependencies
+[resolvers.layer-1]
+endpoint = "1.1.1.1"
+
+# Layer 2: First DoH hop
+[resolvers.layer-2]
+endpoint = "https://doh-a.example/dns-query"
+bootstrap = "layer-1"
+
+# Layer 3: Final resolver with ECH
+[resolvers.layer-3]
+endpoint = "https://doh-b.example/dns-query"
+bootstrap = "layer-2"
+  [resolvers.layer-3.ech]
+  mode = "doh"
+  require_ech = true
+  ech_resolver = "layer-2"  # layer-2 fetches layer-3's ECH config
+```
+
+#### ECH rotation mechanism
+
+Named resolvers with ECH support automatic key rotation:
+
+**Reactive (on rejection):**
+1. Query fails with ECH rejection error
+2. Resolver detects the error pattern
+3. Re-resolves dial address through bootstrap
+4. Fetches fresh ECHConfigList via `ech_resolver`
+5. Builds new resolver with new config
+6. Atomically swaps the resolver
+7. Retries the query (up to `max_retries`)
+
+**Proactive (on timer):**
+1. Timer fires every `ech_refresh` interval
+2. Re-runs full build plan
+3. Byte-compares new ECHConfigList against current
+4. If unchanged: no-op (keeps existing resolver)
+5. If changed: atomic swap to new resolver
+
+Concurrent rebuilds are idempotent via generation counters.
 
 ## Upstream address family & NAT64
 

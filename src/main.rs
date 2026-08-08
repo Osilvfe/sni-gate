@@ -8,6 +8,7 @@
 mod ca;
 mod config;
 mod dns;
+mod dns_resolvers;
 mod ech;
 mod error;
 mod nat64;
@@ -58,7 +59,7 @@ struct ProbeTarget {
     port: u16,
     policy: config::H2Probe,
     budget: Duration,
-    resolver: Arc<hickory_resolver::TokioResolver>,
+    resolver: Arc<dns_resolvers::DnsResolver>,
     family: config::AddressFamily,
     nat64: Option<Nat64Prefix>,
 }
@@ -190,6 +191,10 @@ async fn run(cfg: Config) -> Result<()> {
     });
 
     let mut resolver_cache: ResolverCache = HashMap::new();
+
+    // --- Build named resolvers in dependency order ---
+    let named_resolvers = build_named_resolvers(&cfg, &mut resolver_cache).await?;
+
     let mut probe_targets: Vec<ProbeTarget> = Vec::new();
 
     // --- Build every listener ---
@@ -200,6 +205,7 @@ async fn run(cfg: Config) -> Result<()> {
             listener,
             server_configs.clone(),
             root_store.clone(),
+            &named_resolvers,
             &mut resolver_cache,
             &mut probe_targets,
         )?;
@@ -239,6 +245,7 @@ fn build_listener(
     listener: &Listener,
     server_configs: Arc<ServerConfigs>,
     root_store: Arc<RootCertStore>,
+    named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
     probe_targets: &mut Vec<ProbeTarget>,
 ) -> Result<ListenerState> {
@@ -251,6 +258,7 @@ fn build_listener(
             listener,
             route,
             &root_store,
+            named_resolvers,
             resolver_cache,
             probe_targets,
         )?));
@@ -264,6 +272,7 @@ fn build_listener(
             listener,
             d,
             &root_store,
+            named_resolvers,
             resolver_cache,
             probe_targets,
         )?));
@@ -292,6 +301,7 @@ fn build_route(
     listener: &Listener,
     route: &Route,
     root_store: &Arc<RootCertStore>,
+    named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
     probe_targets: &mut Vec<ProbeTarget>,
 ) -> Result<RouteRuntime> {
@@ -330,13 +340,28 @@ fn build_route(
     };
 
     let addr_spec = eff.addr_resolver.clone().unwrap_or_default();
-    let addr_resolver = get_resolver(resolver_cache, &addr_spec, eff.address_family)?;
+    let addr_resolver = get_resolver(
+        named_resolvers,
+        resolver_cache,
+        &addr_spec,
+        eff.address_family,
+    )?;
 
     let eff_ech = cfg.effective_ech(listener, route, rt_tpl, ln_tpl);
     let ech = if route_type == RouteType::Ech {
-        let ech_spec = eff.ech_resolver.clone().unwrap_or_default();
+        let ech_spec = eff.ech_resolver.clone().unwrap_or_else(|| {
+            // Default ECH resolver: use addr_resolver if present, else system resolver
+            eff.addr_resolver
+                .clone()
+                .unwrap_or_else(|| "system".to_string())
+        });
         // HTTPS records are resolved dual-family regardless of upstream family.
-        let ech_resolver = get_resolver(resolver_cache, &ech_spec, config::AddressFamily::Dual)?;
+        let ech_resolver = get_resolver(
+            named_resolvers,
+            resolver_cache,
+            &ech_spec,
+            config::AddressFamily::Dual,
+        )?;
         Some(EchProvider::new(
             eff_ech.clone(),
             port,
@@ -417,10 +442,11 @@ async fn run_probes(targets: Vec<ProbeTarget>) -> Result<()> {
         set.spawn(async move {
             // Resolution shares the route's own resolver/family/NAT64 settings so
             // the probe reaches exactly the address the data path would dial.
-            let resolved =
-                dns::resolve_upstream(&t.resolver, &t.host, t.port, t.family, t.nat64.as_ref())
-                    .await
-                    .with_context(|| format!("resolving h2c probe target {}:{}", t.host, t.port));
+            let resolved = t
+                .resolver
+                .lookup_addr(&t.host, t.port, t.family, t.nat64.as_ref())
+                .await
+                .with_context(|| format!("resolving h2c probe target {}:{}", t.host, t.port));
             let outcome = match resolved {
                 Ok(addr) => probe::probe_h2c(addr, t.budget).await,
                 Err(e) => Err(e),
@@ -474,21 +500,208 @@ async fn run_probes(targets: Vec<ProbeTarget>) -> Result<()> {
 }
 
 /// Get or build a resolver for `spec` under `family`.
+///
+/// Checks the named registry first; if `spec` is a reference, returns that
+/// resolver (and ignores `family` — a named resolver has its own). Otherwise
+/// parses as an inline spec, builds, and wraps in a DnsResolver.
 fn get_resolver(
+    registry: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     cache: &mut ResolverCache,
     spec: &str,
     family: config::AddressFamily,
-) -> Result<Arc<hickory_resolver::TokioResolver>> {
+) -> Result<Arc<dns_resolvers::DnsResolver>> {
+    // Named reference: return from registry.
+    if Config::is_resolver_ref(spec) {
+        return registry
+            .get(spec)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown resolver {spec:?}"));
+    }
+
+    // Inline spec: check cache, or build and wrap.
     let key = (spec.to_string(), family);
     if let Some(r) = cache.get(&key) {
-        return Ok(r.clone());
+        // Wrap cached TokioResolver in DnsResolver (no plan = no rebuild).
+        return Ok(dns_resolvers::DnsResolver::new(
+            spec.to_string(),
+            r.clone(),
+            None,
+            None,
+        ));
     }
     let parsed = ResolverSpec::parse(spec).with_context(|| format!("resolver spec {spec:?}"))?;
     let r = parsed
         .build(family)
         .with_context(|| format!("building resolver {spec:?}"))?;
     cache.insert(key, r.clone());
-    Ok(r)
+    Ok(dns_resolvers::DnsResolver::new(
+        spec.to_string(),
+        r,
+        None,
+        None,
+    ))
+}
+
+/// Build all declared `[resolvers.<name>]` in dependency order, returning a
+/// registry keyed by name.
+async fn build_named_resolvers(
+    cfg: &Config,
+    _cache: &mut ResolverCache,
+) -> Result<HashMap<String, Arc<dns_resolvers::DnsResolver>>> {
+    let mut registry: HashMap<String, Arc<dns_resolvers::DnsResolver>> = HashMap::new();
+    let root_store = Arc::new(ech::webpki_root_store());
+
+    // Topological order so each resolver's dependencies are already built.
+    let order = cfg.resolver_build_order()?;
+
+    for name in order {
+        let eff = cfg.effective_resolver(&name)?;
+
+        // Parse the endpoint (no I/O).
+        let endpoint = dns_resolvers::Endpoint::parse(&eff.endpoint)
+            .with_context(|| format!("[resolvers.{name}] endpoint"))?;
+
+        // Resolve bootstrap: inline spec or named reference.
+        let bootstrap = match &eff.bootstrap {
+            Some(spec) if Config::is_resolver_ref(spec) => {
+                registry.get(spec).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[resolvers.{name}]: bootstrap {spec:?} not found (build order error)"
+                    )
+                })?
+            }
+            Some(spec) => {
+                // Inline spec: build and wrap.
+                let parsed = dns::ResolverSpec::parse(spec)
+                    .with_context(|| format!("[resolvers.{name}] bootstrap spec"))?;
+                let resolver = parsed.build(eff.address_family)?;
+                dns_resolvers::DnsResolver::new(format!("{name}:bootstrap"), resolver, None, None)
+            }
+            None => {
+                // OS resolution.
+                let resolver = dns::ResolverSpec::System.build(eff.address_family)?;
+                dns_resolvers::DnsResolver::new(format!("{name}:system"), resolver, None, None)
+            }
+        };
+
+        // Dial host and port after upstream override.
+        let endpoint_host = endpoint.host().unwrap_or_default().to_string();
+        let (up_host, port) =
+            config::resolved_upstream_from(eff.upstream.as_deref(), endpoint.port()).unwrap();
+        let dial_host = up_host.unwrap_or_else(|| endpoint_host.clone());
+        let dial_port = port;
+
+        // For Plain endpoints (IP addresses), we don't need to resolve the dial_host
+        // through bootstrap - it's already an IP that will be used directly in dns_resolvers::build.
+        // Only DoH/DoT endpoints with hostnames need bootstrap resolution.
+        // An empty dial_host here means a Plain endpoint with no upstream override,
+        // which is handled correctly in dns_resolvers::build (it extracts the IP directly).
+
+        // Server name after override_sni.
+        let server_name = match eff.sni_policy {
+            config::SniPolicy::Reflect | config::SniPolicy::Omit => {
+                endpoint.host().map(str::to_string)
+            }
+            config::SniPolicy::Fixed(ref n) => Some(n.clone()),
+        };
+        let enable_sni = eff.sni_policy != config::SniPolicy::Omit;
+
+        // NAT64 prefix.
+        let nat64 = eff
+            .nat64_prefix
+            .as_ref()
+            .map(|s| s.parse::<nat64::Nat64Prefix>())
+            .transpose()
+            .with_context(|| format!("[resolvers.{name}] nat64_prefix"))?;
+
+        // ECH plan.
+        let ech = eff
+            .ech
+            .as_ref()
+            .map(|e_settings| {
+                let ech_resolver = match &eff.ech_resolver {
+                    Some(spec) if Config::is_resolver_ref(spec) => {
+                        registry.get(spec).cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "[resolvers.{name}.ech]: ech_resolver {spec:?} not found"
+                            )
+                        })?
+                    }
+                    Some(spec) => {
+                        // Inline spec.
+                        let parsed = dns::ResolverSpec::parse(spec)
+                            .with_context(|| format!("[resolvers.{name}] ech_resolver spec"))?;
+                        let resolver = parsed.build(config::AddressFamily::Dual)?;
+                        dns_resolvers::DnsResolver::new(
+                            format!("{name}:ech_resolver"),
+                            resolver,
+                            None,
+                            None,
+                        )
+                    }
+                    None => {
+                        // OS resolution for ECH lookups.
+                        let resolver =
+                            dns::ResolverSpec::System.build(config::AddressFamily::Dual)?;
+                        dns_resolvers::DnsResolver::new(
+                            format!("{name}:ech:system"),
+                            resolver,
+                            None,
+                            None,
+                        )
+                    }
+                };
+
+                Ok::<_, anyhow::Error>(dns_resolvers::EchPlan {
+                    settings: e_settings.clone(),
+                    require_ech: eff.require_ech,
+                    refresh: eff.ech_refresh,
+                    resolver: ech_resolver,
+                    root_store: root_store.clone(),
+                    max_retries: e_settings.max_retries,
+                })
+            })
+            .transpose()?;
+
+        let plan = Arc::new(dns_resolvers::ResolverPlan {
+            // `eff.name` is the declared name, carried through by
+            // `effective_resolver` precisely so diagnostics can quote it.
+            label: eff.name.clone(),
+            endpoint,
+            dial_host,
+            dial_port,
+            server_name,
+            enable_sni,
+            family: eff.address_family,
+            nat64,
+            connect_timeout: eff.connect_timeout,
+            bootstrap,
+            ech,
+        });
+
+        // Build the resolver from the plan.
+        let built = dns_resolvers::build(&plan)
+            .await
+            .with_context(|| format!("[resolvers.{name}]"))?;
+
+        let handle = dns_resolvers::DnsResolver::new(
+            name.clone(),
+            built.resolver,
+            Some(plan.clone()),
+            built.ech_bytes,
+        );
+
+        // Proactive ECH rotation: only a resolver that actually uses ECH has
+        // anything to refresh.
+        if let Some(ech) = &plan.ech {
+            dns_resolvers::spawn_ech_refresher(&handle, ech.refresh);
+        }
+
+        info!(name, endpoint = %eff.endpoint, "built named resolver");
+        registry.insert(name, handle);
+    }
+
+    Ok(registry)
 }
 
 fn init_tracing(directive: &str) {

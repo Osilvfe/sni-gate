@@ -56,6 +56,15 @@ pub struct Config {
     #[serde(default)]
     pub templates: HashMap<String, Template>,
 
+    /// Named DNS resolvers. A `[resolvers.<name>]` table declares a resolver
+    /// endpoint together with the same transport controls a route gets —
+    /// `upstream`, `override_sni`, an `[ech]` block, `address_family`,
+    /// `nat64_prefix` — and is referenced by name anywhere a resolver spec
+    /// string is accepted (`resolver`, `ech_resolver`, `addr_resolver`, or
+    /// another resolver's `bootstrap`). See [`ResolverDef`].
+    #[serde(default)]
+    pub resolvers: HashMap<String, ResolverDef>,
+
     /// One or more inbound listeners.
     #[serde(rename = "listener")]
     pub listeners: Vec<Listener>,
@@ -404,6 +413,238 @@ pub struct Template {
 }
 
 // ---------------------------------------------------------------------------
+// Named resolvers
+// ---------------------------------------------------------------------------
+
+/// A named DNS resolver, declared as `[resolvers.<name>]` and referenced by name
+/// anywhere a resolver spec string is accepted (`resolver`, `addr_resolver`,
+/// `ech_resolver`, or another resolver's `bootstrap`).
+///
+/// # Why this exists
+///
+/// A DoH endpoint is an HTTPS origin. Nothing makes it less subject to SNI
+/// blocking than the origins `[[listener.route]]` already handles, and nothing
+/// makes the countermeasures different: dial a CDN edge instead of the blocked
+/// name, keep (or override) the TLS name, hide that name with ECH. So a resolver
+/// gets the same vocabulary a route has rather than a special-cased subset.
+///
+/// # Inheritance
+///
+/// A resolver is a scope in the ladder with `[global]` as its only parent:
+///
+/// ```text
+/// resolver.ech  →  resolver  →  global.ech  →  global
+/// ```
+///
+/// `address_family`, `nat64_prefix` and `connect_timeout` inherit from
+/// `[global]`, and the `[ech]` block inherits field-by-field from `[global.ech]`
+/// — `mode`, `config`, `ech_domain`, `max_retries`, `require_ech`, `ech_refresh`
+/// each resolve independently, exactly as for a route. So `[resolvers.x.ech]` may
+/// be written empty to mean "the same ECH settings my routes use".
+///
+/// Three things deliberately do **not** inherit, each for a specific reason
+/// rather than a general principle:
+///
+/// * **`bootstrap`** — a *dependency edge*, not a setting. Inheriting it from
+///   `[global].resolver` would make the graph implicitly cyclic in the most
+///   ordinary configuration there is: `global.resolver = "cf-doh"` plus a
+///   `cf-doh` with no explicit bootstrap would have `cf-doh` bootstrapping from
+///   itself. The cycle detector would catch it, but the operator would face an
+///   error about a cycle they never wrote.
+/// * **`ech.ech_resolver`** — the same argument: it is the edge naming who
+///   fetches this resolver's ECH keys.
+/// * **The *presence* of `[ech]`** — the block's fields inherit, but the block
+///   itself must be declared. A bare `[global.ech]` (present in any config with
+///   ECH routes) would otherwise silently switch ECH on for every resolver,
+///   including the bootstrap resolver that must stay reachable when nothing else
+///   is — the exact failure that leaves the gateway unable to resolve at all. It
+///   would also apply a route's `ech_domain` to an unrelated DoH host.
+///
+/// `endpoint`, `upstream` and `override_sni` have no `[global]` counterpart:
+/// the first is this resolver's identity, and the other two are meaningful only
+/// relative to a specific endpoint.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverDef {
+    /// The transport, in the same grammar accepted everywhere else:
+    /// `system` · `https://host[:port][/path]` · `tls://host[:port]` ·
+    /// `udp://ip[:port]` · `tcp://ip[:port]` · bare `ip[:port]`.
+    ///
+    /// Called `endpoint` rather than `url` because `system` and `udp://1.1.1.1`
+    /// are not URLs.
+    pub endpoint: String,
+
+    /// Where to actually dial, when that differs from the endpoint's own host.
+    /// Accepts the same forms as a route's `upstream`:
+    ///
+    ///   * `"host:port"` — both overridden
+    ///   * `"host"`      — host overridden, endpoint's port kept
+    ///   * `"8443"`      — port overridden, endpoint's host kept
+    ///   * *(omitted)*   — dial the endpoint's own host and port
+    ///
+    /// Overriding the dial target does **not** change the TLS server name; that
+    /// is exactly what makes `endpoint = "https://blocked.example/dns-query"`
+    /// plus `upstream = "cdn.example"` work.
+    ///
+    /// Unlike a route's `upstream`, the host is never omitted-to-reflect: there
+    /// is no inbound connection to reflect.
+    #[serde(default)]
+    pub upstream: Option<String>,
+
+    /// TLS server name presented to the endpoint. Same three cases as a route's
+    /// `override_sni`: omitted reflects the endpoint's own host, a value sends
+    /// exactly that name, and `""` sends no `server_name` extension while the
+    /// certificate is still verified against the endpoint host.
+    ///
+    /// On **DoH** this also moves the HTTP `:authority`, because hickory uses one
+    /// field for both and RFC 8484 carries the query to that origin. They are one
+    /// knob on this transport, not two that happen to agree — to *hide* a name
+    /// rather than change it, use ECH.
+    #[serde(default)]
+    pub override_sni: Option<String>,
+
+    /// Resolver that turns this resolver's dial host into an address. A name from
+    /// `[resolvers.*]`, or a bare spec. Omitted means OS resolution, which is
+    /// correct for a bootstrap resolver addressed by IP.
+    ///
+    /// Never inherited — see the type-level note.
+    #[serde(default)]
+    pub bootstrap: Option<String>,
+
+    /// ECH for this resolver's own TLS handshake. Opt-in: the *presence* of this
+    /// block is never inherited from `[global.ech]`, though its fields are.
+    #[serde(default)]
+    pub ech: Option<EchConfig>,
+
+    /// Address family used when resolving the dial host. Inherits from `[global]`.
+    #[serde(default)]
+    pub address_family: Option<AddressFamily>,
+
+    /// NAT64 /96 prefix applied when the dial host resolves only to IPv4.
+    /// Inherits from `[global]`.
+    #[serde(default)]
+    pub nat64_prefix: Option<String>,
+
+    /// Per-query timeout handed to hickory, and the bound on dialing this
+    /// resolver's own endpoint. Inherits from `[global]`.
+    #[serde(default, with = "humantime_serde::option")]
+    pub connect_timeout: Option<Duration>,
+}
+
+/// The fully-resolved settings for one named resolver.
+///
+/// Unlike [`Effective`] this is not the product of a five-tier ladder — a
+/// resolver has only itself and `[global]` — so it is a validated,
+/// defaults-applied view of one [`ResolverDef`].
+#[derive(Debug, Clone)]
+pub struct EffectiveResolver {
+    /// The name it was declared under, for diagnostics.
+    pub name: String,
+    pub endpoint: String,
+    pub upstream: Option<String>,
+    pub sni_policy: SniPolicy,
+    pub bootstrap: Option<String>,
+    pub address_family: AddressFamily,
+    pub nat64_prefix: Option<String>,
+    pub connect_timeout: Duration,
+    /// `Some` only when the definition carries an explicit `[ech]` block.
+    /// `None` means this resolver does not use ECH at all.
+    pub ech: Option<EffectiveEch>,
+    /// Only meaningful when `ech` is `Some`.
+    pub require_ech: bool,
+    /// Only meaningful when `ech` is `Some`.
+    pub ech_refresh: Duration,
+    /// Resolver performing this resolver's own ECH HTTPS-record lookup.
+    /// Never inherited.
+    pub ech_resolver: Option<String>,
+}
+
+impl ResolverDef {
+    /// Flatten one definition, applying inheritance from `[global]` and defaults.
+    ///
+    /// Nothing here can fail: the fallible parts (endpoint grammar, reference
+    /// existence, cycles, a `static` mode with no resolvable config) are checked
+    /// by [`Config::validate_resolvers`], which reads *this* result rather than
+    /// the raw definition so that validation and runtime never disagree.
+    pub fn effective(&self, name: &str, global: &Global) -> EffectiveResolver {
+        let g = &global.common;
+        let ge = global.ech.as_ref();
+
+        // The `[ech]` block inherits field-by-field from `[global.ech]` exactly as
+        // a route's does — but only once this resolver has *declared* an `[ech]`
+        // table. Presence is the opt-in gate; see the type-level note.
+        let ech = self.ech.as_ref().map(|e| EffectiveEch {
+            mode: e
+                .mode
+                .or_else(|| ge.and_then(|g| g.mode))
+                .unwrap_or_default(),
+            config: e
+                .config
+                .clone()
+                .or_else(|| ge.and_then(|g| g.config.clone())),
+            ech_domain: e
+                .ech_domain
+                .clone()
+                .or_else(|| ge.and_then(|g| g.ech_domain.clone())),
+            max_retries: e
+                .max_retries
+                .or_else(|| ge.and_then(|g| g.max_retries))
+                .unwrap_or(2),
+        });
+
+        EffectiveResolver {
+            name: name.to_string(),
+            endpoint: self.endpoint.clone(),
+            upstream: self.upstream.clone(),
+            sni_policy: SniPolicy::resolve(self.override_sni.as_deref()),
+            // Never inherited — a dependency edge, not a setting.
+            bootstrap: self.bootstrap.clone(),
+            address_family: self.address_family.or(g.address_family).unwrap_or_default(),
+            nat64_prefix: self.nat64_prefix.clone().or_else(|| g.nat64_prefix.clone()),
+            connect_timeout: self
+                .connect_timeout
+                .or(g.connect_timeout)
+                .unwrap_or_else(default_connect_timeout),
+            ech,
+            // Gated on this resolver having its own `[ech]`: without one these are
+            // never read. With one, they inherit like a route's, and a resolver
+            // that opts into ECH defaults to requiring it.
+            require_ech: self
+                .ech
+                .as_ref()
+                .and_then(|e| {
+                    e.require_ech
+                        .or_else(|| ge.and_then(|g| g.require_ech))
+                        .or(g.require_ech)
+                })
+                .unwrap_or(true),
+            ech_refresh: self
+                .ech
+                .as_ref()
+                .and_then(|e| {
+                    e.ech_refresh
+                        .or_else(|| ge.and_then(|g| g.ech_refresh))
+                        .or(g.ech_refresh)
+                })
+                .unwrap_or_else(default_ech_refresh),
+            // Never inherited — a dependency edge, like `bootstrap`.
+            ech_resolver: self.ech.as_ref().and_then(|e| e.ech_resolver.clone()),
+        }
+    }
+
+    /// The other resolvers this one depends on: its bootstrap, and whoever
+    /// fetches its ECH config. These are the edges of the dependency graph.
+    fn references(&self) -> impl Iterator<Item = &str> {
+        [
+            self.bootstrap.as_deref(),
+            self.ech.as_ref().and_then(|e| e.ech_resolver.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Overridable common options (the fallback ladder)
 // ---------------------------------------------------------------------------
 
@@ -737,6 +978,287 @@ impl Config {
         }
     }
 
+    /// Whether `spec` is a `[resolvers.<name>]` reference rather than an inline
+    /// endpoint spec.
+    ///
+    /// The two namespaces are disjoint *by construction*, not by convention: every
+    /// inline spec carries either a scheme (`https://`, `tls://`, `udp://`), a `:`
+    /// port separator, or is a bare IP literal, and `system` is reserved. A bare
+    /// word is none of those — today it is already a load error, so reading it as
+    /// a name is purely additive and can never shadow a valid spec.
+    ///
+    /// [`validate_resolvers`](Self::validate_resolvers) additionally rejects a
+    /// declared name that *would* parse as a spec, closing the loop from the other
+    /// side, and rejects a bare word matching no declaration (a typo) rather than
+    /// letting it fail later as "not a valid ip[:port]".
+    pub fn is_resolver_ref(spec: &str) -> bool {
+        let s = spec.trim();
+        !s.is_empty()
+            && !s.eq_ignore_ascii_case("system")
+            && !s.contains("://")
+            && !s.contains(':')
+            && s.parse::<std::net::IpAddr>().is_err()
+    }
+
+    /// Look up a declared resolver by name.
+    pub fn resolver_def(&self, name: &str) -> Result<&ResolverDef, ConfigError> {
+        self.resolvers.get(name).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "unknown resolver {name:?} (no matching [resolvers.{name}])"
+            ))
+        })
+    }
+
+    /// The effective settings for a declared resolver, by name.
+    pub fn effective_resolver(&self, name: &str) -> Result<EffectiveResolver, ConfigError> {
+        Ok(self.resolver_def(name)?.effective(name, &self.global))
+    }
+
+    /// Every resolver spec written anywhere in the document, each tagged with a
+    /// human-readable origin so an error can point at the line the user wrote.
+    fn resolver_refs(&self) -> Vec<(String, String)> {
+        fn push_common(out: &mut Vec<(String, String)>, origin: String, c: &CommonOpts) {
+            for s in [&c.resolver, &c.ech_resolver, &c.addr_resolver]
+                .into_iter()
+                .flatten()
+            {
+                out.push((origin.clone(), s.clone()));
+            }
+        }
+
+        let mut out: Vec<(String, String)> = Vec::new();
+
+        push_common(&mut out, "[global]".to_string(), &self.global.common);
+        if let Some(e) = &self.global.ech {
+            if let Some(s) = &e.ech_resolver {
+                out.push(("[global.ech]".to_string(), s.clone()));
+            }
+        }
+        for (name, t) in &self.templates {
+            push_common(&mut out, format!("[templates.{name}]"), &t.common);
+            if let Some(e) = &t.ech {
+                if let Some(s) = &e.ech_resolver {
+                    out.push((format!("[templates.{name}.ech]"), s.clone()));
+                }
+            }
+        }
+        for l in &self.listeners {
+            let origin = format!("listener {}", l.addr);
+            push_common(&mut out, origin.clone(), &l.common);
+            if let Some(e) = &l.ech {
+                if let Some(s) = &e.ech_resolver {
+                    out.push((format!("{origin} [ech]"), s.clone()));
+                }
+            }
+            for r in l.routes.iter().chain(l.default_route.iter()) {
+                let ro = format!("route {}", r.label());
+                push_common(&mut out, ro.clone(), &r.common);
+                if let Some(e) = &r.ech {
+                    if let Some(s) = &e.ech_resolver {
+                        out.push((format!("{ro} [ech]"), s.clone()));
+                    }
+                }
+            }
+        }
+        for (name, r) in &self.resolvers {
+            let origin = format!("[resolvers.{name}]");
+            if let Some(s) = &r.bootstrap {
+                out.push((format!("{origin} bootstrap"), s.clone()));
+            }
+            if let Some(e) = &r.ech {
+                if let Some(s) = &e.ech_resolver {
+                    out.push((format!("{origin}.ech ech_resolver"), s.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Validate the `[resolvers]` table: namespace disjointness, reference
+    /// existence, endpoint grammar, acyclicity, and ECH completeness.
+    ///
+    /// Cycles must be a **load-time** refusal rather than a runtime timeout,
+    /// because building a resolver is exactly what resolving its own address
+    /// requires: a cycle would deadlock startup with no useful diagnostic. The
+    /// error names the whole path so the user can see which edge to break.
+    fn validate_resolvers(&self) -> Result<(), ConfigError> {
+        // A declared name that would also parse as an inline spec would make
+        // every reference to it ambiguous. Reject it at the declaration, where
+        // the fix is obvious, rather than at each use.
+        for name in self.resolvers.keys() {
+            if !Self::is_resolver_ref(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "[resolvers.{name}]: the name {name:?} would also parse as an inline \
+                     resolver spec, which would make every reference to it ambiguous; \
+                     pick a name that is not `system`, an IP literal, or scheme-prefixed"
+                )));
+            }
+        }
+
+        // Every reference resolves. A bare word that matches nothing is a typo,
+        // and saying so beats the downstream "not a valid ip[:port]".
+        for (origin, spec) in self.resolver_refs() {
+            if Self::is_resolver_ref(&spec) && !self.resolvers.contains_key(&spec) {
+                return Err(ConfigError::Invalid(format!(
+                    "{origin}: unknown resolver {spec:?} (no matching [resolvers.{spec}]; \
+                     an inline endpoint needs a scheme, e.g. \"https://{spec}/dns-query\")"
+                )));
+            }
+        }
+
+        for (name, def) in &self.resolvers {
+            if def.endpoint.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[resolvers.{name}]: `endpoint` must not be empty (use \"system\" for \
+                     the OS resolver)"
+                )));
+            }
+            // A resolver's own `endpoint` must be an inline spec: allowing a name
+            // there would mean "this resolver *is* that resolver", which is a
+            // reference, not a transport.
+            if Self::is_resolver_ref(&def.endpoint) {
+                return Err(ConfigError::Invalid(format!(
+                    "[resolvers.{name}]: `endpoint` must be an inline spec, not a reference \
+                     to another resolver (got {:?}); use `bootstrap` to say who resolves \
+                     this endpoint's own address",
+                    def.endpoint
+                )));
+            }
+
+            let eff = def.effective(name, &self.global);
+
+            // `static` / `doh-with-fallback` need a config from *somewhere*. This
+            // reads the **effective** block, not the raw one: `config` may be
+            // inherited from [global.ech], and checking the raw table would reject
+            // exactly the case inheritance exists to serve.
+            if let Some(ech) = &eff.ech {
+                if matches!(ech.mode, EchMode::Static | EchMode::DohWithFallback)
+                    && ech.config.is_none()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "[resolvers.{name}.ech]: mode = \"{}\" requires a base64 `config`, \
+                         resolvable from [resolvers.{name}.ech] or [global.ech]",
+                        match ech.mode {
+                            EchMode::Static => "static",
+                            _ => "doh-with-fallback",
+                        }
+                    )));
+                }
+                // An ECH-enabled resolver whose ECH lookup is answered by itself
+                // cannot bootstrap: fetching its own ECHConfig needs the resolver
+                // the fetch is for. The generic cycle check below catches named
+                // self-reference, but `ech_resolver` omitted entirely means "the
+                // system resolver", which is fine — only naming *itself* is not.
+                if eff.ech_resolver.as_deref() == Some(name.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "[resolvers.{name}.ech]: ech_resolver = {name:?} would have this \
+                         resolver fetch its own ECHConfig through itself; name a different \
+                         resolver, or omit it to use OS resolution"
+                    )));
+                }
+            }
+            if eff.bootstrap.as_deref() == Some(name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "[resolvers.{name}]: bootstrap = {name:?} would have this resolver \
+                     resolve its own address through itself; name a different resolver, \
+                     or omit it to use OS resolution"
+                )));
+            }
+        }
+
+        // Acyclicity. `build_order` performs the DFS and reports the path.
+        self.resolver_build_order().map(|_| ())
+    }
+
+    /// The declared resolvers in dependency order: every resolver appears after
+    /// the ones it depends on, so a single forward pass can build them all with
+    /// each dependency already available.
+    ///
+    /// Returns an error naming the full cycle path when the graph is cyclic.
+    pub fn resolver_build_order(&self) -> Result<Vec<String>, ConfigError> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Open,
+            Done,
+        }
+
+        let mut marks: HashMap<&str, Mark> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+
+        // Deterministic iteration: a HashMap's order varies per process, and an
+        // error message (or a build order) that changes run to run is a bad
+        // diagnostic. Sorting costs nothing at startup.
+        let mut names: Vec<&str> = self.resolvers.keys().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+
+        // Explicit stack rather than recursion: a deep chain must not be able to
+        // overflow the stack during config load.
+        enum Step<'a> {
+            Enter(&'a str, Vec<&'a str>),
+            Exit(&'a str),
+        }
+
+        for root in names {
+            if marks.get(root) == Some(&Mark::Done) {
+                continue;
+            }
+            let mut stack = vec![Step::Enter(root, vec![root])];
+            while let Some(step) = stack.pop() {
+                match step {
+                    Step::Exit(name) => {
+                        marks.insert(name, Mark::Done);
+                        order.push(name.to_string());
+                    }
+                    Step::Enter(name, path) => {
+                        match marks.get(name) {
+                            Some(Mark::Done) => continue,
+                            Some(Mark::Open) => {
+                                // `path` ends at the repeated name, so it already
+                                // reads as the cycle.
+                                return Err(ConfigError::Invalid(format!(
+                                    "[resolvers]: dependency cycle {} — every resolver in a \
+                                     cycle needs another one in it to find its own address. \
+                                     Break the chain by pointing one `bootstrap` at a literal \
+                                     IP, or by omitting it to use OS resolution",
+                                    path.join(" -> ")
+                                )));
+                            }
+                            None => {}
+                        }
+                        marks.insert(name, Mark::Open);
+                        stack.push(Step::Exit(name));
+
+                        // Only declared names are edges; inline specs are leaves.
+                        let def = self.resolver_def(name)?;
+                        let mut edges: Vec<&str> = def
+                            .references()
+                            .filter(|s| Self::is_resolver_ref(s))
+                            .collect();
+                        edges.sort_unstable();
+                        edges.dedup();
+                        for e in edges {
+                            // Resolve to the declared key so the reported path uses
+                            // the canonical spelling.
+                            let key = self
+                                .resolvers
+                                .get_key_value(e)
+                                .map(|(k, _)| k.as_str())
+                                .ok_or_else(|| {
+                                    ConfigError::Invalid(format!(
+                                        "[resolvers.{name}]: unknown resolver {e:?}"
+                                    ))
+                                })?;
+                            let mut next = path.clone();
+                            next.push(key);
+                            stack.push(Step::Enter(key, next));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(order)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.listeners.is_empty() {
             return Err(ConfigError::Invalid(
@@ -778,6 +1300,7 @@ impl Config {
                 "store.renew_margin_days must be < ca.leaf_validity_days".into(),
             ));
         }
+        self.validate_resolvers()?;
         Ok(())
     }
 

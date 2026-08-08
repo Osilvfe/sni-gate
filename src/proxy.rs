@@ -45,7 +45,6 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
 use crate::config::{AddressFamily, FailPolicy, RouteType, SniPolicy};
-use crate::dns::resolve_upstream;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::peek::{classify, Inbound};
@@ -74,7 +73,7 @@ pub struct RouteRuntime {
     pub nat64: Option<Nat64Prefix>,
     pub fail: FailPolicy,
     /// DNS resolver for upstream A/AAAA.
-    pub addr_resolver: Arc<hickory_resolver::TokioResolver>,
+    pub addr_resolver: Arc<crate::dns_resolvers::DnsResolver>,
     /// ECH provider (only for `ech` routes).
     pub ech: Option<EchProvider>,
     /// Verified web-PKI roots for upstream TLS (`ech`/`tls`).
@@ -320,15 +319,16 @@ async fn serve_mirrored(
             rt.name
         )
     })?;
-    let upstream_addr = resolve_upstream(
-        &rt.addr_resolver,
-        &host,
-        rt.upstream_port,
-        rt.address_family,
-        rt.nat64.as_ref(),
-    )
-    .await
-    .with_context(|| format!("resolving upstream {host}"))?;
+    let upstream_addr = rt
+        .addr_resolver
+        .lookup_addr(
+            &host,
+            rt.upstream_port,
+            rt.address_family,
+            rt.nat64.as_ref(),
+        )
+        .await
+        .with_context(|| format!("resolving upstream {host}"))?;
 
     // Dial first, so the upstream's choice can drive the inbound handshake.
     let up = match rt.route_type {
@@ -404,15 +404,16 @@ where
         )
     })?;
 
-    let upstream_addr = resolve_upstream(
-        &rt.addr_resolver,
-        &host,
-        rt.upstream_port,
-        rt.address_family,
-        rt.nat64.as_ref(),
-    )
-    .await
-    .with_context(|| format!("resolving upstream {host}"))?;
+    let upstream_addr = rt
+        .addr_resolver
+        .lookup_addr(
+            &host,
+            rt.upstream_port,
+            rt.address_family,
+            rt.nat64.as_ref(),
+        )
+        .await
+        .with_context(|| format!("resolving upstream {host}"))?;
 
     match rt.route_type {
         RouteType::Http => {
@@ -542,19 +543,11 @@ async fn dial_ech(
 
 /// Whether an I/O error is rustls's "server rejected ECH" signal.
 ///
-/// tokio-rustls surfaces rustls errors wrapped in `io::Error`; we downcast to
-/// the typed `rustls::Error` and match the exact
-/// `PeerIncompatible::ServerRejectedEncryptedClientHello` variant, rather than
-/// matching on the Display string (which could false-positive on unrelated
-/// errors that merely contain "ECH").
+/// Delegates to [`crate::ech::is_ech_reject_io`]. A resolver's own handshake
+/// needs the identical verdict, so the predicate lives in `ech` and both paths
+/// call it rather than each carrying a copy that could drift.
 fn is_ech_reject(e: &std::io::Error) -> bool {
-    matches!(
-        e.get_ref()
-            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
-        Some(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(_)
-        ))
-    )
+    crate::ech::is_ech_reject_io(e)
 }
 
 /// Splice bytes bidirectionally, enforcing a true **idle** timeout: the clock
@@ -651,14 +644,15 @@ async fn raw_passthrough(
                 rt.name
             )
         })?;
-        let upstream_addr = resolve_upstream(
-            &rt.addr_resolver,
-            &host,
-            rt.upstream_port,
-            rt.address_family,
-            rt.nat64.as_ref(),
-        )
-        .await?;
+        let upstream_addr = rt
+            .addr_resolver
+            .lookup_addr(
+                &host,
+                rt.upstream_port,
+                rt.address_family,
+                rt.nat64.as_ref(),
+            )
+            .await?;
         dial(upstream_addr, rt.connect_timeout).await
     }
     .await;
