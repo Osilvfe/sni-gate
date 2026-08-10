@@ -6,6 +6,7 @@
 //! wildcard from a local CA (persisted, cached, public-suffix-aware).
 
 mod ca;
+mod certscope;
 mod config;
 mod dns;
 mod dns_resolvers;
@@ -35,12 +36,13 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::ca::{CaParams, CertificateAuthority};
+use crate::certscope::{CertScope, EchIdentity, Forwarding};
 use crate::config::{Config, Listener, Route, RouteType};
 use crate::dns::ResolverSpec;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::proxy::{ListenerState, RouteRuntime, ServerConfigs};
-use crate::resolver::{DynamicResolver, ResolverParams};
+use crate::resolver::{DynamicResolver, Issuer, IssuerParams};
 use crate::router::Router;
 use crate::store::CertStore;
 
@@ -152,7 +154,10 @@ async fn run(cfg: Config) -> Result<()> {
         None
     };
 
-    let dyn_resolver = Arc::new(DynamicResolver::new(ResolverParams {
+    // The issuance machinery, shared by every listener. Each listener then binds
+    // it to its own routing table (see `build_listener`), because which names may
+    // share a certificate is a property of *that listener's* routes.
+    let issuer = Arc::new(Issuer::new(IssuerParams {
         ca,
         suffix,
         store,
@@ -160,30 +165,6 @@ async fn run(cfg: Config) -> Result<()> {
         cache_capacity: cfg.cache.capacity,
         cache_ttl: Duration::from_secs(cfg.cache.ttl_secs),
     }));
-
-    // One base server config for local termination; the resolver issues for any
-    // SNI. It is then cloned into the ALPN variants the data path selects
-    // between (see `ServerConfigs`): the clones share the cert resolver,
-    // ticketer and session cache, and differ only in `alpn_protocols`.
-    let mut server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(dyn_resolver);
-    if let Ok(t) = rustls::crypto::aws_lc_rs::Ticketer::new() {
-        server_config.ticketer = t;
-    }
-    server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(8192);
-
-    let with_alpn = |protocols: Vec<Vec<u8>>| {
-        let mut c = server_config.clone();
-        c.alpn_protocols = protocols;
-        Arc::new(c)
-    };
-    let server_configs = Arc::new(ServerConfigs {
-        none: with_alpn(Vec::new()),
-        h1: with_alpn(vec![b"http/1.1".to_vec()]),
-        h2: with_alpn(vec![b"h2".to_vec()]),
-        h2h1: with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    });
 
     // Shared web-PKI roots for upstream TLS verification.
     let root_store = Arc::new(RootCertStore {
@@ -203,7 +184,7 @@ async fn run(cfg: Config) -> Result<()> {
         let state = build_listener(
             &cfg,
             listener,
-            server_configs.clone(),
+            issuer.clone(),
             root_store.clone(),
             &named_resolvers,
             &mut resolver_cache,
@@ -243,7 +224,7 @@ async fn run(cfg: Config) -> Result<()> {
 fn build_listener(
     cfg: &Config,
     listener: &Listener,
-    server_configs: Arc<ServerConfigs>,
+    issuer: Arc<Issuer>,
     root_store: Arc<RootCertStore>,
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
@@ -251,9 +232,10 @@ fn build_listener(
 ) -> Result<ListenerState> {
     let mut runtimes: Vec<Arc<RouteRuntime>> = Vec::new();
     let mut patterns: Vec<Vec<String>> = Vec::new();
+    let mut forwardings: Vec<Forwarding> = Vec::new();
 
     for route in &listener.routes {
-        runtimes.push(Arc::new(build_route(
+        let built = build_route(
             cfg,
             listener,
             route,
@@ -261,13 +243,15 @@ fn build_listener(
             named_resolvers,
             resolver_cache,
             probe_targets,
-        )?));
+        )?;
+        runtimes.push(Arc::new(built.runtime));
+        forwardings.push(built.forwarding);
         patterns.push(route.match_sni.clone());
     }
 
     let default_id = if let Some(d) = &listener.default_route {
         let id = runtimes.len();
-        runtimes.push(Arc::new(build_route(
+        let built = build_route(
             cfg,
             listener,
             d,
@@ -275,15 +259,60 @@ fn build_listener(
             named_resolvers,
             resolver_cache,
             probe_targets,
-        )?));
+        )?;
+        runtimes.push(Arc::new(built.runtime));
+        forwardings.push(built.forwarding);
         patterns.push(Vec::new());
         Some(id)
     } else {
         None
     };
 
-    let router = Router::build(&patterns, default_id)
-        .map_err(|e| anyhow::anyhow!("listener {}: {e}", listener.addr))?;
+    let router = Arc::new(
+        Router::build(&patterns, default_id)
+            .map_err(|e| anyhow::anyhow!("listener {}: {e}", listener.addr))?,
+    );
+
+    // Certificate scopes. The routing table is part of a scope's identity because
+    // a wildcard proven confined under these routes may not be confined under
+    // another listener's — see `certscope`.
+    let router_fp = certscope::router_fingerprint(&patterns, default_id);
+    let scopes: Arc<[CertScope]> = forwardings
+        .iter()
+        .map(|f| CertScope::new(router_fp, f))
+        .collect::<Vec<_>>()
+        .into();
+
+    // This listener's certificate resolver: the shared issuer bound to this
+    // routing table.
+    let cert_resolver = Arc::new(DynamicResolver::new(issuer, router.clone(), scopes.clone()));
+
+    report_issuance_plan(listener, &cert_resolver, &runtimes, &scopes, &patterns);
+    warn_on_raw_overlap(listener, &runtimes, &patterns);
+
+    // One base server config for local termination; the resolver issues for any
+    // routable SNI. It is then cloned into the ALPN variants the data path selects
+    // between (see `ServerConfigs`): the clones share the cert resolver, ticketer
+    // and session cache, and differ only in `alpn_protocols`.
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(cert_resolver);
+    if let Ok(t) = rustls::crypto::aws_lc_rs::Ticketer::new() {
+        server_config.ticketer = t;
+    }
+    server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(8192);
+
+    let with_alpn = |protocols: Vec<Vec<u8>>| {
+        let mut c = server_config.clone();
+        c.alpn_protocols = protocols;
+        Arc::new(c)
+    };
+    let server_configs = Arc::new(ServerConfigs {
+        none: with_alpn(Vec::new()),
+        h1: with_alpn(vec![b"http/1.1".to_vec()]),
+        h2: with_alpn(vec![b"h2".to_vec()]),
+        h2h1: with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    });
 
     Ok(ListenerState {
         addr: listener.addr,
@@ -292,6 +321,218 @@ fn build_listener(
         server_configs,
         unmatched: cfg.global.unmatched.clone(),
     })
+}
+
+/// Report, before any traffic arrives, what each route's certificates will
+/// actually cover.
+///
+/// `[issuance] mode` is an upper bound on breadth: a proposed wildcard is
+/// withheld when some host it would cover routes to a different upstream, because
+/// issuing it would let a client coalesce a connection past this gateway's
+/// routing (see [`resolver`]). That is a correctness bound rather than a silent
+/// downgrade, so the effective coverage — and every withheld name, with the
+/// conflicting host named — is printed here instead of being left to be
+/// discovered from a packet capture.
+///
+/// Reported at `INFO`, not `WARN`: on a configuration that deliberately sends two
+/// names under one registrable domain to different upstreams, withholding is the
+/// intended outcome on every boot, and warning about intended behavior is how
+/// warnings stop being read. The one case that does warn is
+/// [`warn_on_raw_overlap`], which is a gap this program cannot close.
+fn report_issuance_plan(
+    listener: &Listener,
+    cert_resolver: &DynamicResolver,
+    runtimes: &[Arc<RouteRuntime>],
+    scopes: &[CertScope],
+    patterns: &[Vec<String>],
+) {
+    struct RouteReport<'a> {
+        name: &'a str,
+        scope: &'a CertScope,
+        covers: std::collections::BTreeSet<String>,
+        withheld: Vec<String>,
+        regexes: Vec<&'a str>,
+    }
+
+    let mut reports: Vec<RouteReport<'_>> = Vec::with_capacity(patterns.len());
+
+    for (id, pats) in patterns.iter().enumerate() {
+        // Probe hosts: the concrete names whose coverage a pattern determines. A
+        // regex pattern has no representative host, so it is reported as deferred.
+        let mut probes: Vec<String> = Vec::new();
+        let mut regexes: Vec<&str> = Vec::new();
+        for pat in pats {
+            let pat = pat.trim();
+            if let Some(re) = pat.strip_prefix('~') {
+                regexes.push(re);
+            } else if let Some(rest) = pat.strip_prefix("*.") {
+                probes.push(format!("probe.{rest}"));
+            } else if let Some(rest) = pat.strip_prefix('.') {
+                // A suffix pattern covers the apex and its subdomains; the two can
+                // plan differently, so probe both.
+                probes.push(rest.to_string());
+                probes.push(format!("probe.{rest}"));
+            } else {
+                probes.push(pat.to_string());
+            }
+        }
+
+        let mut withheld: Vec<String> = Vec::new();
+        let mut covers: std::collections::BTreeSet<String> = Default::default();
+        for host in &probes {
+            if let Some(plan) = cert_resolver.plan(host) {
+                covers.extend(plan.kept.iter().cloned());
+                for (name, escape) in &plan.withheld {
+                    withheld.push(format!("{name} ({})", describe_escape(escape, runtimes)));
+                }
+            }
+        }
+        withheld.sort();
+        withheld.dedup();
+
+        reports.push(RouteReport {
+            name: &runtimes[id].name,
+            scope: &scopes[id],
+            covers,
+            withheld,
+            regexes,
+        });
+    }
+
+    // The mechanism, explained once per listener rather than once per route.
+    if reports.iter().any(|r| !r.withheld.is_empty()) {
+        info!(
+            listener = %listener.addr,
+            "some wildcard coverage is withheld: the names below would also cover \
+             hosts this listener routes to a different upstream, and a client \
+             holding one connection may send another origin's requests over it when \
+             the certificate covers both (RFC 9113 §9.1.1) — with no new TLS \
+             handshake, and so no SNI to route on. Certificates are narrowed to keep \
+             routing authoritative; routing itself is unaffected. To widen coverage, \
+             give the conflicting hosts the same upstream, or move them under \
+             different registrable domains."
+        );
+    }
+
+    for r in &reports {
+        if r.withheld.is_empty() {
+            debug!(
+                listener = %listener.addr,
+                route = %r.name,
+                scope = %r.scope,
+                covers = ?r.covers,
+                "certificate coverage"
+            );
+        } else {
+            info!(
+                listener = %listener.addr,
+                route = %r.name,
+                scope = %r.scope,
+                covers = ?r.covers,
+                withheld = ?r.withheld,
+                "certificate coverage (narrowed)"
+            );
+        }
+        if !r.regexes.is_empty() {
+            debug!(
+                listener = %listener.addr,
+                route = %r.name,
+                patterns = ?r.regexes,
+                "regex patterns have no representative host; their coverage is \
+                 determined when a matching connection first arrives"
+            );
+        }
+    }
+}
+
+/// Render an [`router::Escape`] for an operator, naming the route it points at.
+fn describe_escape(escape: &router::Escape, runtimes: &[Arc<RouteRuntime>]) -> String {
+    let route_name = |id: usize| {
+        runtimes
+            .get(id)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| format!("#{id}"))
+    };
+    match escape {
+        router::Escape::Host { host, route } => format!("{host} -> {}", route_name(*route)),
+        router::Escape::DefaultRoute { route } => {
+            format!("subdomains -> default_route {}", route_name(*route))
+        }
+        router::Escape::RegexTier { route } => {
+            format!("may match regex route {}", route_name(*route))
+        }
+        router::Escape::Unmatched => "subdomains match no route".to_string(),
+    }
+}
+
+/// Warn when a `raw` route shares a registrable domain with a terminating route.
+///
+/// A `raw` route never terminates TLS, so the client sees the **upstream's** own
+/// certificate and this gateway cannot clip it. If that certificate is a wildcard
+/// covering names this listener routes elsewhere, a client can coalesce onto the
+/// raw connection and escape routing — a case the issuance-side fix cannot reach.
+/// Detect the shape and say so plainly rather than imply it is covered.
+fn warn_on_raw_overlap(
+    listener: &Listener,
+    runtimes: &[Arc<RouteRuntime>],
+    patterns: &[Vec<String>],
+) {
+    // Registrable-domain approximation good enough for a warning: the last two
+    // labels of a pattern's base name. Being over-eager here only widens a
+    // warning, never narrows a certificate.
+    let apex = |pat: &str| -> Option<String> {
+        let base = pat.trim().trim_start_matches('~').trim_start_matches("*.");
+        let base = base.trim_start_matches('.');
+        if base.is_empty() || base.contains('^') || base.contains('\\') {
+            return None;
+        }
+        let labels: Vec<&str> = base.split('.').collect();
+        (labels.len() >= 2).then(|| labels[labels.len() - 2..].join("."))
+    };
+
+    let mut raw_apexes: Vec<(String, String)> = Vec::new();
+    let mut term_apexes: Vec<(String, String)> = Vec::new();
+    for (id, pats) in patterns.iter().enumerate() {
+        let route = &runtimes[id];
+        for pat in pats {
+            if let Some(a) = apex(pat) {
+                if route.route_type == RouteType::Raw {
+                    raw_apexes.push((a, route.name.clone()));
+                } else {
+                    term_apexes.push((a, route.name.clone()));
+                }
+            }
+        }
+    }
+
+    for (apex, raw_route) in &raw_apexes {
+        let clashing: Vec<&String> = term_apexes
+            .iter()
+            .filter(|(a, _)| a == apex)
+            .map(|(_, n)| n)
+            .collect();
+        if !clashing.is_empty() {
+            tracing::warn!(
+                listener = %listener.addr,
+                route = %raw_route,
+                domain = %apex,
+                also_routed_by = ?clashing,
+                "a raw route shares a registrable domain with terminating routes. \
+                 raw never terminates TLS, so the client sees the upstream's own \
+                 certificate and sni-gate cannot narrow it. If that certificate \
+                 covers a name routed elsewhere here, a client may reuse the raw \
+                 connection for it and bypass routing. Give the raw route its own \
+                 registrable domain, or use a terminating type, if that matters."
+            );
+        }
+    }
+}
+
+/// One built route: its data-path runtime plus the forwarding identity that
+/// decides which names may share its certificates.
+struct BuiltRoute {
+    runtime: RouteRuntime,
+    forwarding: Forwarding,
 }
 
 /// Build one route's runtime, flattening effective settings and building (or
@@ -304,7 +545,7 @@ fn build_route(
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
     probe_targets: &mut Vec<ProbeTarget>,
-) -> Result<RouteRuntime> {
+) -> Result<BuiltRoute> {
     // Templates were validated at load, so name lookups cannot fail here.
     let rt_tpl = cfg.template_for(&route.use_template)?;
     let ln_tpl = cfg.template_for(&listener.use_template)?;
@@ -348,12 +589,22 @@ fn build_route(
     )?;
 
     let eff_ech = cfg.effective_ech(listener, route, rt_tpl, ln_tpl);
+    // Which ECHConfigList source this route uses, for the certificate scope: two
+    // ECH routes to one socket that draw their keys from different sources are not
+    // interchangeable, so they must not share a certificate.
+    let mut ech_identity: Option<EchIdentity> = None;
     let ech = if route_type == RouteType::Ech {
         let ech_spec = eff.ech_resolver.clone().unwrap_or_else(|| {
             // Default ECH resolver: use addr_resolver if present, else system resolver
             eff.addr_resolver
                 .clone()
                 .unwrap_or_else(|| "system".to_string())
+        });
+        ech_identity = Some(EchIdentity {
+            mode: eff_ech.mode,
+            domain: eff_ech.ech_domain.clone(),
+            resolver: ech_spec.clone(),
+            inline_config: eff_ech.config.is_some(),
         });
         // HTTPS records are resolved dual-family regardless of upstream family.
         let ech_resolver = get_resolver(
@@ -405,23 +656,42 @@ fn build_route(
         }
     }
 
-    Ok(RouteRuntime {
-        name: route.label(),
+    // The forwarding identity that decides which names may share this route's
+    // certificates. Everything here can change where a connection goes or under
+    // what name it is presented; nothing that cannot (timeouts, the fail policy,
+    // the HTTP/2 switch, ECH refresh cadence) is included, since that would
+    // fragment scopes without buying any safety.
+    let forwarding = Forwarding {
         route_type,
-        upstream_host: host,
-        upstream_port: port,
-        sni_policy,
-        http2: eff_http2.enabled,
-        require_ech: eff.require_ech,
-        max_retries: eff_ech.max_retries,
-        connect_timeout: eff.connect_timeout,
-        idle_timeout: eff.idle_timeout,
-        address_family: eff.address_family,
-        nat64,
-        fail: eff.fail,
-        addr_resolver,
-        ech,
-        root_store: root_store.clone(),
+        host: host.clone(),
+        port,
+        sni: sni_policy.clone(),
+        family: eff.address_family,
+        nat64: eff.nat64_prefix.clone(),
+        addr_resolver: addr_spec.clone(),
+        ech: ech_identity,
+    };
+
+    Ok(BuiltRoute {
+        runtime: RouteRuntime {
+            name: route.label(),
+            route_type,
+            upstream_host: host,
+            upstream_port: port,
+            sni_policy,
+            http2: eff_http2.enabled,
+            require_ech: eff.require_ech,
+            max_retries: eff_ech.max_retries,
+            connect_timeout: eff.connect_timeout,
+            idle_timeout: eff.idle_timeout,
+            address_family: eff.address_family,
+            nat64,
+            fail: eff.fail,
+            addr_resolver,
+            ech,
+            root_store: root_store.clone(),
+        },
+        forwarding,
     })
 }
 

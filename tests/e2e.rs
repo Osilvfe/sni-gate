@@ -323,19 +323,179 @@ addr = "127.0.0.1:{listen}"
         );
     }
 
-    // Exactly one certificate, keyed by the registrable domain, directly under
-    // `certs/` (no per-host file, no mode subdirectory).
-    let certs_dir = dir.path().join("certs");
-    let crt_files: Vec<_> = std::fs::read_dir(&certs_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .filter(|n| n.ends_with(".crt"))
-        .collect();
+    // Exactly one certificate, keyed by the registrable domain, inside this
+    // route's certificate-scope directory (`certs/<scope>/deep.example.crt`) —
+    // one file for the whole domain, no per-host leaf. The scope level is what
+    // keeps two routes that forward differently from overwriting each other.
+    let crt_files = collect_certs(&dir.path().join("certs"));
     assert_eq!(
         crt_files,
         vec!["deep.example.crt".to_string()],
         "expected a single registrable-anchored cert, got {crt_files:?}"
     );
+    let scopes = collect_scope_dirs(&dir.path().join("certs"));
+    assert_eq!(
+        scopes.len(),
+        1,
+        "one route forwarding one way is one scope, got {scopes:?}"
+    );
+}
+
+/// Every `.crt` file name under `certs/`, at any scope depth, sorted.
+fn collect_certs(certs_dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![certs_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "crt") {
+                out.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The certificate-scope subdirectory names under `certs/`, sorted.
+fn collect_scope_dirs(certs_dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(certs_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+#[test]
+fn cross_route_coalescing_is_structurally_impossible() {
+    // The reported bug, as an end-to-end assertion on real signed certificates.
+    //
+    // Two names under one registrable domain, deliberately routed to DIFFERENT
+    // upstreams, with `mode = "ladder"` asking for the widest possible coverage:
+    //
+    //   apex.coalesce.test      -> backend A
+    //   static.coalesce.test    -> backend B  (via default_route)
+    //
+    // Before the fix, the apex's handshake issued {*.coalesce.test, coalesce.test}
+    // — valid for `static.coalesce.test` too. A browser holding that connection
+    // may then coalesce a request for the static name onto it (RFC 9113 §9.1.1):
+    // no new TCP, no new TLS, no new SNI, so sni-gate never routes it and backend
+    // A answers for a name that belongs to backend B.
+    //
+    // What must hold now: neither certificate is valid for a name the other
+    // route owns. That removes the browser's *permission* to coalesce, which is
+    // the only one of the three preconditions this program controls.
+    let dir = tempdir();
+    let (backend_a, _ha) = spawn_mock_backend();
+    let (backend_b, _hb) = spawn_mock_backend();
+    let listen = free_port();
+    let config = format!(
+        r#"
+[global]
+resolver = "system"
+unmatched = "close"
+[ca]
+cert_path = "ca/ca.crt"
+key_path = "ca/ca.key"
+common_name = "E2E CA"
+leaf_validity_days = 90
+[issuance]
+mode = "ladder"
+[store]
+enabled = true
+dir = "certs"
+renew_margin_days = 30
+[cache.psl]
+source = "embedded"
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "apex"
+  type = "http"
+  match_sni = ["apex.coalesce.test"]
+  upstream = "127.0.0.1:{backend_a}"
+  [listener.default_route]
+  name = "catchall"
+  type = "http"
+  upstream = "127.0.0.1:{backend_b}"
+"#
+    );
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+    let ca_path = dir.path().join("ca").join("ca.crt");
+
+    // The apex, on its own route. `ladder` proposes `*.coalesce.test`, but every
+    // other host under that wildcard falls to `default_route` — a different
+    // upstream — so the wildcard must be withheld.
+    let apex_sans = drive_tls_collect_sans(listen, &ca_path, "apex.coalesce.test");
+    assert!(
+        !apex_sans.iter().any(|s| s == "*.coalesce.test"),
+        "apex cert must not claim *.coalesce.test (would authorize coalescing \
+         onto the default route's names), got {apex_sans:?}"
+    );
+    assert!(
+        !host_covered(&apex_sans, "static.coalesce.test"),
+        "apex cert must not be valid for a default_route name, got {apex_sans:?}"
+    );
+    assert!(
+        host_covered(&apex_sans, "apex.coalesce.test"),
+        "apex cert must still cover its own host, got {apex_sans:?}"
+    );
+
+    // The sibling, on the default route. It must not claim the apex's name.
+    let static_sans = drive_tls_collect_sans(listen, &ca_path, "static.coalesce.test");
+    assert!(
+        !host_covered(&static_sans, "apex.coalesce.test"),
+        "default-route cert must not be valid for the apex route's name, got \
+         {static_sans:?}"
+    );
+    assert!(
+        host_covered(&static_sans, "static.coalesce.test"),
+        "default-route cert must cover its own host, got {static_sans:?}"
+    );
+
+    // Both routes still serve their own traffic correctly.
+    drive_tls_http(listen, &ca_path, "apex.coalesce.test");
+    drive_tls_http(listen, &ca_path, "static.coalesce.test");
+
+    // Two forwarding targets -> two certificate scopes -> two directories, so
+    // neither can overwrite the other's file on disk. Without this partition the
+    // two would share `certs/coalesce.test.crt` and a reload would serve one
+    // certificate for both routes, re-widening coverage after the fact.
+    let scopes = collect_scope_dirs(&dir.path().join("certs"));
+    assert_eq!(
+        scopes.len(),
+        2,
+        "two forwarding targets must be two scopes, got {scopes:?}"
+    );
+}
+
+/// Whether a SAN list is valid for `host` — exact match or a single-level
+/// wildcard. Mirrors the coverage rule a TLS client applies (RFC 6125 §6.4.3),
+/// so these assertions test what a *browser* would conclude about the real cert.
+fn host_covered(sans: &[String], host: &str) -> bool {
+    sans.iter().any(|san| {
+        if san == host {
+            return true;
+        }
+        match san.strip_prefix("*.") {
+            Some(suffix) => match host.split_once('.') {
+                Some((label, rest)) => !label.is_empty() && rest == suffix,
+                None => false,
+            },
+            None => false,
+        }
+    })
 }
 
 #[test]

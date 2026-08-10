@@ -1,19 +1,32 @@
 //! On-disk persistence of issued certificates.
 //!
-//! Each certificate is stored as a `<base>.crt` (PEM chain, leaf first) and a
-//! `<base>.key` (PEM PKCS#8 private key) pair, keyed by the certificate base —
-//! the coverage anchor (the registrable domain in `ladder` mode, else the host).
-//! A base is always a plain name (never a wildcard or path-unsafe IP), so it maps
-//! directly to a safe file stem. All modes share one directory: a stored
-//! certificate is only reused when it actually covers the requested host (see
-//! [`crate::suffix::host_covered_by`]), so a mode switch can never serve a
-//! certificate whose coverage no longer fits — it is simply re-issued.
+//! Certificates live at `<dir>/<scope>/<base>.crt` (PEM chain, leaf first) with a
+//! matching `.key` (PEM PKCS#8). Two keys address a certificate:
+//!
+//! * **scope** — the certificate partition ([`crate::certscope::CertScope`]).
+//!   Names that route to different upstreams must never share a certificate, so
+//!   they must never share a file either: without this level, two partitions for
+//!   one registrable domain would overwrite each other, and a reload would serve
+//!   whichever wrote last to *both* — reintroducing exactly the cross-route
+//!   coverage the partitioning exists to prevent.
+//! * **base** — the coverage anchor within that scope (the registrable domain, or
+//!   the host for IP literals and names with no registrable domain).
+//!
+//! Both components are plain, path-safe names (a scope key is sanitized at
+//! construction; a base is never a wildcard), so each maps directly to one path
+//! component. A stored certificate is only reused when it actually covers the
+//! requested host (see [`crate::suffix::host_covered_by`]), so a change to
+//! `[issuance] mode` can never serve a certificate whose coverage no longer fits
+//! — it is simply re-issued.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use time::{Duration, OffsetDateTime};
+
+use crate::certscope::CertScope;
 
 /// Manages the certificate directory.
 pub struct CertStore {
@@ -46,30 +59,41 @@ impl CertStore {
             .with_context(|| format!("creating certificate store {}", self.dir.display()))
     }
 
-    fn cert_path(&self, base: &str) -> PathBuf {
-        self.dir.join(format!("{base}.crt"))
+    /// Directory holding one scope's certificates.
+    fn scope_dir(&self, scope: &CertScope) -> PathBuf {
+        self.dir.join(scope.key())
     }
 
-    fn key_path(&self, base: &str) -> PathBuf {
-        self.dir.join(format!("{base}.key"))
+    fn cert_path(&self, scope: &CertScope, base: &str) -> PathBuf {
+        self.scope_dir(scope).join(format!("{base}.crt"))
     }
 
-    /// Load a persisted certificate for `base`, if present and not within the
-    /// renewal margin of expiry. Returns `None` to signal "issue a fresh one".
-    pub fn load(&self, base: &str) -> Option<StoredCertificate> {
-        let cert_path = self.cert_path(base);
-        let key_path = self.key_path(base);
+    fn key_path(&self, scope: &CertScope, base: &str) -> PathBuf {
+        self.scope_dir(scope).join(format!("{base}.key"))
+    }
+
+    /// Load the persisted certificate for `base` **within `scope`**, if present
+    /// and not within the renewal margin of expiry. Returns `None` to signal
+    /// "issue a fresh one".
+    pub fn load(&self, scope: &CertScope, base: &str) -> Option<StoredCertificate> {
+        let cert_path = self.cert_path(scope, base);
+        let key_path = self.key_path(scope, base);
         if !cert_path.exists() || !key_path.exists() {
             return None;
         }
         match self.load_inner(&cert_path, &key_path) {
             Ok(stored) if !self.needs_renewal(stored.not_after) => Some(stored),
             Ok(_) => {
-                tracing::debug!(base, "persisted certificate near expiry; will re-issue");
+                tracing::debug!(scope = %scope, base, "persisted certificate near expiry; will re-issue");
                 None
             }
             Err(err) => {
-                tracing::warn!(base, error = %err, "failed to load persisted certificate; re-issuing");
+                tracing::warn!(
+                    scope = %scope,
+                    base,
+                    error = %err,
+                    "failed to load persisted certificate; re-issuing"
+                );
                 None
             }
         }
@@ -99,12 +123,22 @@ impl CertStore {
         })
     }
 
-    /// Persist a certificate chain and key for `base`, written atomically so a
-    /// crash mid-write never leaves a half-file that would fail to load.
-    pub fn save(&self, base: &str, chain_pem: &str, key_pem: &str) -> Result<()> {
-        write_atomic(&self.cert_path(base), chain_pem.as_bytes())
+    /// Persist a certificate chain and key for `base` **within `scope`**, written
+    /// atomically so a crash mid-write never leaves a half-file that would fail
+    /// to load. The scope directory is created on demand.
+    pub fn save(
+        &self,
+        scope: &CertScope,
+        base: &str,
+        chain_pem: &str,
+        key_pem: &str,
+    ) -> Result<()> {
+        let dir = self.scope_dir(scope);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating scope directory {}", dir.display()))?;
+        write_atomic(&self.cert_path(scope, base), chain_pem.as_bytes())
             .context("persisting certificate chain")?;
-        write_atomic_private(&self.key_path(base), key_pem.as_bytes())
+        write_atomic_private(&self.key_path(scope, base), key_pem.as_bytes())
             .context("persisting private key")?;
         Ok(())
     }
@@ -158,9 +192,22 @@ fn ip_from_bytes(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// The staging path for an atomic write: the target with `.tmp` **appended**.
+///
+/// Appending rather than replacing the extension matters: `with_extension("tmp")`
+/// maps both `x.crt` and `x.key` onto the same `x.tmp`, so the chain and key of
+/// one certificate would stage through a single file. Today the resolver's
+/// single-flight lock serializes them, but that is an accident of the caller, not
+/// a property of this function.
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path.file_name().unwrap_or_default());
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
 /// Atomically write `bytes` to `path` via a temporary file + rename.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = staging_path(path);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -168,7 +215,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Atomically write a private key, restricting permissions where supported.
 fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = staging_path(path);
     std::fs::write(&tmp, bytes)?;
     #[cfg(unix)]
     {
@@ -177,4 +224,26 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_paths_do_not_collide_between_chain_and_key() {
+        let crt = Path::new("certs/scope/example.com.crt");
+        let key = Path::new("certs/scope/example.com.key");
+        assert_ne!(
+            staging_path(crt),
+            staging_path(key),
+            "chain and key must stage through distinct files"
+        );
+        assert_eq!(
+            staging_path(crt).file_name().unwrap(),
+            "example.com.crt.tmp"
+        );
+        // Staging stays in the same directory, so the rename is atomic.
+        assert_eq!(staging_path(crt).parent(), crt.parent());
+    }
 }

@@ -108,7 +108,9 @@ pub struct ServerConfigs {
 /// Immutable per-listener state shared with every connection task.
 pub struct ListenerState {
     pub addr: SocketAddr,
-    pub router: Router,
+    /// Shared with this listener's certificate resolver, which routes each
+    /// ClientHello's SNI to decide what the certificate may cover.
+    pub router: Arc<Router>,
     pub routes: Vec<Arc<RouteRuntime>>,
     /// Inbound server configs, selected per connection by negotiated ALPN.
     pub server_configs: Arc<ServerConfigs>,

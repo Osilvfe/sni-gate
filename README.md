@@ -115,16 +115,16 @@ nothing to reflect).
 
 ## Certificate issuance modes
 
-Every per-SNI leaf is anchored at the **registrable domain**, so one
-`certs/<registrable>.crt` serves a whole domain and `[issuance] mode` chooses how
-much of it a request contributes. For an inbound SNI of `b.a.example.com`
-(registrable `example.com`):
+Every per-SNI leaf is anchored at the **registrable domain**, so one certificate
+serves a whole domain within its [certificate scope](#certificate-scopes), and
+`[issuance] mode` chooses how much of it a request contributes. For an inbound
+SNI of `b.a.example.com` (registrable `example.com`):
 
-| `mode`     | key (`certs/<key>.crt`) | names this host contributes                          |
-|------------|-------------------------|------------------------------------------------------|
-| `exact`    | `example.com`           | `b.a.example.com`                                     |
-| `wildcard` | `example.com`           | `*.a.example.com`                                     |
-| `ladder`   | `example.com`           | `*.a.example.com`, `*.example.com`, `example.com`     |
+| `mode`     | anchor        | names this host contributes                          |
+|------------|---------------|------------------------------------------------------|
+| `exact`    | `example.com` | `b.a.example.com`                                     |
+| `wildcard` | `example.com` | `*.a.example.com`                                     |
+| `ladder`   | `example.com` | `*.a.example.com`, `*.example.com`, `example.com`     |
 
 The only wildcard that usefully covers a host `H` is `*.parent(H)` — `*.H` would
 cover subdomains a leaf host usually never has. So a level's `*.X` wildcard is
@@ -134,31 +134,118 @@ leaf like `rr5.googlevideo.com` never yields the useless `*.rr5.googlevideo.com`
 contributes the whole ancestor chain (host, every ancestor domain, and their
 siblings). `exact` contributes only the bare host.
 
-**One certificate per registrable domain, accumulating, never re-signed for a
-name it already covers.** Before signing, the resolver checks whether the anchor's
-cached/persisted certificate already covers the host; if so it is reused. If not,
-the host's names are **merged** into it and it is re-issued — so siblings
+`mode` is an **upper bound** on breadth, not a promise of it: a proposed name is
+withheld when it would also cover a host this listener routes to a *different*
+upstream. See [Certificate scopes](#certificate-scopes) — that clipping is what
+keeps routing honest, and the effective coverage of every route is printed at
+startup.
+
+**One certificate per (scope, registrable domain), accumulating, never re-signed
+for a name it already covers.** Before signing, the resolver checks whether the
+anchor's cached/persisted certificate already covers the host; if so it is reused.
+If not, the host's names are **merged** into it and it is re-issued — so siblings
 (`c.a.example.com`, `www.example.com`, …) and even deeper new branches all fold
-into the one `example.com.crt` rather than each minting a redundant leaf. All
-modes share one `certs/` directory and switching modes is seamless (a certificate
-that does not cover the host is just re-issued). Leaves stay small — bounded by
-the distinct sub-hierarchies actually seen.
+into one leaf rather than each minting a redundant one. Switching modes is
+seamless (a certificate that does not cover the host is just re-issued). Leaves
+stay small — bounded by the distinct sub-hierarchies actually seen.
 
 The registrable domain is computed from the public-suffix list's **ICANN section
 only**. Real registry suffixes (`co.uk`, `co.jp`) remain boundaries, so `*.co.jp`
 is never issued; private-section entries (`github.io`, `withgoogle.com`) are
-treated as ordinary registrable domains, so `csp.withgoogle.com` is served by
-`withgoogle.com.crt` (`{*.withgoogle.com, withgoogle.com}`). IP literals and hosts
-with no registrable domain always fall back to `exact`. The wildcard is never
-lifted above the registrable domain, so `*.com` can never be produced.
+treated as ordinary registrable domains, so `csp.withgoogle.com` is served by a
+`withgoogle.com` leaf (`{*.withgoogle.com, withgoogle.com}`). IP literals and
+hosts with no registrable domain always fall back to `exact`. The wildcard is
+never lifted above the registrable domain, so `*.com` can never be produced.
 
 ```toml
 [issuance]
 mode = "wildcard"   # exact | wildcard | ladder
 ```
 
-The legacy boolean `wildcard = true|false` is still accepted (`true` → `wildcard`,
-`false` → `exact`) and is ignored when `mode` is set.
+## Certificate scopes
+
+A browser may reuse ("coalesce") an existing HTTP/2 connection for a **second**
+origin when both of these hold ([RFC 9113 §9.1.1]):
+
+1. the second origin resolves to an address already in that connection's set, and
+2. the certificate on that connection is valid for the second origin.
+
+A coalesced request travels on the **existing** connection: no new TCP, no new TLS
+handshake, and therefore **no new SNI**. sni-gate routes per connection, at
+handshake time, from the SNI — so it never sees the second name and cannot
+re-route it. The request is delivered to whatever upstream that connection was
+already wired to.
+
+Every name pointed at this gateway shares its address, so condition 1 always
+holds here and condition 2 is the only one sni-gate controls. Hence the invariant:
+
+> A certificate served on a connection routed to some destination is never valid
+> for a name this listener would route to a **different** destination.
+
+Two mechanisms hold it, and both are load-bearing:
+
+- **Clipping.** Each proposed name is checked against this listener's routing
+  table and dropped unless *every* host it would cover routes into the same scope.
+  A wildcard is refused when a sibling is pinned elsewhere, when subdomains fall
+  through to a `default_route` in another scope, when they would match no route at
+  all, or — conservatively — when they could reach a `regex` route in another scope
+  (regex match sets are not statically decidable). The requesting host itself is
+  always covered, so a clipped certificate is still usable.
+- **Partitioning.** The certificate cache and the on-disk store are keyed by
+  scope. Clipping alone would not survive accumulation: a later host under the
+  same anchor but a different destination would otherwise be merged into the
+  existing certificate, re-widening it after the fact.
+
+A **scope** is a set of names that may share a certificate. Two routes share one
+when they forward identically *and* are matched by the same routing table:
+
+- **Forwarding target** — route type, dial host (or the reflecting marker), port,
+  `override_sni` policy, `address_family`, `nat64_prefix`, `addr_resolver`, and
+  the ECH config source. Everything that decides where a connection goes and under
+  what name it is presented. Settings that cannot change the destination
+  (timeouts, `fail`, the HTTP/2 switch, `ech_refresh`) are excluded: they would
+  fragment scopes without buying safety.
+- **Routing table** — a fingerprint of the listener's routes. A wildcard proven
+  confined under one listener's routes may not be confined under another's, so a
+  proof is only ever reused where it still holds. Listeners with identical route
+  tables (the usual `0.0.0.0:443` + `[::]:443` pair) therefore still share
+  certificates.
+
+Certificates are persisted as `certs/<scope>/<registrable>.crt` (plus `.key`).
+The scope directory is what stops two destinations from overwriting each other's
+file — without it, a reload would serve one certificate to both routes and
+re-widen coverage.
+
+Names **within** one scope may share a wildcard, so a client can still coalesce
+between them. That is deliberate: it is exactly what the real origin's own
+wildcard certificate already permits, and the request reaches the same configured
+destination, which demultiplexes on `:authority` as any origin does. To forbid
+coalescing entirely, set `mode = "exact"` — every certificate is then reduced to
+the single name that requested it.
+
+At startup each route's effective coverage is logged, and every withheld name is
+reported at `WARN` with the conflicting host named:
+
+```
+withholding wildcard coverage  route=cf-ech
+  withheld=["*.example.com (subdomains -> default_route catchall)",
+            "example.com (example.com -> catchall)"]
+```
+
+That is a report, not a failure — routing is unaffected. It means the routing
+table sends two names under one registrable domain to different upstreams. To
+widen coverage, give the conflicting hosts the same upstream or move them under a
+different registrable domain.
+
+**One case this cannot reach:** a `raw` route never terminates TLS, so the client
+sees the **upstream's own** certificate and sni-gate cannot narrow it. If that
+certificate covers a name routed elsewhere on the same listener, a client may
+coalesce onto the raw connection and escape routing. sni-gate detects the shape —
+a `raw` route sharing a registrable domain with terminating routes — and warns at
+startup; it cannot fix it. Give such a route its own registrable domain, or use a
+terminating type.
+
+[RFC 9113 §9.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-9.1.1
 
 ## Hierarchical configuration
 

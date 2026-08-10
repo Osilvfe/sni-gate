@@ -820,34 +820,26 @@ pub enum IssuanceMode {
     Ladder,
 }
 
-/// Per-SNI issuance policy. Prefer `mode`; the boolean `wildcard` is retained
-/// for backward compatibility (`true` → `wildcard`, `false` → `exact`) and is
-/// ignored when `mode` is set explicitly.
+/// Per-SNI issuance policy.
+///
+/// `mode` is an **upper bound** on how much one certificate may cover, not a
+/// promise: a proposed wildcard is withheld when some host it would cover routes
+/// to a different upstream on the same listener, because issuing it would let a
+/// client reuse one HTTP/2 connection for both and bypass routing entirely (see
+/// [`crate::certscope`]). The effective coverage of every route is printed at
+/// startup.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuanceConfig {
-    /// Name-coverage mode. When unset, derived from `wildcard` for back-compat.
+    /// Name-coverage mode; the upper bound before route-scope clipping.
     #[serde(default)]
-    pub mode: Option<IssuanceMode>,
-
-    /// Legacy switch. `None` (unset) keeps the default; `Some(true/false)` maps
-    /// to `wildcard`/`exact` only when `mode` is not given.
-    #[serde(default)]
-    pub wildcard: Option<bool>,
+    pub mode: IssuanceMode,
 }
 
 impl IssuanceConfig {
-    /// The effective issuance mode, resolving `mode` first and otherwise the
-    /// legacy `wildcard` flag, defaulting to [`IssuanceMode::Wildcard`].
+    /// The configured issuance mode.
     pub fn resolved_mode(&self) -> IssuanceMode {
-        if let Some(m) = self.mode {
-            return m;
-        }
-        match self.wildcard {
-            Some(true) => IssuanceMode::Wildcard,
-            Some(false) => IssuanceMode::Exact,
-            None => IssuanceMode::default(),
-        }
+        self.mode
     }
 }
 
@@ -2561,25 +2553,28 @@ addr = "0.0.0.0:443"
     }
 
     #[test]
-    fn issuance_mode_resolution_and_backcompat() {
-        // Explicit mode wins.
-        let c: IssuanceConfig = toml::from_str(r#"mode = "ladder""#).unwrap();
-        assert_eq!(c.resolved_mode(), IssuanceMode::Ladder);
-        // Explicit mode wins even if the legacy flag disagrees.
-        let c: IssuanceConfig = toml::from_str(
-            r#"mode = "exact"
-wildcard = true"#,
-        )
-        .unwrap();
-        assert_eq!(c.resolved_mode(), IssuanceMode::Exact);
-        // Legacy flag maps: true → wildcard, false → exact.
-        let c: IssuanceConfig = toml::from_str(r#"wildcard = true"#).unwrap();
-        assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
-        let c: IssuanceConfig = toml::from_str(r#"wildcard = false"#).unwrap();
-        assert_eq!(c.resolved_mode(), IssuanceMode::Exact);
-        // Neither set → default is wildcard.
+    fn issuance_mode_resolution() {
+        for (toml_src, want) in [
+            (r#"mode = "exact""#, IssuanceMode::Exact),
+            (r#"mode = "wildcard""#, IssuanceMode::Wildcard),
+            (r#"mode = "ladder""#, IssuanceMode::Ladder),
+        ] {
+            let c: IssuanceConfig = toml::from_str(toml_src).unwrap();
+            assert_eq!(c.resolved_mode(), want, "for {toml_src}");
+        }
+        // Unset → the default.
         let c = IssuanceConfig::default();
         assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
+        let c: IssuanceConfig = toml::from_str("").unwrap();
+        assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
+
+        // There is exactly one way to express the mode: the removed legacy
+        // boolean is now an unknown field, so a stale config fails loudly at load
+        // rather than being silently reinterpreted.
+        assert!(
+            toml::from_str::<IssuanceConfig>(r#"wildcard = true"#).is_err(),
+            "the legacy `wildcard` flag must be rejected, not ignored"
+        );
     }
 
     // -----------------------------------------------------------------------

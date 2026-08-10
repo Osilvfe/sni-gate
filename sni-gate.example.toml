@@ -92,9 +92,9 @@ leaf_validity_days = 397
 install_to_system_root = false  # opt-in; Administrator on Windows; idempotent
 
 [issuance]
-# Every leaf is anchored at the registrable domain (one certs/<registrable>.crt),
-# accumulating coverage; a request for an already-covered name is never re-signed.
-# `mode` sets how much each host contributes (for b.a.example.com → example.com.crt):
+# Every leaf is anchored at the registrable domain, accumulating coverage; a
+# request for an already-covered name is never re-signed.
+# `mode` sets how much each host contributes (for b.a.example.com → example.com):
 #   "exact"     b.a.example.com                              (bare host, no wildcard)
 #   "wildcard"  *.a.example.com                              (host + siblings)  (default)
 #   "ladder"    *.a.example.com, *.example.com, example.com  (whole ancestor chain)
@@ -102,13 +102,20 @@ install_to_system_root = false  # opt-in; Administrator on Windows; idempotent
 # accessed host actually has X as its parent. Registrable domain uses the PSL
 # ICANN section only, so *.co.jp is never issued while github.io / withgoogle.com
 # are treated as ordinary domains (→ *.withgoogle.com is allowed).
+#
+# `mode` is an UPPER BOUND, not a promise. A proposed name is withheld when it
+# would also cover a host this listener routes to a different upstream: a browser
+# holding a connection whose cert covers a second origin may send that origin's
+# requests over it (RFC 9113 §9.1.1) with no new TLS handshake and hence no new
+# SNI, which would bypass routing entirely. Certificates are therefore partitioned
+# by forwarding target and persisted as certs/<scope>/<registrable>.crt. Each
+# route's effective coverage — and every withheld name, with the conflicting host
+# named — is logged at startup. Use "exact" to forbid coalescing outright.
 mode = "wildcard"
-# Legacy: `wildcard = true|false` still works (true→wildcard, false→exact),
-# ignored when `mode` is set.
 
 [store]
-enabled = true                # persist issued certs across restarts (in certs/)
-dir = "certs"
+enabled = true                # persist issued certs across restarts
+dir = "certs"                 # laid out as <dir>/<scope>/<registrable>.crt
 renew_margin_days = 30
 
 [cache]
