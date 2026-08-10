@@ -11,7 +11,7 @@
 //! and optionally at runtime (if `check_interval` is set). When `auto_reload = true`,
 //! file changes (from any source) trigger a hot-reload via file-system watching.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -164,7 +164,7 @@ async fn save_to_file(path: &Path, data: &[u8]) -> Result<()> {
     let data = data.to_vec();
 
     tokio::task::spawn_blocking(move || {
-        let tmp = path.with_extension("tmp");
+        let tmp = staging_path(&path);
         std::fs::write(&tmp, &data).with_context(|| format!("writing to {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
@@ -172,6 +172,13 @@ async fn save_to_file(path: &Path, data: &[u8]) -> Result<()> {
     })
     .await
     .context("save task panicked")?
+}
+
+/// Staging path: append .tmp to the full filename to avoid collisions.
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(path.file_name().unwrap_or_default());
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 /// File age (now - mtime).
