@@ -224,7 +224,7 @@ coalescing entirely, set `mode = "exact"` — every certificate is then reduced 
 the single name that requested it.
 
 At startup each route's effective coverage is logged, and every withheld name is
-reported at `WARN` with the conflicting host named:
+reported at `INFO` with the conflicting host named:
 
 ```
 withholding wildcard coverage  route=cf-ech
