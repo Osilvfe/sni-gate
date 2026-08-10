@@ -68,7 +68,10 @@ impl SuffixList {
             parsed.domain(b"example.co.uk").is_some(),
             "downloaded list failed a sanity check; keeping the current list"
         );
-        *self.list.write().unwrap() = parsed;
+        *self
+            .list
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = parsed;
         Ok(())
     }
 
@@ -103,7 +106,10 @@ impl SuffixList {
 
         let host = host.trim_end_matches('.').to_ascii_lowercase();
 
-        let list = self.list.read().unwrap();
+        let list = self
+            .list
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(registrable) = registrable_icann(&list, &host) else {
             // No registrable domain (bare suffix, single label): exact only.
             return Certificand::exact(&host);
