@@ -270,14 +270,14 @@ fn build_listener(
     };
 
     let router = Arc::new(
-        Router::build(&patterns, default_id)
+        Router::build(&patterns, default_id, &cfg.regexes)
             .map_err(|e| anyhow::anyhow!("listener {}: {e}", listener.addr))?,
     );
 
     // Certificate scopes. The routing table is part of a scope's identity because
     // a wildcard proven confined under these routes may not be confined under
     // another listener's — see `certscope`.
-    let router_fp = certscope::router_fingerprint(&patterns, default_id);
+    let router_fp = certscope::router_fingerprint(&patterns, default_id, &cfg.regexes);
     let scopes: Arc<[CertScope]> = forwardings
         .iter()
         .map(|f| CertScope::new(router_fp, f))
@@ -289,7 +289,7 @@ fn build_listener(
     let cert_resolver = Arc::new(DynamicResolver::new(issuer, router.clone(), scopes.clone()));
 
     report_issuance_plan(listener, &cert_resolver, &runtimes, &scopes, &patterns);
-    warn_on_raw_overlap(listener, &runtimes, &patterns);
+    warn_on_raw_overlap(listener, &runtimes, &patterns, cfg);
 
     // One base server config for local termination; the resolver issues for any
     // routable SNI. It is then cloned into the ALPN variants the data path selects
@@ -364,8 +364,9 @@ fn report_issuance_plan(
         let mut regexes: Vec<&str> = Vec::new();
         for pat in pats {
             let pat = pat.trim();
-            if let Some(re) = pat.strip_prefix('~') {
-                regexes.push(re);
+            if let Some(name) = pat.strip_prefix('@') {
+                // Named regex reference has no representative host
+                regexes.push(name);
             } else if let Some(rest) = pat.strip_prefix("*.") {
                 probes.push(format!("probe.{rest}"));
             } else if let Some(rest) = pat.strip_prefix('.') {
@@ -477,18 +478,47 @@ fn warn_on_raw_overlap(
     listener: &Listener,
     runtimes: &[Arc<RouteRuntime>],
     patterns: &[Vec<String>],
+    cfg: &Config,
 ) {
     // Registrable-domain approximation good enough for a warning: the last two
     // labels of a pattern's base name. Being over-eager here only widens a
     // warning, never narrows a certificate.
-    let apex = |pat: &str| -> Option<String> {
-        let base = pat.trim().trim_start_matches('~').trim_start_matches("*.");
-        let base = base.trim_start_matches('.');
+    let apex = |pat: &str| -> Vec<String> {
+        let pat = pat.trim();
+
+        // Named regex: extract apex from its declared scope_suffix
+        if let Some(name) = pat.strip_prefix('@') {
+            if let Ok(def) = cfg.regex_def(name) {
+                return def
+                    .scope_suffix
+                    .iter()
+                    .filter_map(|scope| {
+                        let base = scope
+                            .trim()
+                            .trim_start_matches("*.")
+                            .trim_start_matches('.');
+                        if base.is_empty() || base.contains('^') || base.contains('\\') {
+                            return None;
+                        }
+                        let labels: Vec<&str> = base.split('.').collect();
+                        (labels.len() >= 2).then(|| labels[labels.len() - 2..].join("."))
+                    })
+                    .collect();
+            }
+            return Vec::new();
+        }
+
+        // Exact/wildcard/suffix patterns
+        let base = pat.trim_start_matches("*.").trim_start_matches('.');
         if base.is_empty() || base.contains('^') || base.contains('\\') {
-            return None;
+            return Vec::new();
         }
         let labels: Vec<&str> = base.split('.').collect();
-        (labels.len() >= 2).then(|| labels[labels.len() - 2..].join("."))
+        if labels.len() >= 2 {
+            vec![labels[labels.len() - 2..].join(".")]
+        } else {
+            Vec::new()
+        }
     };
 
     let mut raw_apexes: Vec<(String, String)> = Vec::new();
@@ -496,7 +526,7 @@ fn warn_on_raw_overlap(
     for (id, pats) in patterns.iter().enumerate() {
         let route = &runtimes[id];
         for pat in pats {
-            if let Some(a) = apex(pat) {
+            for a in apex(pat) {
                 if route.route_type == RouteType::Raw {
                     raw_apexes.push((a, route.name.clone()));
                 } else {

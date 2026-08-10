@@ -156,11 +156,23 @@ impl std::fmt::Display for CertScope {
 const REFLECT: &str = "reflect";
 
 /// Fingerprint a routing table by the exact inputs that define its behavior:
-/// each route's patterns, in route order, plus the default route.
+/// each route's patterns, in route order, plus the default route, plus any
+/// regex scope_suffix declarations.
 ///
-/// Two tables with equal fingerprints resolve every host identically, so a
-/// confinement proof established against one holds for the other.
-pub fn router_fingerprint(patterns: &[Vec<String>], default: Option<usize>) -> u64 {
+/// Two tables with equal fingerprints resolve every host identically **and**
+/// make identical wildcard confinement decisions, so a certificate proven safe
+/// under one is safe under the other.
+///
+/// The fingerprint includes regex scope information because changing a regex's
+/// scope_suffix changes which wildcards are confined: a certificate issued when
+/// a regex had scope ".example.com" must not be reused after the scope narrows
+/// to "*.example.com", even if the match_sni reference ("@regex-name") stayed
+/// the same.
+pub fn router_fingerprint(
+    patterns: &[Vec<String>],
+    default: Option<usize>,
+    regexes: &std::collections::HashMap<String, crate::config::RegexDef>,
+) -> u64 {
     let mut buf = String::new();
     for (id, pats) in patterns.iter().enumerate() {
         buf.push_str(&id.to_string());
@@ -176,6 +188,25 @@ pub fn router_fingerprint(patterns: &[Vec<String>], default: Option<usize>) -> u
     match default {
         Some(id) => buf.push_str(&id.to_string()),
         None => buf.push_str("none"),
+    }
+    // Include regex scope_suffix in the fingerprint. A regex reference in
+    // match_sni alone is not enough: changing the scope_suffix changes
+    // wildcard confinement decisions, so certificates must not survive that.
+    if !regexes.is_empty() {
+        buf.push_str(";regexes={");
+        let mut regex_vec: Vec<_> = regexes.iter().collect();
+        regex_vec.sort_by_key(|(name, _)| *name);
+        for (name, def) in regex_vec {
+            buf.push_str(name);
+            buf.push(':');
+            buf.push_str(&def.pattern);
+            buf.push('[');
+            let mut scopes = def.scope_suffix.clone();
+            scopes.sort();
+            buf.push_str(&scopes.join(","));
+            buf.push_str("];");
+        }
+        buf.push('}');
     }
     fnv1a(buf.as_bytes())
 }
@@ -364,20 +395,100 @@ mod tests {
 
     #[test]
     fn router_fingerprint_ignores_pattern_order_but_not_content() {
-        let a = router_fingerprint(&[vec![".a.test".into(), ".b.test".into()]], Some(0));
-        let b = router_fingerprint(&[vec![".b.test".into(), ".a.test".into()]], Some(0));
-        assert_eq!(a, b, "cosmetic reordering must not churn scopes");
+        use std::collections::HashMap;
+        let empty = HashMap::new();
 
-        let c = router_fingerprint(&[vec![".a.test".into(), ".c.test".into()]], Some(0));
+        let a = router_fingerprint(&[vec![".a.test".into(), ".b.test".into()]], Some(0), &empty);
+        let b = router_fingerprint(&[vec![".b.test".into(), ".a.test".into()]], Some(0), &empty);
+        assert_eq!(a, b, "pattern order within a route must not matter");
+
+        let c = router_fingerprint(&[vec![".a.test".into(), ".c.test".into()]], Some(0), &empty);
         assert_ne!(a, c, "different patterns must differ");
 
-        let d = router_fingerprint(&[vec![".a.test".into(), ".b.test".into()]], None);
+        let d = router_fingerprint(&[vec![".a.test".into(), ".b.test".into()]], None, &empty);
         assert_ne!(a, d, "presence of a default route must differ");
 
         // Route order matters: ids are how routes are referenced.
-        let e = router_fingerprint(&[vec![".a.test".into()], vec![".b.test".into()]], Some(0));
-        let f = router_fingerprint(&[vec![".b.test".into()], vec![".a.test".into()]], Some(0));
+        let e = router_fingerprint(
+            &[vec![".a.test".into()], vec![".b.test".into()]],
+            Some(0),
+            &empty,
+        );
+        let f = router_fingerprint(
+            &[vec![".b.test".into()], vec![".a.test".into()]],
+            Some(0),
+            &empty,
+        );
         assert_ne!(e, f);
+    }
+
+    #[test]
+    fn router_fingerprint_includes_regex_scopes() {
+        use crate::config::RegexDef;
+        use std::collections::HashMap;
+
+        let empty = HashMap::new();
+        let patterns = vec![vec!["@cdn".into()]];
+
+        // Base fingerprint without regex
+        let base = router_fingerprint(&patterns, None, &empty);
+
+        // Add a regex definition
+        let mut regexes1 = HashMap::new();
+        regexes1.insert(
+            "cdn".to_string(),
+            RegexDef {
+                pattern: "^cdn-[0-9]+\\.example\\.com$".to_string(),
+                scope_suffix: vec!["*.example.com".to_string()],
+            },
+        );
+        let fp1 = router_fingerprint(&patterns, None, &regexes1);
+        assert_ne!(base, fp1, "adding regex must change fingerprint");
+
+        // Same regex name, different scope_suffix
+        let mut regexes2 = HashMap::new();
+        regexes2.insert(
+            "cdn".to_string(),
+            RegexDef {
+                pattern: "^cdn-[0-9]+\\.example\\.com$".to_string(),
+                scope_suffix: vec![".example.com".to_string()], // Different scope!
+            },
+        );
+        let fp2 = router_fingerprint(&patterns, None, &regexes2);
+        assert_ne!(fp1, fp2, "changing scope_suffix must change fingerprint");
+
+        // Same scope_suffix, different pattern
+        let mut regexes3 = HashMap::new();
+        regexes3.insert(
+            "cdn".to_string(),
+            RegexDef {
+                pattern: "^cdn-[a-z]+\\.example\\.com$".to_string(), // Different pattern
+                scope_suffix: vec!["*.example.com".to_string()],
+            },
+        );
+        let fp3 = router_fingerprint(&patterns, None, &regexes3);
+        assert_ne!(fp1, fp3, "changing pattern must change fingerprint");
+
+        // Multiple scope_suffix entries, order should not matter
+        let mut regexes4 = HashMap::new();
+        regexes4.insert(
+            "cdn".to_string(),
+            RegexDef {
+                pattern: "^test$".to_string(),
+                scope_suffix: vec!["*.a.com".to_string(), "*.b.com".to_string()],
+            },
+        );
+        let mut regexes5 = HashMap::new();
+        regexes5.insert(
+            "cdn".to_string(),
+            RegexDef {
+                pattern: "^test$".to_string(),
+                scope_suffix: vec!["*.b.com".to_string(), "*.a.com".to_string()], // Reversed
+            },
+        );
+        let fp4 = router_fingerprint(&patterns, None, &regexes4);
+        let fp5 = router_fingerprint(&patterns, None, &regexes5);
+        assert_eq!(fp4, fp5, "scope_suffix order should not matter");
     }
 
     #[test]

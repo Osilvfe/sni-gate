@@ -69,6 +69,20 @@ pub struct Config {
     #[serde(default)]
     pub resolvers: HashMap<String, ResolverDef>,
 
+    /// Named regular expressions for SNI/Host matching. A `[regexes.<name>]`
+    /// table declares a regex pattern together with its scope suffix — the set
+    /// of domain suffixes the pattern may match. This scope information enables
+    /// wildcard certificate issuance to safely coexist with regex routes: a
+    /// wildcard is refused only when it would cover a name some regex in a
+    /// different route scope could match.
+    ///
+    /// Regex routes are referenced in `match_sni` with an `@` prefix:
+    /// `match_sni = ["@cdn-pattern", ".example.com"]`. Inline regex syntax
+    /// (`~pattern`) is no longer supported; all regexes must be declared and
+    /// named here. See [`RegexDef`].
+    #[serde(default)]
+    pub regexes: HashMap<String, RegexDef>,
+
     /// One or more inbound listeners.
     #[serde(rename = "listener")]
     pub listeners: Vec<Listener>,
@@ -432,6 +446,104 @@ pub struct Template {
     /// Per-route failure policy.
     #[serde(default)]
     pub fail: Option<FailPolicy>,
+}
+
+// ---------------------------------------------------------------------------
+// Named regexes
+// ---------------------------------------------------------------------------
+
+/// A named regular expression for SNI/Host matching, declared as
+/// `[regexes.<name>]` and referenced in `match_sni` with an `@` prefix.
+///
+/// # Why this exists
+///
+/// Regular expressions in route patterns cannot be statically analyzed to
+/// determine their match scope, which creates a correctness problem for wildcard
+/// certificate issuance: a wildcard `*.example.com` must not be issued if some
+/// regex in a *different* route scope could match hosts under `example.com`,
+/// because HTTP/2 connection coalescing would let the browser send a request for
+/// that regex-matched host on the wildcard connection, bypassing SNI-based
+/// routing entirely. See [`crate::certscope`] for the full rationale.
+///
+/// The inline regex syntax (`~pattern`) cannot carry scope information, so it
+/// forces a conservative refusal: *any* out-of-scope regex blocks *all*
+/// wildcards. Named regexes solve this by requiring an explicit `scope_suffix`
+/// declaration: the operator states which domain suffixes the pattern may match,
+/// and wildcard issuance uses that to precisely determine when a conflict exists.
+///
+/// # Configuration
+///
+/// ```toml
+/// [regexes.cdn-upos]
+/// pattern = "^upos-[a-z0-9-]+\\.akamaized\\.net$"
+/// scope_suffix = ["*.akamaized.net"]
+/// ```
+///
+/// Reference in a route with `@`:
+/// ```toml
+/// [[listener.route]]
+/// match_sni = ["@cdn-upos", ".example.com"]
+/// upstream = "cdn.example.com"
+/// type = "tls"
+/// ```
+///
+/// # Scope suffix syntax
+///
+/// The `scope_suffix` field uses the same pattern grammar as route matching:
+///
+/// * **`"*.domain.com"`** — matches only direct subdomains of `domain.com`
+///   (one label above it). Example: `a.domain.com` matches, `sub.a.domain.com`
+///   does not.
+/// * **`".domain.com"`** — matches `domain.com` itself plus all subdomains at
+///   any depth. Example: `domain.com`, `a.domain.com`, `sub.a.domain.com` all
+///   match.
+/// * **`"domain.com"`** — matches only the apex domain `domain.com` exactly.
+///
+/// A regex may declare multiple suffixes:
+/// ```toml
+/// scope_suffix = ["*.cdn1.example.com", "*.cdn2.example.com"]
+/// ```
+///
+/// # Validation
+///
+/// At startup, each `scope_suffix` entry is validated for correct syntax (must
+/// be a multi-level domain, cannot be a bare TLD). The pattern itself is
+/// compiled to verify it is a valid regex. No attempt is made to verify that
+/// the pattern's actual matches align with the declared scope — that
+/// responsibility lies with the operator. An incorrect declaration is a
+/// configuration error, not a runtime failure: it may cause wildcards to be
+/// refused when they would be safe, or (if the scope is under-declared) allow
+/// wildcards that should be refused, leading to incorrect routing.
+///
+/// # Inline regex deprecation
+///
+/// The inline syntax `match_sni = ["~^pattern$"]` is no longer supported. All
+/// regex patterns must be declared as named `[regexes.<name>]` entries with an
+/// explicit `scope_suffix`. This is enforced at config load time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexDef {
+    /// The regular expression pattern. Do not prefix with `~` — that was the
+    /// inline syntax marker and is not part of the pattern itself.
+    ///
+    /// The pattern is matched against normalized host names (lowercased, trailing
+    /// dot removed, port stripped if present). It is compiled with the `regex`
+    /// crate's default settings.
+    pub pattern: String,
+
+    /// The set of domain suffixes this pattern may match, using route pattern
+    /// syntax. Required and must not be empty.
+    ///
+    /// * `"*.example.com"` — one-label subdomains of `example.com`
+    /// * `".example.com"` — `example.com` and all its subdomains
+    /// * `"example.com"` — only the apex `example.com`
+    ///
+    /// This is a **conservative declaration**: it is the operator's responsibility
+    /// to ensure the pattern does not match hosts outside the declared scope. An
+    /// incorrect declaration may allow wildcard certificates to be issued when
+    /// they should be refused, leading to incorrect routing via HTTP/2 connection
+    /// coalescing.
+    pub scope_suffix: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +1121,42 @@ impl Config {
         }
     }
 
+    /// Whether `pattern` is a `[regexes.<name>]` reference (starts with `@`).
+    ///
+    /// Named regex references are distinguished by an `@` prefix to avoid ambiguity
+    /// with exact-match patterns. A pattern `@cdn-pattern` references
+    /// `[regexes.cdn-pattern]`. The prefix is required and unambiguous: exact-match
+    /// patterns never start with `@` in valid domain names.
+    pub fn is_regex_ref(pattern: &str) -> bool {
+        pattern.trim().starts_with('@')
+    }
+
+    /// Look up a declared regex by name (without the `@` prefix).
+    pub fn regex_def(&self, name: &str) -> Result<&RegexDef, ConfigError> {
+        self.regexes.get(name).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "unknown regex {name:?} (no matching [regexes.{name}])"
+            ))
+        })
+    }
+
+    /// Parse a regex reference pattern (with `@` prefix) and return the definition.
+    pub fn resolve_regex_ref(&self, pattern: &str) -> Result<&RegexDef, ConfigError> {
+        let name = pattern.trim().strip_prefix('@').ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid regex reference {pattern:?} (must start with @)"
+            ))
+        })?;
+
+        if name.is_empty() {
+            return Err(ConfigError::Invalid(
+                "regex reference cannot be bare '@' (expected @<name>)".into(),
+            ));
+        }
+
+        self.regex_def(name)
+    }
+
     /// Whether `spec` is a `[resolvers.<name>]` reference rather than an inline
     /// endpoint spec.
     ///
@@ -1332,6 +1480,55 @@ impl Config {
             ));
         }
         self.validate_resolvers()?;
+        self.validate_regexes()?;
+        Ok(())
+    }
+
+    /// Validate the `[regexes]` table: pattern compilation, scope_suffix presence
+    /// and syntax, and reference resolution from routes.
+    fn validate_regexes(&self) -> Result<(), ConfigError> {
+        use regex::Regex;
+
+        for (name, def) in &self.regexes {
+            // 1. Pattern must compile
+            Regex::new(&def.pattern).map_err(|e| {
+                ConfigError::Invalid(format!("[regexes.{name}]: invalid pattern: {e}"))
+            })?;
+
+            // 2. scope_suffix must not be empty
+            if def.scope_suffix.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[regexes.{name}]: scope_suffix must not be empty (declare at least one \
+                     domain suffix this pattern may match, e.g., [\"*.example.com\"])"
+                )));
+            }
+
+            // 3. Each scope_suffix entry must be valid
+            for scope in &def.scope_suffix {
+                validate_scope_pattern(name, scope)?;
+            }
+        }
+
+        // 4. Every regex reference in routes must resolve
+        for listener in &self.listeners {
+            for route in listener.routes.iter().chain(listener.default_route.iter()) {
+                for pattern in &route.match_sni {
+                    if Self::is_regex_ref(pattern) {
+                        // Validate the reference resolves
+                        self.resolve_regex_ref(pattern)?;
+                    } else if pattern.trim().starts_with('~') {
+                        // Inline regex syntax is no longer supported
+                        return Err(ConfigError::Invalid(format!(
+                            "route {}: inline regex {pattern:?} is no longer supported; \
+                             declare it in [regexes.<name>] with a scope_suffix, then \
+                             reference it as @<name>",
+                            route.label()
+                        )));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1902,6 +2099,82 @@ where
     }
 
     deserializer.deserialize_option(Outer)
+}
+
+// ---------------------------------------------------------------------------
+// Scope pattern validation
+// ---------------------------------------------------------------------------
+
+/// Validate a single scope_suffix pattern for syntactic correctness.
+///
+/// Accepted forms:
+/// * `"*.domain.com"` — wildcard (one-label subdomains)
+/// * `".domain.com"` — suffix (domain and all subdomains)
+/// * `"domain.com"` — exact apex
+///
+/// The domain part must be multi-level (contain at least one dot) and consist
+/// of valid domain-name characters. Bare TLDs like `"com"` or `"*.com"` are
+/// rejected.
+fn validate_scope_pattern(regex_name: &str, scope: &str) -> Result<(), ConfigError> {
+    let scope = scope.trim();
+
+    if scope.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "[regexes.{regex_name}]: scope_suffix contains empty entry"
+        )));
+    }
+
+    // Extract the domain part by stripping pattern prefixes
+    let domain = if let Some(rest) = scope.strip_prefix("*.") {
+        rest
+    } else if let Some(rest) = scope.strip_prefix('.') {
+        rest
+    } else {
+        scope
+    };
+
+    if domain.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "[regexes.{regex_name}]: invalid scope_suffix {scope:?} (pattern prefix with no domain)"
+        )));
+    }
+
+    // Must contain at least one dot (multi-level domain, not a bare TLD)
+    if !domain.contains('.') {
+        return Err(ConfigError::Invalid(format!(
+            "[regexes.{regex_name}]: scope_suffix {scope:?} must be a multi-level domain \
+             (e.g., \"*.example.com\", \".example.com\", or \"example.com\"); \
+             bare TLDs are not allowed"
+        )));
+    }
+
+    // Basic validation: domain-name characters only
+    // Allow: alphanumeric, hyphen, dot. Hyphen cannot be at start/end of a label.
+    let labels: Vec<&str> = domain.split('.').collect();
+    for label in labels {
+        if label.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "[regexes.{regex_name}]: scope_suffix {scope:?} contains empty label \
+                 (consecutive dots or leading/trailing dot)"
+            )));
+        }
+
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ConfigError::Invalid(format!(
+                "[regexes.{regex_name}]: scope_suffix {scope:?} contains invalid label \
+                 {label:?} (hyphens cannot be at the start or end)"
+            )));
+        }
+
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ConfigError::Invalid(format!(
+                "[regexes.{regex_name}]: scope_suffix {scope:?} contains invalid characters \
+                 in label {label:?} (only alphanumeric and hyphen allowed)"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2990,5 +3263,207 @@ addr = "0.0.0.0:443"
         );
         cfg.validate().unwrap();
         assert_eq!(route_ech(&cfg, 0).mode, EchMode::Doh);
+    }
+
+    // -- Named regex validation tests ---------------------------------------
+
+    #[test]
+    fn regex_with_valid_scope_suffix() {
+        let cfg = parse(
+            r#"
+[regexes.cdn]
+pattern = "^cdn-[0-9]+\\.example\\.com$"
+scope_suffix = ["*.example.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@cdn"]
+"#,
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn regex_with_multiple_scope_suffixes() {
+        let cfg = parse(
+            r#"
+[regexes.multi]
+pattern = "^test.*$"
+scope_suffix = ["*.example.com", ".other.com", "apex.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@multi"]
+"#,
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn regex_with_empty_scope_suffix_is_rejected() {
+        let cfg = parse(
+            r#"
+[regexes.bad]
+pattern = "^test\\.com$"
+scope_suffix = []
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@bad"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("scope_suffix must not be empty"));
+    }
+
+    #[test]
+    fn regex_with_invalid_pattern_is_rejected() {
+        let cfg = parse(
+            r#"
+[regexes.bad]
+pattern = "^[invalid"
+scope_suffix = ["*.example.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@bad"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid pattern"));
+    }
+
+    #[test]
+    fn regex_with_bare_tld_scope_is_rejected() {
+        let cfg = parse(
+            r#"
+[regexes.bad]
+pattern = "^.*\\.com$"
+scope_suffix = ["*.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@bad"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("multi-level domain"));
+        assert!(err.to_string().contains("bare TLDs"));
+    }
+
+    #[test]
+    fn regex_with_empty_scope_entry_is_rejected() {
+        let cfg = parse(
+            r#"
+[regexes.bad]
+pattern = "^test\\.example\\.com$"
+scope_suffix = ["*.example.com", ""]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@bad"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("empty entry"));
+    }
+
+    #[test]
+    fn regex_with_invalid_label_is_rejected() {
+        let cfg = parse(
+            r#"
+[regexes.bad]
+pattern = "^test$"
+scope_suffix = ["*.-invalid.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@bad"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("hyphens cannot be at the start"));
+    }
+
+    #[test]
+    fn inline_regex_is_rejected() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["~^test\\.com$"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("inline regex"));
+        assert!(err.to_string().contains("no longer supported"));
+    }
+
+    #[test]
+    fn regex_reference_to_nonexistent_regex_is_rejected() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["@nonexistent"]
+"#,
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown regex"));
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn is_regex_ref_identifies_at_prefix() {
+        assert!(Config::is_regex_ref("@cdn-pattern"));
+        assert!(Config::is_regex_ref("  @name  "));
+        assert!(!Config::is_regex_ref("example.com"));
+        assert!(!Config::is_regex_ref("*.example.com"));
+        assert!(!Config::is_regex_ref(".example.com"));
+        assert!(!Config::is_regex_ref(""));
+    }
+
+    #[test]
+    fn resolve_regex_ref_extracts_name() {
+        let cfg = parse(
+            r#"
+[regexes.test-cdn]
+pattern = "^test$"
+scope_suffix = ["*.example.com"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".example.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+
+        let def = cfg.resolve_regex_ref("@test-cdn").unwrap();
+        assert_eq!(def.pattern, "^test$");
+        assert_eq!(def.scope_suffix, vec!["*.example.com"]);
+
+        assert!(cfg.resolve_regex_ref("@nonexistent").is_err());
+        assert!(cfg.resolve_regex_ref("not-a-ref").is_err());
+        assert!(cfg.resolve_regex_ref("@").is_err());
     }
 }

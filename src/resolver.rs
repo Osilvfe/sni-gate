@@ -436,7 +436,8 @@ mod tests {
             cache_capacity: 64,
             cache_ttl: Duration::from_secs(60),
         }));
-        let router = Arc::new(Router::build(patterns, default).unwrap());
+        let router =
+            Arc::new(Router::build(patterns, default, &std::collections::HashMap::new()).unwrap());
         DynamicResolver::new(issuer, router, scopes.to_vec().into())
     }
 

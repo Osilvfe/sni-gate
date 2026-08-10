@@ -162,7 +162,7 @@ connect_timeout = "5s"
   [[listener.route]]
   name = "site-a"
   type = "ech"
-  match_sni = [".site-a.example"]    # exact | *.x | .x (suffix) | ~regex
+  match_sni = [".site-a.example"]    # exact | *.x | .x (suffix) | @name (named regex)
   upstream = "edge.example:443"
   # override_sni: inner (protected) SNI for ech, upstream SNI for tls.
   #   (omitted)  reflect the inbound SNI verbatim

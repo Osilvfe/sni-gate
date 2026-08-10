@@ -32,7 +32,7 @@ It merges two capabilities:
 
 1. **Peek** the connection without consuming bytes to learn the routing key
    (TLS SNI, or the HTTP `Host` header).
-2. **Route** it: `exact` > `wildcard *.x` > `suffix .x` > `regex ~…` > the
+2. **Route** it: `exact` > `wildcard *.x` > `suffix .x` > `regex @name` > the
    listener's `default_route`.
 3. For any type except `raw`, **terminate inbound TLS**, issuing a certificate
    for the SNI (and its wildcard) from the local CA, then **re-originate** to the
@@ -92,6 +92,53 @@ Because resolution keys on *presence*, a route can blank out a name inherited
 from its template with `override_sni = ""`.
 
 [RFC 9849 §5]: https://www.rfc-editor.org/rfc/rfc9849.html#section-5
+
+## Named regular expressions
+
+Regular expressions in `match_sni` must be declared as `[regexes.<name>]` entries
+and referenced with an `@` prefix. Each regex carries a `scope_suffix` declaration
+that enables wildcard certificate issuance to coexist safely with regex routes.
+
+```toml
+[regexes.cdn-upos]
+pattern = "^upos-[a-z0-9-]+\\.akamaized\\.net$"
+scope_suffix = ["*.akamaized.net"]
+
+[[listener.route]]
+match_sni = ["@cdn-upos", ".google.com"]
+upstream = "cdn.example.com"
+type = "tls"
+```
+
+### Why scope_suffix is required
+
+When deciding whether to issue a wildcard certificate like `*.example.com`, the
+router must verify that all hosts it would cover route to the same destination.
+For exact/wildcard/suffix patterns, this is statically decidable. For regex
+patterns, it is not—the program cannot determine which hosts a regex will match.
+
+`scope_suffix` is the operator's declaration: "this regex may match hosts under
+these domain suffixes." The router uses this to check for overlaps. If a wildcard
+`*.example.com` is requested for route A, and a regex in route B declares
+`scope_suffix = ["*.example.com"]`, the wildcard is refused to prevent incorrect
+HTTP/2 connection coalescing.
+
+### Syntax
+
+`scope_suffix` uses the same pattern grammar as route matching:
+
+- `"*.domain.com"` — matches only direct subdomains of `domain.com` (one label above it)
+- `".domain.com"` — matches `domain.com` itself plus all subdomains at any depth
+- `"domain.com"` — matches only the apex domain exactly
+
+A regex may declare multiple suffixes:
+```toml
+scope_suffix = ["*.cdn1.example.com", "*.cdn2.example.com"]
+```
+
+**The operator is responsible for ensuring the pattern does not match hosts outside
+the declared scope.** An under-declared scope may allow wildcard certificates that
+should be refused, leading to incorrect routing via HTTP/2 connection coalescing.
 
 ## Upstream address
 
@@ -188,9 +235,9 @@ Two mechanisms hold it, and both are load-bearing:
   table and dropped unless *every* host it would cover routes into the same scope.
   A wildcard is refused when a sibling is pinned elsewhere, when subdomains fall
   through to a `default_route` in another scope, when they would match no route at
-  all, or — conservatively — when they could reach a `regex` route in another scope
-  (regex match sets are not statically decidable). The requesting host itself is
-  always covered, so a clipped certificate is still usable.
+  all, or when a regex route in another scope declares a `scope_suffix` that
+  overlaps with the wildcard. The requesting host itself is always covered, so a
+  clipped certificate is still usable.
 - **Partitioning.** The certificate cache and the on-disk store are keyed by
   scope. Clipping alone would not survive accumulation: a later host under the
   same anchor but a different destination would otherwise be merged into the
