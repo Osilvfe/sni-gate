@@ -21,7 +21,7 @@ It merges two capabilities:
 
 ```
                          issue per-SNI cert (wildcard, cached, persisted)
-                         ┌───────────────────────────────────────┐
+                         ┌────────────────────────────────────────┐
                          │                                        ▼
  client ──TLS(SNI)/HTTP──▶ sni-gate :443 ── route by SNI/Host ──▶ upstream
                               peek (no consume)                    · ech  → TLS1.3 + ECH
