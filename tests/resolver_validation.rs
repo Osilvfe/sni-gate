@@ -22,11 +22,11 @@ addr = "127.0.0.1:9999"
 
 [resolvers.a]
 endpoint = "https://a.test/dns-query"
-bootstrap = "b"
+bootstrap = "@b"
 
 [resolvers.b]
 endpoint = "https://b.test/dns-query"
-bootstrap = "a"
+bootstrap = "@a"
 "#,
         preamble = preamble()
     );
@@ -47,7 +47,7 @@ fn unknown_resolver_reference_is_rejected() {
     let config = format!(
         r#"
 [global]
-resolver = "typo"
+resolver = "@typo"
 {preamble}
 [[listener]]
 addr = "127.0.0.1:9999"
@@ -101,34 +101,6 @@ endpoint = "https://doh.test/dns-query"
 }
 
 #[test]
-fn resolver_name_that_looks_like_a_spec_is_rejected() {
-    let dir = tempdir();
-    let config = format!(
-        r#"
-[global]
-{preamble}
-[[listener]]
-addr = "127.0.0.1:9999"
-  [[listener.route]]
-  name = "x"
-  type = "raw"
-  match_sni = ["x.test"]
-  upstream = "127.0.0.1:1"
-
-[resolvers."https://ambiguous.test/dns-query"]
-endpoint = "https://real.test/dns-query"
-"#,
-        preamble = preamble()
-    );
-    let (ok, out) = run_sni_gate_to_completion(&config, dir.path());
-    assert!(!ok, "ambiguous name should be rejected; output:\n{out}");
-    assert!(
-        out.contains("would also parse as an inline") && out.contains("ambiguous"),
-        "error should explain the ambiguity; got:\n{out}"
-    );
-}
-
-#[test]
 fn self_bootstrap_is_rejected() {
     let dir = tempdir();
     let config = format!(
@@ -145,7 +117,7 @@ addr = "127.0.0.1:9999"
 
 [resolvers.r]
 endpoint = "https://doh.test/dns-query"
-bootstrap = "r"
+bootstrap = "@r"
 "#,
         preamble = preamble()
     );

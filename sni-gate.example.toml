@@ -23,7 +23,8 @@ log = "info"                                   # or SNI_GATE_LOG / RUST_LOG
 #   "https://host[:port]/dns-query"   DoH
 #   "tls://host[:port]"               DoT
 #   "udp://ip[:port]" | "ip[:port]"   plain DNS to an IP
-resolver = "system"                            # e.g. "https://dns.example/dns-query"
+#   "@resolver-name"                  reference to [resolvers.<name>] declaration
+resolver = "system"                            # e.g. "https://dns.example/dns-query" or "@cloudflare"
 # ech_resolver / addr_resolver may override the generic resolver per purpose.
 ech_refresh = "1h"                             # ECH config refresh bound
 # nat64_prefix = "64:ff9b::"                   # /96 prefix, hierarchical
@@ -263,3 +264,28 @@ connect_timeout = "5s"
   name = "reflect"
   type = "raw"
   match_sni = [".mirror.example"]
+
+# ---------------------------------------------------------------------------
+# Named resolvers (advanced DNS configuration with bootstrap chains and ECH)
+# ---------------------------------------------------------------------------
+# Named resolvers enable DoH/DoT endpoints to be resolved through other
+# resolvers (bootstrap chains), support upstream override for CDN fronting,
+# and can use ECH to protect their own TLS handshake. Reference them with
+# @ prefix: resolver = "@cloudflare"
+#
+# [resolvers.cloudflare]
+# endpoint = "https://1.1.1.1/dns-query"
+#
+# [resolvers.google]
+# endpoint = "https://dns.google/dns-query"
+# upstream = "edge.cdn.example"      # CDN fronting: dial edge, SNI dns.google
+# bootstrap = "@cloudflare"          # Resolve dns.google via cloudflare
+#
+# [resolvers.secure]
+# endpoint = "https://doh.example/dns-query"
+# bootstrap = "@cloudflare"
+#   [resolvers.secure.ech]
+#   mode = "doh"
+#   require_ech = true
+#   ech_resolver = "@cloudflare"     # Cloudflare fetches secure's ECH config
+

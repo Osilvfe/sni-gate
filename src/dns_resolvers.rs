@@ -911,20 +911,26 @@ mod tests {
         assert_eq!(e.host(), Some("dns.example"));
     }
 
-    /// A bare word is not an endpoint. This is what keeps the reference
-    /// namespace (`resolver = "cf-doh"`) disjoint from the spec namespace:
-    /// `Config::is_resolver_ref` reads such a word as a name, and it must never
-    /// also parse as a transport.
+    /// Named resolver references use `@` prefix to maintain symmetry with named
+    /// regex references. A bare word without `@` is never a reference.
     #[test]
-    fn bare_word_is_not_an_endpoint() {
+    fn bare_word_is_not_an_endpoint_or_reference() {
         for s in ["cf-doh", "boot", "my-resolver", "not-an-ip"] {
             assert!(
                 Endpoint::parse(s).is_err(),
                 "{s:?} must not parse as an endpoint"
             );
             assert!(
+                !crate::config::Config::is_resolver_ref(s),
+                "{s:?} without @ prefix must not be a resolver reference"
+            );
+        }
+
+        // With @ prefix, they are references
+        for s in ["@cf-doh", "@boot", "@my-resolver"] {
+            assert!(
                 crate::config::Config::is_resolver_ref(s),
-                "{s:?} must read as a resolver reference"
+                "{s:?} with @ prefix must be a resolver reference"
             );
         }
     }

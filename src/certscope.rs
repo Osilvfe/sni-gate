@@ -371,7 +371,7 @@ mod tests {
         f.ech.as_mut().unwrap().domain = None;
         cases.push(("ech domain", f));
         let mut f = fwd();
-        f.ech.as_mut().unwrap().resolver = "cloudflare-doh".into();
+        f.ech.as_mut().unwrap().resolver = "@cloudflare-doh".into();
         cases.push(("ech resolver", f));
         let mut f = fwd();
         f.ech.as_mut().unwrap().inline_config = true;

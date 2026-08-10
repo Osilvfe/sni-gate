@@ -813,10 +813,14 @@ fn get_resolver(
 ) -> Result<Arc<dns_resolvers::DnsResolver>> {
     // Named reference: return from registry.
     if Config::is_resolver_ref(spec) {
+        let name = spec
+            .trim()
+            .strip_prefix('@')
+            .ok_or_else(|| anyhow::anyhow!("invalid resolver reference {spec:?}"))?;
         return registry
-            .get(spec)
+            .get(name)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown resolver {spec:?}"));
+            .ok_or_else(|| anyhow::anyhow!("unknown resolver @{name}"));
     }
 
     // Inline spec: check cache, or build and wrap.
@@ -865,9 +869,12 @@ async fn build_named_resolvers(
         // Resolve bootstrap: inline spec or named reference.
         let bootstrap = match &eff.bootstrap {
             Some(spec) if Config::is_resolver_ref(spec) => {
-                registry.get(spec).cloned().ok_or_else(|| {
+                let bootstrap_name = spec.trim().strip_prefix('@').ok_or_else(|| {
+                    anyhow::anyhow!("[resolvers.{name}]: invalid bootstrap reference {spec:?}")
+                })?;
+                registry.get(bootstrap_name).cloned().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "[resolvers.{name}]: bootstrap {spec:?} not found (build order error)"
+                        "[resolvers.{name}]: bootstrap @{bootstrap_name} not found (build order error)"
                     )
                 })?
             }
@@ -922,9 +929,14 @@ async fn build_named_resolvers(
             .map(|e_settings| {
                 let ech_resolver = match &eff.ech_resolver {
                     Some(spec) if Config::is_resolver_ref(spec) => {
-                        registry.get(spec).cloned().ok_or_else(|| {
+                        let ech_name = spec.trim().strip_prefix('@').ok_or_else(|| {
                             anyhow::anyhow!(
-                                "[resolvers.{name}.ech]: ech_resolver {spec:?} not found"
+                                "[resolvers.{name}.ech]: invalid ech_resolver reference {spec:?}"
+                            )
+                        })?;
+                        registry.get(ech_name).cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "[resolvers.{name}.ech]: ech_resolver @{ech_name} not found"
                             )
                         })?
                     }

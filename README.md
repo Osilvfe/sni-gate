@@ -385,7 +385,7 @@ spec is accepted.
    
    [resolvers.primary]
    endpoint = "https://dns.blocked.example/dns-query"
-   bootstrap = "bootstrap"  # Resolve dns.blocked.example via bootstrap
+   bootstrap = "@bootstrap"  # Resolve dns.blocked.example via bootstrap
    ```
 
 2. **Upstream override (CDN fronting)** — Dial a CDN edge while presenting the
@@ -402,7 +402,7 @@ spec is accepted.
    ```toml
    [resolvers.secure]
    endpoint = "https://doh.example/dns-query"
-   bootstrap = "bootstrap"
+   bootstrap = "@bootstrap"
      [resolvers.secure.ech]
      mode = "doh"
      require_ech = true
@@ -415,7 +415,7 @@ spec is accepted.
 endpoint = "..."           # Required: transport spec (see formats below)
 upstream = "..."           # Optional: override dial target (host, port, or both)
 override_sni = "..."       # Optional: TLS server name (omit=reflect, "name"=fixed, ""=suppress)
-bootstrap = "..."          # Optional: resolver name or inline spec for endpoint resolution
+bootstrap = "..."          # Optional: @resolver-name or inline spec for endpoint resolution
 address_family = "..."     # Optional: dual/ipv4/ipv6 (inherits from [global])
 nat64_prefix = "..."       # Optional: e.g. "64:ff9b::/96" (inherits from [global])
 connect_timeout = "..."    # Optional: per-query timeout (inherits from [global])
@@ -427,7 +427,7 @@ ech_domain = "..."         # Override HTTPS lookup name
 require_ech = true         # Fail rather than GREASE (default: true)
 max_retries = 2            # ECH rejection retry budget
 ech_refresh = "1h"         # Proactive rotation interval
-ech_resolver = "..."       # Who fetches this resolver's ECH config
+ech_resolver = "..."       # @resolver-name or inline spec for ECH config fetch
 ```
 
 #### Endpoint formats
@@ -443,13 +443,13 @@ resolver references. Use `udp://` or `tcp://` prefix to specify a hostname.
 
 #### Using named resolvers
 
-Reference by name anywhere a resolver spec is accepted:
+Reference by name with `@` prefix anywhere a resolver spec is accepted:
 
 ```toml
 [global]
-resolver = "my-doh"          # Default for everything
-addr_resolver = "fast"       # Override for A/AAAA lookups
-ech_resolver = "secure"      # Override for HTTPS/ECH lookups
+resolver = "@my-doh"          # Default for everything
+addr_resolver = "@fast"       # Override for A/AAAA lookups
+ech_resolver = "@secure"      # Override for HTTPS/ECH lookups
 
 [resolvers.my-doh]
 endpoint = "https://1.1.1.1/dns-query"
@@ -487,15 +487,14 @@ fields then inherit from `[global.ech]` field-by-field.
 Named resolvers are validated at load time:
 
 - **Cycle detection**: `a → b → a` dependency cycles are rejected
-- **Unknown references**: `bootstrap = "typo"` when no such resolver exists
-- **Self-bootstrap**: `bootstrap = "self"` is rejected
-- **Name collision**: Resolver names cannot look like inline specs (e.g., can't name a resolver "1.1.1.1")
+- **Unknown references**: `bootstrap = "@typo"` when no such resolver exists
+- **Self-bootstrap**: `bootstrap = "@self"` is rejected
 
 #### Advanced example: Multi-layer bootstrap chain
 
 ```toml
 [global]
-resolver = "layer-3"
+resolver = "@layer-3"
 
 # Layer 1: IP-addressed, no dependencies
 [resolvers.layer-1]
@@ -504,16 +503,16 @@ endpoint = "1.1.1.1"
 # Layer 2: First DoH hop
 [resolvers.layer-2]
 endpoint = "https://doh-a.example/dns-query"
-bootstrap = "layer-1"
+bootstrap = "@layer-1"
 
 # Layer 3: Final resolver with ECH
 [resolvers.layer-3]
 endpoint = "https://doh-b.example/dns-query"
-bootstrap = "layer-2"
+bootstrap = "@layer-2"
   [resolvers.layer-3.ech]
   mode = "doh"
   require_ech = true
-  ech_resolver = "layer-2"  # layer-2 fetches layer-3's ECH config
+  ech_resolver = "@layer-2"  # layer-2 fetches layer-3's ECH config
 ```
 
 #### ECH rotation mechanism

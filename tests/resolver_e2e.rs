@@ -23,7 +23,7 @@ fn named_resolver_answers_upstream_lookup() {
     let config = format!(
         r#"
 [global]
-resolver = "test-dns"
+resolver = "@test-dns"
 address_family = "ipv4"
 {preamble}
 
@@ -78,7 +78,7 @@ fn bootstrap_resolver_answers_endpoint_lookup() {
     let config = format!(
         r#"
 [global]
-resolver = "resolver-a"
+resolver = "@resolver-a"
 address_family = "ipv4"
 {preamble}
 
@@ -87,7 +87,7 @@ endpoint = "127.0.0.1:{bootstrap_port}"
 
 [resolvers.resolver-a]
 endpoint = "udp://resolver-a.example:{resolver_a_port}"
-bootstrap = "bootstrap"
+bootstrap = "@bootstrap"
 
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -141,14 +141,14 @@ fn upstream_override_changes_dial_target() {
     let config = format!(
         r#"
 [global]
-resolver = "test-dns"
+resolver = "@test-dns"
 address_family = "ipv4"
 {preamble}
 
 [resolvers.test-dns]
 endpoint = "udp://dns.original.test:{dns_port}"
 upstream = "edge.cdn.test"
-bootstrap = "boot"
+bootstrap = "@boot"
 
 [resolvers.boot]
 endpoint = "127.0.0.1:{dns_port}"

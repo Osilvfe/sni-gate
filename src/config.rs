@@ -581,7 +581,7 @@ pub struct RegexDef {
 ///
 /// * **`bootstrap`** — a *dependency edge*, not a setting. Inheriting it from
 ///   `[global].resolver` would make the graph implicitly cyclic in the most
-///   ordinary configuration there is: `global.resolver = "cf-doh"` plus a
+///   ordinary configuration there is: `global.resolver = "@cf-doh"` plus a
 ///   `cf-doh` with no explicit bootstrap would have `cf-doh` bootstrapping from
 ///   itself. The cycle detector would catch it, but the operator would face an
 ///   error about a cycle they never wrote.
@@ -1160,32 +1160,38 @@ impl Config {
     /// Whether `spec` is a `[resolvers.<name>]` reference rather than an inline
     /// endpoint spec.
     ///
-    /// The two namespaces are disjoint *by construction*, not by convention: every
-    /// inline spec carries either a scheme (`https://`, `tls://`, `udp://`), a `:`
-    /// port separator, or is a bare IP literal, and `system` is reserved. A bare
-    /// word is none of those — today it is already a load error, so reading it as
-    /// a name is purely additive and can never shadow a valid spec.
-    ///
-    /// [`validate_resolvers`](Self::validate_resolvers) additionally rejects a
-    /// declared name that *would* parse as a spec, closing the loop from the other
-    /// side, and rejects a bare word matching no declaration (a typo) rather than
-    /// letting it fail later as "not a valid ip[:port]".
+    /// Named resolver references are distinguished by an `@` prefix to maintain
+    /// symmetry with named regex references. A spec `@my-resolver` references
+    /// `[resolvers.my-resolver]`. The prefix is required and unambiguous: inline
+    /// specs never start with `@`.
     pub fn is_resolver_ref(spec: &str) -> bool {
-        let s = spec.trim();
-        !s.is_empty()
-            && !s.eq_ignore_ascii_case("system")
-            && !s.contains("://")
-            && !s.contains(':')
-            && s.parse::<std::net::IpAddr>().is_err()
+        spec.trim().starts_with('@')
     }
 
-    /// Look up a declared resolver by name.
+    /// Look up a declared resolver by name (without the `@` prefix).
     pub fn resolver_def(&self, name: &str) -> Result<&ResolverDef, ConfigError> {
         self.resolvers.get(name).ok_or_else(|| {
             ConfigError::Invalid(format!(
                 "unknown resolver {name:?} (no matching [resolvers.{name}])"
             ))
         })
+    }
+
+    /// Parse a resolver reference (with `@` prefix) and return the definition.
+    pub fn resolve_resolver_ref(&self, spec: &str) -> Result<&ResolverDef, ConfigError> {
+        let name = spec.trim().strip_prefix('@').ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid resolver reference {spec:?} (must start with @)"
+            ))
+        })?;
+
+        if name.is_empty() {
+            return Err(ConfigError::Invalid(
+                "resolver reference cannot be bare '@' (expected @<name>)".into(),
+            ));
+        }
+
+        self.resolver_def(name)
     }
 
     /// The effective settings for a declared resolver, by name.
@@ -1253,35 +1259,20 @@ impl Config {
         out
     }
 
-    /// Validate the `[resolvers]` table: namespace disjointness, reference
-    /// existence, endpoint grammar, acyclicity, and ECH completeness.
+    /// Validate the `[resolvers]` table: reference existence, endpoint grammar,
+    /// acyclicity, and ECH completeness.
     ///
     /// Cycles must be a **load-time** refusal rather than a runtime timeout,
     /// because building a resolver is exactly what resolving its own address
     /// requires: a cycle would deadlock startup with no useful diagnostic. The
     /// error names the whole path so the user can see which edge to break.
     fn validate_resolvers(&self) -> Result<(), ConfigError> {
-        // A declared name that would also parse as an inline spec would make
-        // every reference to it ambiguous. Reject it at the declaration, where
-        // the fix is obvious, rather than at each use.
-        for name in self.resolvers.keys() {
-            if !Self::is_resolver_ref(name) {
-                return Err(ConfigError::Invalid(format!(
-                    "[resolvers.{name}]: the name {name:?} would also parse as an inline \
-                     resolver spec, which would make every reference to it ambiguous; \
-                     pick a name that is not `system`, an IP literal, or scheme-prefixed"
-                )));
-            }
-        }
-
-        // Every reference resolves. A bare word that matches nothing is a typo,
-        // and saying so beats the downstream "not a valid ip[:port]".
+        // Every reference resolves.
         for (origin, spec) in self.resolver_refs() {
-            if Self::is_resolver_ref(&spec) && !self.resolvers.contains_key(&spec) {
-                return Err(ConfigError::Invalid(format!(
-                    "{origin}: unknown resolver {spec:?} (no matching [resolvers.{spec}]; \
-                     an inline endpoint needs a scheme, e.g. \"https://{spec}/dns-query\")"
-                )));
+            if Self::is_resolver_ref(&spec) {
+                // Validate the reference resolves
+                self.resolve_resolver_ref(&spec)
+                    .map_err(|e| ConfigError::Invalid(format!("{origin}: {e}")))?;
             }
         }
 
@@ -1328,20 +1319,32 @@ impl Config {
                 // the fetch is for. The generic cycle check below catches named
                 // self-reference, but `ech_resolver` omitted entirely means "the
                 // system resolver", which is fine — only naming *itself* is not.
-                if eff.ech_resolver.as_deref() == Some(name.as_str()) {
-                    return Err(ConfigError::Invalid(format!(
-                        "[resolvers.{name}.ech]: ech_resolver = {name:?} would have this \
-                         resolver fetch its own ECHConfig through itself; name a different \
-                         resolver, or omit it to use OS resolution"
-                    )));
+                if let Some(spec) = &eff.ech_resolver {
+                    if Self::is_resolver_ref(spec) {
+                        if let Some(resolved_name) = spec.strip_prefix('@') {
+                            if resolved_name == name {
+                                return Err(ConfigError::Invalid(format!(
+                                    "[resolvers.{name}.ech]: ech_resolver = {spec:?} would have this \
+                                     resolver fetch its own ECHConfig through itself; name a different \
+                                     resolver, or omit it to use OS resolution"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
-            if eff.bootstrap.as_deref() == Some(name.as_str()) {
-                return Err(ConfigError::Invalid(format!(
-                    "[resolvers.{name}]: bootstrap = {name:?} would have this resolver \
-                     resolve its own address through itself; name a different resolver, \
-                     or omit it to use OS resolution"
-                )));
+            if let Some(spec) = &eff.bootstrap {
+                if Self::is_resolver_ref(spec) {
+                    if let Some(resolved_name) = spec.strip_prefix('@') {
+                        if resolved_name == name {
+                            return Err(ConfigError::Invalid(format!(
+                                "[resolvers.{name}]: bootstrap = {spec:?} would have this resolver \
+                                 resolve its own address through itself; name a different resolver, \
+                                 or omit it to use OS resolution"
+                            )));
+                        }
+                    }
+                }
             }
         }
 
@@ -1416,11 +1419,17 @@ impl Config {
                         edges.sort_unstable();
                         edges.dedup();
                         for e in edges {
+                            // Strip the @ prefix to get the bare name for lookup
+                            let bare_name = e.strip_prefix('@').ok_or_else(|| {
+                                ConfigError::Invalid(format!(
+                                    "[resolvers.{name}]: invalid resolver reference {e:?}"
+                                ))
+                            })?;
                             // Resolve to the declared key so the reported path uses
                             // the canonical spelling.
                             let key = self
                                 .resolvers
-                                .get_key_value(e)
+                                .get_key_value(bare_name)
                                 .map(|(k, _)| k.as_str())
                                 .ok_or_else(|| {
                                     ConfigError::Invalid(format!(
