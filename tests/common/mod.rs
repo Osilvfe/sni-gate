@@ -466,7 +466,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 "#
     .to_string()

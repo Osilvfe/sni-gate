@@ -122,13 +122,20 @@ renew_margin_days = 30
 capacity = 8192
 ttl_secs = 86400
 
-[cache.psl]                   # public-suffix list (wildcard base derivation)
-source = "embedded"           # embedded | file | network
-# path = "public_suffix_list.dat"
-# url = "https://publicsuffix.org/list/public_suffix_list.dat"
-# cron = "0 17 3 * * 0"       # weekly refresh (network mode)
-# timeout_secs = 30
-# proxy = ""                  # optional; empty = direct
+# ===========================================================================
+# Public Suffix List
+# ===========================================================================
+# Determines the registrable-domain anchor for issued certificates.
+[psl]
+source = "embedded"           # embedded | file
+# When source = "file":
+# path = "cache/public_suffix_list.dat"
+# auto_update = false         # download PSL when stale
+# update_url = "https://publicsuffix.org/list/public_suffix_list.dat"
+# max_age = "30d"             # how old before considered stale
+# check_interval = "6h"       # how often to check at runtime (omit = startup only)
+# update_timeout = "30s"
+# auto_reload = false         # hot-reload when file changes (via file watcher)
 
 # ===========================================================================
 # Listener 1 — HTTPS on 443

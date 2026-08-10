@@ -39,10 +39,9 @@ publicsuffix = "2"
 # In-memory caches (issued certs, per-inner ECH configs).
 moka = { version = "0.12", features = ["sync"] }
 
-# PSL network refresh (optional, proxy-aware) + cron scheduling.
+# PSL network refresh + file watching for auto-reload.
 ureq = "3"
-cron = "0.17"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+notify = "7"
 
 # Config, logging, misc.
 serde = { version = "1", features = ["derive"] }

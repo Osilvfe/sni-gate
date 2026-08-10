@@ -152,7 +152,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -196,7 +196,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -236,7 +236,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -280,7 +280,7 @@ mode = "ladder"
 enabled = true
 dir = "certs"
 renew_margin_days = 30
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -415,7 +415,7 @@ mode = "ladder"
 enabled = true
 dir = "certs"
 renew_margin_days = 30
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -516,7 +516,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 [templates.web]
 type = "http"
@@ -725,7 +725,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"
@@ -976,7 +976,7 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[cache.psl]
+[psl]
 source = "embedded"
 [[listener]]
 addr = "127.0.0.1:{listen}"

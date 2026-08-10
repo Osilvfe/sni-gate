@@ -50,6 +50,10 @@ pub struct Config {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Public suffix list configuration.
+    #[serde(default)]
+    pub psl: PslConfig,
+
     /// Reusable, named bundles of route/listener settings. A `route`,
     /// `default_route`, or `listener` references one with `use = "<name>"`.
     /// Templates cannot reference other templates (no nesting).
@@ -864,22 +868,41 @@ impl Default for StoreConfig {
     }
 }
 
-/// Public-suffix list source for wildcard base derivation.
+/// Public-suffix list configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PslConfig {
-    #[serde(default = "default_psl_source")]
+    /// PSL data source.
+    #[serde(default)]
     pub source: PslSource,
+
+    /// File path (only used when `source = "file"`).
     #[serde(default = "default_psl_path")]
     pub path: PathBuf,
-    #[serde(default = "default_psl_url")]
-    pub url: String,
-    #[serde(default = "default_psl_cron")]
-    pub cron: String,
-    #[serde(default = "default_psl_timeout_secs")]
-    pub timeout_secs: u64,
+
+    /// Whether to auto-download the PSL when it's stale.
     #[serde(default)]
-    pub proxy: String,
+    pub auto_update: bool,
+
+    /// URL to download PSL from (only used when `auto_update = true`).
+    #[serde(default = "default_psl_update_url")]
+    pub update_url: String,
+
+    /// Maximum age before PSL is considered stale.
+    #[serde(default = "default_psl_max_age", with = "humantime_serde")]
+    pub max_age: Duration,
+
+    /// How often to check PSL age at runtime (None = only at startup).
+    #[serde(default, with = "humantime_serde")]
+    pub check_interval: Option<Duration>,
+
+    /// Download timeout.
+    #[serde(default = "default_psl_update_timeout", with = "humantime_serde")]
+    pub update_timeout: Duration,
+
+    /// Whether to hot-reload PSL when the file changes.
+    #[serde(default)]
+    pub auto_reload: bool,
 }
 
 impl Default for PslConfig {
@@ -887,20 +910,22 @@ impl Default for PslConfig {
         Self {
             source: PslSource::Embedded,
             path: default_psl_path(),
-            url: default_psl_url(),
-            cron: default_psl_cron(),
-            timeout_secs: default_psl_timeout_secs(),
-            proxy: String::new(),
+            auto_update: false,
+            update_url: default_psl_update_url(),
+            max_age: default_psl_max_age(),
+            check_interval: None,
+            update_timeout: default_psl_update_timeout(),
+            auto_reload: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PslSource {
+    #[default]
     Embedded,
     File,
-    Network,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -910,10 +935,6 @@ pub struct CacheConfig {
     pub capacity: u64,
     #[serde(default = "default_cache_ttl_secs")]
     pub ttl_secs: u64,
-    /// Public-suffix list settings live under `[cache.psl]` — nested so the
-    /// wildcard/PSL machinery stays together.
-    #[serde(default)]
-    pub psl: PslConfig,
 }
 
 impl Default for CacheConfig {
@@ -921,7 +942,6 @@ impl Default for CacheConfig {
         Self {
             capacity: default_cache_capacity(),
             ttl_secs: default_cache_ttl_secs(),
-            psl: PslConfig::default(),
         }
     }
 }
@@ -2015,20 +2035,17 @@ fn default_probe_timeout() -> Duration {
     // backend is unreachable.
     Duration::from_secs(3)
 }
-fn default_psl_source() -> PslSource {
-    PslSource::Embedded
-}
 fn default_psl_path() -> PathBuf {
-    PathBuf::from("public_suffix_list.dat")
+    PathBuf::from("cache/public_suffix_list.dat")
 }
-fn default_psl_url() -> String {
+fn default_psl_update_url() -> String {
     "https://publicsuffix.org/list/public_suffix_list.dat".to_string()
 }
-fn default_psl_cron() -> String {
-    "0 17 3 * * 0".to_string()
+fn default_psl_max_age() -> Duration {
+    Duration::from_secs(30 * 24 * 60 * 60) // 30 days
 }
-fn default_psl_timeout_secs() -> u64 {
-    30
+fn default_psl_update_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 #[cfg(test)]

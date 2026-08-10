@@ -7,7 +7,7 @@
 
 mod ca;
 mod certscope;
-mod config;
+pub mod config;
 mod dns;
 mod dns_resolvers;
 mod ech;
@@ -16,7 +16,7 @@ mod nat64;
 mod peek;
 mod probe;
 mod proxy;
-mod psl_source;
+mod psl;
 mod resolver;
 mod router;
 mod store;
@@ -141,8 +141,9 @@ async fn run(cfg: Config) -> Result<()> {
         }
     }
 
-    let suffix = psl_source::load(&cfg.cache.psl).context("initializing public suffix list")?;
-    psl_source::spawn_refresher(&cfg.cache.psl, suffix.clone());
+    let suffix = psl::init(&cfg.psl)
+        .await
+        .context("initializing public suffix list")?;
 
     let issuance_mode = cfg.issuance.resolved_mode();
 
