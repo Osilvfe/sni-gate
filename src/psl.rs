@@ -27,7 +27,21 @@ pub async fn init(cfg: &PslConfig) -> Result<Arc<SuffixList>> {
     let psl = Arc::new(load_initial(cfg).await?);
 
     if cfg.auto_reload && cfg.source == PslSource::File {
-        spawn_reload_task(cfg.clone(), psl.clone())?;
+        // Only start file watcher if the file exists. When auto_update downloads
+        // the file later, the watcher will be absent, but that's acceptable:
+        // the update task will write the file and subsequent restarts will arm
+        // the watcher. Without this guard, a missing file causes inotify to fail
+        // on Linux and startup aborts even though load_initial succeeded via the
+        // embedded fallback.
+        if cfg.path.exists() {
+            spawn_reload_task(cfg.clone(), psl.clone())?;
+        } else {
+            tracing::info!(
+                path = %cfg.path.display(),
+                "auto_reload requested but PSL file does not exist; watcher will not start \
+                 until file is created"
+            );
+        }
     }
 
     if let Some(interval) = cfg.check_interval {
