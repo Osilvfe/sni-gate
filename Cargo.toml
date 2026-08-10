@@ -68,3 +68,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 # Parse SANs out of the leaf the gateway issues, to assert issuance-mode coverage
 # end-to-end. Same version as the runtime dependency.
 x509-parser = "0.18"
+# For PSL fallback tests: backdate file mtime to simulate stale files.
+filetime = "0.2"

@@ -493,4 +493,104 @@ com
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[tokio::test]
+    async fn auto_reload_with_missing_file_does_not_abort_startup() {
+        let dir = std::env::temp_dir().join(format!("psl-reload-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonexistent.dat");
+
+        let cfg = PslConfig {
+            source: PslSource::File,
+            path: path.clone(),
+            auto_update: true,
+            auto_reload: true,
+            update_url: "http://127.0.0.1:1/nonexistent".to_string(),
+            update_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        let result = init(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "init should succeed with embedded fallback when auto_reload is set, \
+             auto_update fails, and file is absent"
+        );
+
+        let psl = result.unwrap();
+        let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
+        assert_eq!(plan.base, "example.com");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fallback_to_stale_file_when_download_fails() {
+        let dir = std::env::temp_dir().join(format!("psl-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("psl.dat");
+
+        let psl_content = r#"// Test PSL
+// BEGIN ICANN DOMAINS
+test
+com
+// END ICANN DOMAINS
+"#;
+        std::fs::write(&path, psl_content).unwrap();
+
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime)).unwrap();
+
+        let cfg = PslConfig {
+            source: PslSource::File,
+            path: path.clone(),
+            auto_update: true,
+            max_age: Duration::from_secs(3600),
+            update_url: "http://127.0.0.1:1/nonexistent".to_string(),
+            update_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        let psl = load_initial(&cfg).await.unwrap();
+        let plan = psl.plan("example.test", crate::config::IssuanceMode::Exact);
+        assert_eq!(plan.base, "example.test");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fallback_to_embedded_when_no_file_and_download_fails() {
+        let dir = std::env::temp_dir().join(format!("psl-embedded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonexistent.dat");
+
+        let cfg = PslConfig {
+            source: PslSource::File,
+            path: path.clone(),
+            auto_update: true,
+            update_url: "http://127.0.0.1:1/nonexistent".to_string(),
+            update_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        let psl = load_initial(&cfg).await.unwrap();
+        let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
+        assert_eq!(plan.base, "example.com");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn invalid_psl_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("psl-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("invalid.dat");
+
+        std::fs::write(&path, "not a valid PSL file").unwrap();
+
+        let result = load_from_file(&path).await;
+        assert!(result.is_err(), "invalid PSL should be rejected");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
