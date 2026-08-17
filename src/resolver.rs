@@ -178,16 +178,16 @@ impl std::fmt::Debug for DynamicResolver {
 /// What clipping decided for one observed upstream certificate: the names that
 /// will be issued, and the observed SANs that were dropped with the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MirrorPlan {
+struct MirrorPlan {
     /// Names that survived clipping and will be issued. Always covers the host.
-    pub kept: Vec<String>,
+    kept: Vec<String>,
     /// Observed SANs dropped because adopting them would over-claim.
-    pub dropped: Vec<(String, Drop)>,
+    dropped: Vec<(String, Drop)>,
 }
 
 /// Why one observed upstream SAN was not mirrored.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Drop {
+enum Drop {
     /// Some host the name covers routes out of the requesting connection's
     /// certificate scope, so mirroring it would authorize coalescing past this
     /// gateway's routing.
@@ -225,9 +225,10 @@ impl DynamicResolver {
     /// Returns `None` when the host matches no route — nothing is ever issued for
     /// a name this listener would not serve.
     ///
-    /// Exposed so a test (and a future operator-facing report) can inspect the
-    /// decision directly rather than infer it from a signed certificate.
-    pub fn mirror_plan(&self, sni_host: &str, observed: &[String]) -> Option<MirrorPlan> {
+    /// Exposed so a test can inspect the decision directly rather than infer it
+    /// from a signed certificate.
+    #[cfg(test)]
+    fn mirror_plan(&self, sni_host: &str, observed: &[String]) -> Option<MirrorPlan> {
         let owner = self.router.match_host(sni_host)?;
         Some(self.clip(sni_host, owner, observed))
     }
