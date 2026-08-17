@@ -172,12 +172,25 @@ async fn download_and_save(cfg: &PslConfig) -> Result<()> {
     Ok(())
 }
 
-/// Save data to file atomically (write to tmp, then rename).
+/// Save data to file atomically (write to tmp, then rename), creating the
+/// parent directory if it does not exist yet.
+///
+/// The directory is created here rather than in [`load_initial`] so the two
+/// cases stay distinguishable: a path sni-gate populates itself is one it may
+/// also lay out, whereas a file the operator maintains by hand should still
+/// fail loudly when it is missing — silently creating an empty directory for it
+/// would turn a typo'd path into a configuration that merely looks fine.
 async fn save_to_file(path: &Path, data: &[u8]) -> Result<()> {
     let path = path.to_path_buf();
     let data = data.to_vec();
 
     tokio::task::spawn_blocking(move || {
+        // A relative filename has an empty parent, which `create_dir_all`
+        // rejects; there is nothing to create in that case anyway.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating PSL cache directory {}", parent.display()))?;
+        }
         let tmp = staging_path(&path);
         std::fs::write(&tmp, &data).with_context(|| format!("writing to {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
@@ -451,6 +464,51 @@ com
         assert!(age < Duration::from_secs(1));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An auto-updated path is one sni-gate owns, so a missing parent directory
+    /// is laid out rather than reported. Before this, the download succeeded and
+    /// the write of the staging file failed, leaving the gateway on the embedded
+    /// list with only a warning to explain it.
+    #[tokio::test]
+    async fn save_creates_missing_parent_directories() {
+        let dir = std::env::temp_dir().join(format!("psl-mkdir-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        // Two levels deep, so this covers more than a single missing component.
+        let path = dir.join("cache").join("nested").join("psl.dat");
+
+        save_to_file(&path, b"test data").await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"test data");
+        assert!(
+            !staging_path(&path).exists(),
+            "staging file must not survive"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bare relative filename has an empty parent, which `create_dir_all`
+    /// rejects — so the guard, not the OS, must decide there is nothing to
+    /// create. Asserted on the condition rather than by running a save, because
+    /// reaching that path means changing the process working directory, which
+    /// would race every other test in this binary.
+    #[test]
+    fn a_bare_filename_has_nothing_to_create() {
+        let bare = Path::new("public_suffix_list.dat");
+        assert!(
+            bare.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .is_none(),
+            "a bare filename must be skipped by the directory guard"
+        );
+        assert!(
+            Path::new("cache/public_suffix_list.dat")
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .is_some(),
+            "a relative path with a directory component must still be created"
+        );
     }
 
     #[tokio::test]
