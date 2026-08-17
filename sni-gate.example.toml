@@ -92,31 +92,25 @@ country = ""                  # optional C
 leaf_validity_days = 397
 install_to_system_root = false  # opt-in; Administrator on Windows; idempotent
 
-[issuance]
-# Every leaf is anchored at the registrable domain, accumulating coverage; a
-# request for an already-covered name is never re-signed.
-# `mode` sets how much each host contributes (for b.a.example.com → example.com):
-#   "exact"     b.a.example.com                              (bare host, no wildcard)
-#   "wildcard"  *.a.example.com                              (host + siblings)  (default)
-#   "ladder"    *.a.example.com, *.example.com, example.com  (whole ancestor chain)
-# The useless `*.<leaf>` wildcard is never emitted; `*.X` appears only once some
-# accessed host actually has X as its parent. Registrable domain uses the PSL
-# ICANN section only, so *.co.jp is never issued while github.io / withgoogle.com
-# are treated as ordinary domains (→ *.withgoogle.com is allowed).
+# Certificate coverage is not configurable, because guessing it is what breaks
+# HTTP/2. The first handshake for an unknown name is answered with an EXACT
+# certificate (that one name, no wildcard). When a TLS-terminating route later
+# hands the connection to a TLS upstream, the upstream's real certificate is read
+# and its DNS SANs are mirrored: coverage widens only to what the upstream itself
+# vouches for, so a browser may only coalesce where the upstream would accept the
+# coalesced `:authority`. If the upstream's SANs shrink on a later handshake, the
+# cached leaf is invalidated and re-signed narrower.
 #
-# `mode` is an UPPER BOUND, not a promise. A proposed name is withheld when it
-# would also cover a host this listener routes to a different upstream: a browser
-# holding a connection whose cert covers a second origin may send that origin's
-# requests over it (RFC 9113 §9.1.1) with no new TLS handshake and hence no new
-# SNI, which would bypass routing entirely. Certificates are therefore partitioned
-# by forwarding target and persisted as certs/<scope>/<registrable>.crt. Each
-# route's effective coverage — and every withheld name, with the conflicting host
-# named — is logged at startup. Use "exact" to forbid coalescing outright.
-mode = "wildcard"
+# A mirrored name is still withheld when it would cover a host this listener
+# routes to a different upstream: a browser holding a connection whose cert covers
+# a second origin may send that origin's requests over it (RFC 9113 §9.1.1) with
+# no new TLS handshake and hence no new SNI, which would bypass routing entirely.
+# Certificates are therefore partitioned by forwarding target and persisted as
+# certs/<scope>/<host>.crt. Withheld names are logged with the conflicting host.
 
 [store]
 enabled = true                # persist issued certs across restarts
-dir = "certs"                 # laid out as <dir>/<scope>/<registrable>.crt
+dir = "certs"                 # laid out as <dir>/<scope>/<host>.crt
 renew_margin_days = 30
 
 [cache]

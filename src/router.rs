@@ -36,9 +36,9 @@ pub struct Router {
 
 /// A compiled regex route with its scope information.
 ///
-/// The scope suffixes enable wildcard certificate issuance to coexist with
-/// regex routes: a wildcard `*.parent` is refused only if some out-of-scope
-/// regex declares a scope suffix that overlaps with `parent`.
+/// The scope suffixes let an upstream-mirrored wildcard coexist with regex
+/// routes: a wildcard `*.parent` is withheld only if some out-of-scope regex
+/// declares a scope suffix that overlaps with `parent`.
 #[derive(Debug)]
 struct RegexRoute {
     pattern: Regex,

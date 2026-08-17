@@ -145,8 +145,6 @@ async fn run(cfg: Config) -> Result<()> {
         .await
         .context("initializing public suffix list")?;
 
-    let issuance_mode = cfg.issuance.resolved_mode();
-
     let store = if cfg.store.enabled {
         let s = CertStore::new(cfg.store.dir.clone(), cfg.store.renew_margin_days);
         s.init().context("initializing certificate store")?;
@@ -162,7 +160,6 @@ async fn run(cfg: Config) -> Result<()> {
         ca,
         suffix,
         store,
-        mode: issuance_mode,
         cache_capacity: cfg.cache.capacity,
         cache_ttl: Duration::from_secs(cfg.cache.ttl_secs),
     }));
@@ -288,7 +285,7 @@ fn build_listener(
     // routing table.
     let cert_resolver = Arc::new(DynamicResolver::new(issuer, router.clone(), scopes.clone()));
 
-    report_issuance_plan(listener, &cert_resolver, &runtimes, &scopes, &patterns);
+    report_certificate_plan(listener, &cert_resolver, &runtimes, &scopes, &patterns);
     warn_on_raw_overlap(listener, &runtimes, &patterns, cfg);
 
     // One base server config for local termination; the resolver issues for any
@@ -297,7 +294,7 @@ fn build_listener(
     // and session cache, and differ only in `alpn_protocols`.
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(cert_resolver);
+        .with_cert_resolver(cert_resolver.clone());
     if let Ok(t) = rustls::crypto::aws_lc_rs::Ticketer::new() {
         server_config.ticketer = t;
     }
@@ -320,27 +317,32 @@ fn build_listener(
         router,
         routes: runtimes,
         server_configs,
+        cert_resolver,
         unmatched: cfg.global.unmatched.clone(),
     })
 }
 
-/// Report, before any traffic arrives, what each route's certificates will
-/// actually cover.
+/// Report, before any traffic arrives, how wide each route's certificates are
+/// *allowed* to become.
 ///
-/// `[issuance] mode` is an upper bound on breadth: a proposed wildcard is
-/// withheld when some host it would cover routes to a different upstream, because
-/// issuing it would let a client coalesce a connection past this gateway's
-/// routing (see [`resolver`]). That is a correctness bound rather than a silent
-/// downgrade, so the effective coverage — and every withheld name, with the
-/// conflicting host named — is printed here instead of being left to be
-/// discovered from a packet capture.
+/// Actual coverage is decided per connection by mirroring what the upstream's own
+/// certificate covers, so it cannot be known at startup. What *can* be known is
+/// the ceiling this listener's routing table imposes on it: a name the upstream
+/// offers is still dropped when some host it covers routes to a different
+/// upstream, because mirroring it would let a client coalesce a connection past
+/// this gateway's routing (see [`resolver`]).
+///
+/// So this probes the mechanism with the observation that matters in practice —
+/// an upstream offering the probe host plus the wildcard one level above it — and
+/// prints what survives. It calls the same [`DynamicResolver::mirror_plan`] the
+/// data path uses, so the report cannot drift from the behavior.
 ///
 /// Reported at `INFO`, not `WARN`: on a configuration that deliberately sends two
-/// names under one registrable domain to different upstreams, withholding is the
+/// names under one registrable domain to different upstreams, dropping is the
 /// intended outcome on every boot, and warning about intended behavior is how
 /// warnings stop being read. The one case that does warn is
 /// [`warn_on_raw_overlap`], which is a gap this program cannot close.
-fn report_issuance_plan(
+fn report_certificate_plan(
     listener: &Listener,
     cert_resolver: &DynamicResolver,
     runtimes: &[Arc<RouteRuntime>],
@@ -350,8 +352,8 @@ fn report_issuance_plan(
     struct RouteReport<'a> {
         name: &'a str,
         scope: &'a CertScope,
-        covers: std::collections::BTreeSet<String>,
-        withheld: Vec<String>,
+        mirrorable: std::collections::BTreeSet<String>,
+        dropped: Vec<String>,
         regexes: Vec<&'a str>,
     }
 
@@ -379,60 +381,66 @@ fn report_issuance_plan(
             }
         }
 
-        let mut withheld: Vec<String> = Vec::new();
-        let mut covers: std::collections::BTreeSet<String> = Default::default();
+        let mut dropped: Vec<String> = Vec::new();
+        let mut mirrorable: std::collections::BTreeSet<String> = Default::default();
         for host in &probes {
-            if let Some(plan) = cert_resolver.plan(host) {
-                covers.extend(plan.kept.iter().cloned());
-                for (name, escape) in &plan.withheld {
-                    withheld.push(format!("{name} ({})", describe_escape(escape, runtimes)));
+            // The observation to test the ceiling against: what a real upstream
+            // certificate for this host almost always carries.
+            let mut observed = vec![host.clone()];
+            if let Some((_, parent)) = host.split_once('.') {
+                observed.push(format!("*.{parent}"));
+            }
+            if let Some(plan) = cert_resolver.mirror_plan(host, &observed) {
+                mirrorable.extend(plan.kept.iter().cloned());
+                for (name, drop) in &plan.dropped {
+                    dropped.push(format!("{name} ({})", describe_drop(drop, runtimes)));
                 }
             }
         }
-        withheld.sort();
-        withheld.dedup();
+        dropped.sort();
+        dropped.dedup();
 
         reports.push(RouteReport {
             name: &runtimes[id].name,
             scope: &scopes[id],
-            covers,
-            withheld,
+            mirrorable,
+            dropped,
             regexes,
         });
     }
 
     // The mechanism, explained once per listener rather than once per route.
-    if reports.iter().any(|r| !r.withheld.is_empty()) {
+    if reports.iter().any(|r| !r.dropped.is_empty()) {
         info!(
             listener = %listener.addr,
-            "some wildcard coverage is withheld: the names below would also cover \
-             hosts this listener routes to a different upstream, and a client \
-             holding one connection may send another origin's requests over it when \
-             the certificate covers both (RFC 9113 §9.1.1) — with no new TLS \
-             handshake, and so no SNI to route on. Certificates are narrowed to keep \
-             routing authoritative; routing itself is unaffected. To widen coverage, \
-             give the conflicting hosts the same upstream, or move them under \
-             different registrable domains."
+            "certificates on this listener will not mirror every name an upstream \
+             offers: the names below also cover hosts this listener routes to a \
+             different upstream, and a client holding one connection may send \
+             another origin's requests over it when the certificate covers both \
+             (RFC 9113 §9.1.1) — with no new TLS handshake, and so no SNI to route \
+             on. Mirroring is clipped to keep routing authoritative; routing itself \
+             is unaffected. To allow the wider name, give the conflicting hosts the \
+             same upstream, or move them under different registrable domains."
         );
     }
 
     for r in &reports {
-        if r.withheld.is_empty() {
+        if r.dropped.is_empty() {
             debug!(
                 listener = %listener.addr,
                 route = %r.name,
                 scope = %r.scope,
-                covers = ?r.covers,
-                "certificate coverage"
+                mirrorable = ?r.mirrorable,
+                "certificate ceiling"
             );
         } else {
             info!(
                 listener = %listener.addr,
                 route = %r.name,
                 scope = %r.scope,
-                covers = ?r.covers,
-                withheld = ?r.withheld,
-                "certificate coverage (narrowed)"
+                mirrorable = ?r.mirrorable,
+                dropped = ?r.dropped,
+                "certificate ceiling (clipped)"
             );
         }
         if !r.regexes.is_empty() {
@@ -440,30 +448,36 @@ fn report_issuance_plan(
                 listener = %listener.addr,
                 route = %r.name,
                 patterns = ?r.regexes,
-                "regex patterns have no representative host; their coverage is \
+                "regex patterns have no representative host; their ceiling is \
                  determined when a matching connection first arrives"
             );
         }
     }
 }
 
-/// Render an [`router::Escape`] for an operator, naming the route it points at.
-fn describe_escape(escape: &router::Escape, runtimes: &[Arc<RouteRuntime>]) -> String {
+/// Render a [`resolver::Drop`] for an operator, naming the route it points at.
+fn describe_drop(drop: &resolver::Drop, runtimes: &[Arc<RouteRuntime>]) -> String {
     let route_name = |id: usize| {
         runtimes
             .get(id)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| format!("#{id}"))
     };
-    match escape {
-        router::Escape::Host { host, route } => format!("{host} -> {}", route_name(*route)),
-        router::Escape::DefaultRoute { route } => {
-            format!("subdomains -> default_route {}", route_name(*route))
+    match drop {
+        resolver::Drop::OutOfScope(escape) => match escape {
+            router::Escape::Host { host, route } => format!("{host} -> {}", route_name(*route)),
+            router::Escape::DefaultRoute { route } => {
+                format!("subdomains -> default_route {}", route_name(*route))
+            }
+            router::Escape::RegexTier { route } => {
+                format!("may match regex route {}", route_name(*route))
+            }
+            router::Escape::Unmatched => "subdomains match no route".to_string(),
+        },
+        resolver::Drop::CrossesRegistryBoundary => {
+            "wildcard directly under a public suffix".to_string()
         }
-        router::Escape::RegexTier { route } => {
-            format!("may match regex route {}", route_name(*route))
-        }
-        router::Escape::Unmatched => "subdomains match no route".to_string(),
+        resolver::Drop::Unmintable => "not a mintable DNS name".to_string(),
     }
 }
 

@@ -48,6 +48,7 @@ use crate::config::{AddressFamily, FailPolicy, RouteType, SniPolicy};
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::peek::{classify, Inbound};
+use crate::resolver::{observed_dns_sans, DynamicResolver};
 use crate::router::Router;
 
 const COPY_BUF_SIZE: usize = 64 * 1024;
@@ -116,6 +117,11 @@ pub struct ListenerState {
     pub server_configs: Arc<ServerConfigs>,
     /// Fail policy for connections matching no route and no default_route.
     pub unmatched: FailPolicy,
+    /// This listener's certificate resolver. The data path reports each
+    /// upstream's real certificate SANs back to it, which is what lets issued
+    /// certificates mirror the coverage the upstream actually grants instead of
+    /// guessing at it (see [`crate::resolver`]).
+    pub cert_resolver: Arc<DynamicResolver>,
 }
 
 /// Bind and serve one listener until it errors unrecoverably.
@@ -196,7 +202,7 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, state: &ListenerState) ->
         }
     } else {
         // Cleartext inbound: no TLS to terminate; forward per route type.
-        serve_plaintext(client, peer, rt, sni, dial_host).await
+        serve_plaintext(client, peer, rt, state, sni, dial_host).await
     };
 
     // On failure, honor the route's fail policy where it makes sense.
@@ -247,6 +253,65 @@ fn mirror_choice<'a>(
     }
 }
 
+/// Report the upstream's real certificate SANs to this listener's resolver, so
+/// the certificate *this* gateway serves for `sni` mirrors the coverage the
+/// upstream actually grants.
+///
+/// # Why this is on the data path
+///
+/// The upstream's certificate is the only authority on which names it will answer
+/// for over one connection. A gateway that invents a wildcard the upstream does
+/// not back lets a browser coalesce a second origin onto the connection
+/// (RFC 9113 §9.1.1); the upstream then sees an `:authority` outside what its own
+/// handshake authorized and rejects it — the 403 this mechanism exists to remove.
+/// The certificate resolver runs inside the *inbound* handshake and cannot dial
+/// anywhere, so the observation has to arrive from here, where the upstream
+/// handshake actually completes.
+///
+/// # Why it does not block
+///
+/// The connection in hand is already served: its certificate was issued before
+/// the client's ClientHello was answered. What mirroring affects is the client's
+/// **next** connection — the one it could coalesce onto — so there is nothing to
+/// wait for. The common case is an upstream whose certificate has not changed, so
+/// that case is settled inline with a cache lookup and a slice comparison
+/// ([`DynamicResolver::mirror_is_current`]); only a genuine change reaches the
+/// blocking pool, where a signature and two file writes are allowed to take their
+/// time.
+fn record_upstream_coverage(
+    state: &ListenerState,
+    rt: &RouteRuntime,
+    sni: Option<&String>,
+    session: &rustls::ClientConnection,
+) {
+    // A route with a fixed `override_sni` asks every upstream for the same name,
+    // so the certificate it returns says nothing about the *inbound* name this
+    // certificate is for. Mirroring it would attach one upstream's coverage to
+    // every name routed here.
+    if rt.sni_policy != SniPolicy::Reflect {
+        return;
+    }
+    let Some(sni) = sni else { return };
+    let Some(chain) = session.peer_certificates() else {
+        return;
+    };
+
+    let observed = observed_dns_sans(chain);
+    if state.cert_resolver.mirror_is_current(sni, &observed) {
+        return;
+    }
+
+    let resolver = state.cert_resolver.clone();
+    let host = sni.clone();
+    let route = rt.name.clone();
+    // Detached: the certificate it produces is for a future connection, and the
+    // current one must not wait on a signature.
+    tokio::task::spawn_blocking(move || {
+        debug!(route = %route, host = %host, sans = ?observed, "observed upstream certificate");
+        resolver.record_upstream_sans(&host, &observed);
+    });
+}
+
 /// Terminate inbound TLS with the dynamic-cert server config, then re-originate.
 ///
 /// The original ordering: the inbound handshake completes first, then the
@@ -274,7 +339,7 @@ async fn serve_terminated(
     if let Some(p) = tls.get_ref().1.alpn_protocol() {
         debug!(%peer, route = %rt.name, alpn = %String::from_utf8_lossy(p), "inbound ALPN");
     }
-    forward(tls, peer, rt, sni, dial_host).await
+    forward(tls, peer, rt, state, sni, dial_host).await
 }
 
 /// Terminate inbound TLS **after** dialing the upstream, advertising exactly the
@@ -356,6 +421,12 @@ async fn serve_mirrored(
     };
 
     let selected = up.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+
+    // The upstream handshake is complete: learn what its certificate really
+    // covers before this connection is spliced away. On this path it matters
+    // most — HTTP/2 is on, so coalescing is exactly what the client may do next.
+    record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
+
     let config = mirror_choice(
         &state.server_configs,
         selected.as_deref(),
@@ -378,10 +449,11 @@ async fn serve_plaintext(
     client: TcpStream,
     peer: SocketAddr,
     rt: &RouteRuntime,
+    state: &ListenerState,
     sni: Option<String>,
     dial_host: Option<String>,
 ) -> Result<()> {
-    forward(client, peer, rt, sni, dial_host).await
+    forward(client, peer, rt, state, sni, dial_host).await
 }
 
 /// Dial the upstream per route type and splice bytes.
@@ -389,6 +461,7 @@ async fn forward<S>(
     inbound: S,
     peer: SocketAddr,
     rt: &RouteRuntime,
+    state: &ListenerState,
     sni: Option<String>,
     dial_host: Option<String>,
 ) -> Result<()>
@@ -428,6 +501,10 @@ where
         RouteType::Tls => {
             let name = sni.clone().unwrap_or_else(|| host.clone());
             let up = dial_tls(upstream_addr, &name, rt, &[]).await?;
+            // HTTP/2 is off for this connection, so it cannot coalesce — but a
+            // later connection for the same name can, and this is a free look at
+            // what the upstream's certificate covers.
+            record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Ech => {
@@ -441,6 +518,7 @@ where
                 )
             })?;
             let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
+            record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Raw => unreachable!("raw handled before termination"),

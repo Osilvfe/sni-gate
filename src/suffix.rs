@@ -1,35 +1,35 @@
-//! Public-suffix handling and certificate planning.
+//! Public-suffix handling.
 //!
 //! The list can be sourced three ways (embedded, file, network) and swapped at
 //! runtime behind an `ArcSwap`-style lock, so a background refresh never blocks
 //! the hot path.
 //!
-//! Given an SNI host name and issuance mode, [`SuffixList::plan`] returns the
-//! certificate to (re)issue: a coverage anchor — the **registrable domain** —
-//! that keys the cache/store, and the names this host contributes to it. Every
-//! certificate is anchored at the registrable domain, so a whole domain shares
-//! one `<registrable>.crt` and siblings reuse it via [`host_covered_by`].
+//! # What the list is for
 //!
-//! Two deliberate choices shape the SANs:
+//! Certificate coverage is **mirrored from the upstream's own certificate** (see
+//! [`crate::resolver`]), so the list no longer plans SANs. It answers one
+//! question instead, and that question is load-bearing:
 //!
-//! * **Anchor at the parent, not the host.** The only wildcard that usefully
-//!   covers a host `H` is `*.parent(H)` (`*.H` would cover children `H` usually
-//!   never has). So a level's `*.X` wildcard is emitted only when some accessed
-//!   host actually has `X` as its parent — a leaf like `rr5.googlevideo.com`
-//!   never yields the useless `*.rr5.googlevideo.com`.
-//! * **ICANN suffixes only.** The registrable domain is computed against the
-//!   PSL's ICANN section, ignoring private-section entries. Real registry
-//!   suffixes (`co.uk`, `co.jp`) remain boundaries — `*.co.jp` is never issued —
-//!   while vendor self-registrations (`withgoogle.com`, `github.io`) are treated
-//!   as ordinary registrable domains, so `csp.withgoogle.com` can be served by
-//!   `withgoogle.com.crt: {*.withgoogle.com, withgoogle.com}`.
+//! > Is a wildcard this gateway is about to mint confined to a single registrable
+//! > domain?
+//!
+//! A mirrored SAN arrives from a *remote* certificate, and this gateway re-signs
+//! it with a CA the client's own trust store accepts. A wildcard that spans a
+//! registry boundary — `*.com`, `*.co.uk` — must therefore never be minted, no
+//! matter what the upstream claimed: no real CA would issue it, and under a
+//! locally-trusted CA it would be valid for the entire suffix. See
+//! [`SuffixList::wildcard_is_mintable`].
+//!
+//! **ICANN suffixes only.** The boundary is computed against the PSL's ICANN
+//! section, ignoring private-section entries. Real registry suffixes (`co.uk`,
+//! `co.jp`) remain boundaries, while vendor self-registrations (`withgoogle.com`,
+//! `github.io`) are treated as ordinary registrable domains — so an upstream that
+//! genuinely serves `*.github.io` can still be mirrored faithfully.
 
 use std::sync::RwLock;
 
 use anyhow::Result;
 use publicsuffix::{List, Psl, Type};
-
-use crate::config::IssuanceMode;
 
 /// A public-suffix list, replaceable at runtime.
 pub struct SuffixList {
@@ -75,64 +75,30 @@ impl SuffixList {
         Ok(())
     }
 
-    /// Plan the names an inbound SNI host contributes to its registrable
-    /// domain's certificate, under the configured [`IssuanceMode`].
+    /// Whether the single-level wildcard `*.<parent>` stays inside one
+    /// registrable domain, and may therefore be minted by this gateway's CA.
     ///
-    /// The returned [`Certificand::base`] is the coverage anchor — the
-    /// registrable domain (ICANN-only; see the module docs) that keys the
-    /// cache/store and is the CN candidate. It is always a plain name, so it
-    /// maps to a safe file stem. `sans` are the names this host needs; the
-    /// resolver merges them into the anchor's existing certificate, so a domain
-    /// accumulates coverage in one `<registrable>.crt` and already-covered hosts
-    /// are never re-signed. Per mode, for a host `H` with registrable `R`:
+    /// `true` when `parent` is a registrable domain or something below one:
+    /// `*.example.com`, `*.a.example.com`, `*.github.io` (private-section entries
+    /// are ordinary domains; see the module docs).
     ///
-    /// * [`IssuanceMode::Exact`] — `{H}`. No wildcard.
-    /// * [`IssuanceMode::Wildcard`] — `{*.parent(H)}` (and `{*.R, R}` when
-    ///   `H == R`): the host and its siblings, via the parent's wildcard. Never
-    ///   `*.H`.
-    /// * [`IssuanceMode::Ladder`] — `{*.parent(H), *.grandparent(H), …, *.R, R}`:
-    ///   the host, every ancestor domain, and their siblings. For
-    ///   `b.a.example.com` / `example.com`:
-    ///   `{*.a.example.com, *.example.com, example.com}`. Never `*.H`, and the
-    ///   wildcard is never lifted above `R`, so `*.com` can never be produced.
+    /// `false` when `parent` is itself a public suffix, a bare TLD, or an unknown
+    /// single label — `*.com`, `*.co.uk`, `*.localhost` — because such a wildcard
+    /// would be valid across a registry boundary. An upstream certificate that
+    /// claims one is not mirrored; the wildcard is dropped and narrower coverage
+    /// is issued instead.
     ///
-    /// IP literals and hosts with no ICANN registrable domain fall back to an
-    /// exact, host-keyed certificate. The returned SANs always cover `host`.
-    pub fn plan(&self, host: &str, mode: IssuanceMode) -> Certificand {
-        // IP literals never get a wildcard.
-        if host.parse::<std::net::IpAddr>().is_ok() {
-            return Certificand::exact(host);
+    /// An IP literal is never a wildcard parent, so it is refused too.
+    pub fn wildcard_is_mintable(&self, parent: &str) -> bool {
+        if parent.parse::<std::net::IpAddr>().is_ok() {
+            return false;
         }
-
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-
+        let parent = parent.trim_end_matches('.').to_ascii_lowercase();
         let list = self
             .list
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(registrable) = registrable_icann(&list, &host) else {
-            // No registrable domain (bare suffix, single label): exact only.
-            return Certificand::exact(&host);
-        };
-        drop(list);
-
-        let sans = match mode {
-            IssuanceMode::Exact => vec![host.clone()],
-            IssuanceMode::Wildcard => {
-                if host == registrable {
-                    vec![format!("*.{registrable}"), registrable.clone()]
-                } else {
-                    // `*.parent(H)` covers H and its siblings — never `*.H`.
-                    vec![format!("*.{}", parent_domain(&host))]
-                }
-            }
-            IssuanceMode::Ladder => ladder_sans(&host, &registrable),
-        };
-
-        Certificand {
-            base: registrable,
-            sans,
-        }
+        registrable_icann(&list, &parent).is_some()
     }
 }
 
@@ -182,47 +148,12 @@ fn one_label_below(host: &str, suffix: &str) -> Option<String> {
     }
 }
 
-/// `host` with its leftmost label removed (its parent domain). A single-label
-/// input is returned unchanged.
-fn parent_domain(host: &str) -> &str {
-    host.split_once('.')
-        .map(|(_, parent)| parent)
-        .unwrap_or(host)
-}
-
-/// The ladder SANs a host contributes: `*.parent(H)`, `*.grandparent(H)`, … up
-/// to `*.registrable`, plus the bare registrable domain. `host` and
-/// `registrable` must be normalized, with `registrable` a label-boundary suffix
-/// of `host`.
-fn ladder_sans(host: &str, registrable: &str) -> Vec<String> {
-    if host == registrable {
-        return vec![format!("*.{registrable}"), registrable.to_string()];
-    }
-    let mut sans = Vec::new();
-    let mut cur = parent_domain(host);
-    loop {
-        sans.push(format!("*.{cur}"));
-        if cur == registrable {
-            break;
-        }
-        let next = parent_domain(cur);
-        // Progress guard: `registrable` is a suffix of `host`, so climbing always
-        // reaches it; stop if a label could not be removed.
-        if next.len() >= cur.len() {
-            break;
-        }
-        cur = next;
-    }
-    // The registrable apex has no covering parent wildcard (`*.<suffix>` is
-    // forbidden), so it is the one bare name we must emit.
-    sans.push(registrable.to_string());
-    sans
-}
-
 /// Whether a certificate carrying `sans` is valid for `host` — i.e. some SAN
-/// equals `host`, or a single-level wildcard SAN `*.<parent>` matches it. Used
-/// to reuse an already-issued certificate for a sibling host instead of signing
-/// a redundant one. `host` must be normalized (lowercase, no trailing dot).
+/// equals `host`, or a single-level wildcard SAN `*.<parent>` matches it. This is
+/// the coverage rule a TLS client applies (RFC 6125 §6.4.3), used both to decide
+/// whether an upstream certificate actually speaks for the name we asked it about
+/// and whether a persisted certificate can still be served. `host` must be
+/// normalized (lowercase, no trailing dot).
 pub fn host_covered_by(sans: &[String], host: &str) -> bool {
     sans.iter().any(|san| {
         if san == host {
@@ -239,27 +170,6 @@ pub fn host_covered_by(sans: &[String], host: &str) -> bool {
     })
 }
 
-/// The names a certificate should be issued for, plus the cache/store key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Certificand {
-    /// Cache/store key and certificate CN candidate — the registrable domain
-    /// (or the host itself for IP / no-registrable fallbacks). Always a plain
-    /// name, so it maps to a safe file stem.
-    pub base: String,
-    /// Subject alternative names this host contributes. Always covers the host.
-    pub sans: Vec<String>,
-}
-
-impl Certificand {
-    /// An exact (non-wildcard) certificate keyed by and covering a single host.
-    pub fn exact(host: &str) -> Self {
-        Self {
-            base: host.to_string(),
-            sans: vec![host.to_string()],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,115 +178,51 @@ mod tests {
         SuffixList::embedded().unwrap()
     }
 
-    use IssuanceMode::{Exact, Ladder, Wildcard};
-
-    // Everything anchors at the registrable domain.
-    #[test]
-    fn everything_is_keyed_at_the_registrable_domain() {
-        for (host, mode) in [
-            ("b.a.example.com", Exact),
-            ("b.a.example.com", Wildcard),
-            ("b.a.example.com", Ladder),
-        ] {
-            assert_eq!(list().plan(host, mode).base, "example.com");
-        }
-    }
-
-    // -- Exact mode: just the host (no wildcard) ----------------------------
+    // -- The registry boundary: which mirrored wildcards may be minted ------
 
     #[test]
-    fn exact_contributes_only_the_bare_host() {
-        let c = list().plan("b.a.example.com", Exact);
-        assert_eq!(c.base, "example.com");
-        assert_eq!(c.sans, vec!["b.a.example.com"]);
-    }
-
-    // -- Wildcard mode: parent wildcard, never *.host -----------------------
-
-    #[test]
-    fn wildcard_uses_the_parent_wildcard_not_the_leaf() {
-        // The motivating case: a leaf CDN host must NOT get a `*.leaf` wildcard;
-        // `*.parent` is what actually covers it and its siblings.
-        let c = list().plan("rr5.googlevideo.com", Wildcard);
-        assert_eq!(c.base, "googlevideo.com");
-        assert_eq!(c.sans, vec!["*.googlevideo.com"]);
-        assert!(host_covered_by(&c.sans, "rr5.googlevideo.com"));
-        assert!(!c.sans.iter().any(|s| s == "*.rr5.googlevideo.com"));
+    fn wildcard_inside_a_registrable_domain_is_mintable() {
+        let l = list();
+        // Parent is the registrable domain itself, or below it.
+        assert!(l.wildcard_is_mintable("example.com"));
+        assert!(l.wildcard_is_mintable("a.example.com"));
+        assert!(l.wildcard_is_mintable("b.a.example.com"));
+        // Multi-level ICANN suffix: one label below it is registrable.
+        assert!(l.wildcard_is_mintable("a.co.uk"));
+        assert!(l.wildcard_is_mintable("www.a.co.uk"));
     }
 
     #[test]
-    fn wildcard_deep_host_anchors_at_its_parent() {
-        let c = list().plan("b.a.example.com", Wildcard);
-        assert_eq!(c.sans, vec!["*.a.example.com"]);
-        assert!(host_covered_by(&c.sans, "b.a.example.com"));
+    fn wildcard_spanning_a_registry_boundary_is_refused() {
+        let l = list();
+        // A bare TLD and a multi-level ICANN suffix are boundaries: `*.com` and
+        // `*.co.uk` would be valid across an entire registry.
+        assert!(!l.wildcard_is_mintable("com"));
+        assert!(!l.wildcard_is_mintable("co.uk"));
+        assert!(!l.wildcard_is_mintable("co.jp"));
+        // An unknown single label is also a boundary (`*.localhost`).
+        assert!(!l.wildcard_is_mintable("localhost"));
+        // Trailing dot and case are normalized before the check.
+        assert!(!l.wildcard_is_mintable("CO.UK."));
     }
 
     #[test]
-    fn wildcard_apex_access_covers_self_and_children() {
-        let c = list().plan("example.com", Wildcard);
-        assert_eq!(c.sans, vec!["*.example.com", "example.com"]);
+    fn ip_literal_is_never_a_wildcard_parent() {
+        let l = list();
+        assert!(!l.wildcard_is_mintable("127.0.0.1"));
+        assert!(!l.wildcard_is_mintable("::1"));
     }
-
-    // -- Ladder mode: parent..registrable wildcards, never *.host -----------
-
-    #[test]
-    fn ladder_is_the_ancestor_chain_without_the_leaf_wildcard() {
-        let c = list().plan("b.a.example.com", Ladder);
-        assert_eq!(c.base, "example.com");
-        assert_eq!(
-            c.sans,
-            vec!["*.a.example.com", "*.example.com", "example.com"]
-        );
-        // No useless leaf wildcard.
-        assert!(!c.sans.iter().any(|s| s == "*.b.a.example.com"));
-        // Covers the host, its ancestors, and their siblings.
-        for h in [
-            "b.a.example.com",
-            "a.example.com",
-            "other.a.example.com",
-            "example.com",
-            "www.example.com",
-        ] {
-            assert!(host_covered_by(&c.sans, h), "ladder must cover {h}");
-        }
-        // But not a deeper, unseen branch.
-        assert!(!host_covered_by(&c.sans, "x.b.a.example.com"));
-    }
-
-    #[test]
-    fn ladder_apex_access() {
-        let c = list().plan("example.com", Ladder);
-        assert_eq!(c.sans, vec!["*.example.com", "example.com"]);
-    }
-
-    #[test]
-    fn ladder_never_emits_wildcard_above_registrable() {
-        // co.uk is an ICANN public suffix: the ladder anchors at a.co.uk and
-        // never emits *.co.uk.
-        let c = list().plan("www.a.co.uk", Ladder);
-        assert_eq!(c.base, "a.co.uk");
-        assert_eq!(c.sans, vec!["*.a.co.uk", "a.co.uk"]);
-        assert!(!c.sans.iter().any(|s| s == "*.co.uk"));
-    }
-
-    // -- ICANN-only registrable: private-section entries are ordinary -------
 
     #[test]
     fn psl_private_section_is_treated_as_ordinary_domain() {
-        // github.io is a PSL *private*-section suffix. Under ICANN-only rules it
-        // is an ordinary registrable domain, so we can serve `*.github.io`
-        // rather than being forced down to `<user>.github.io`.
-        let c = list().plan("user.github.io", Ladder);
-        assert_eq!(c.base, "github.io");
-        assert_eq!(c.sans, vec!["*.github.io", "github.io"]);
-
-        // The user's case: csp.withgoogle.com (withgoogle.com is private) is
-        // served by the withgoogle.com certificate.
-        let c2 = list().plan("csp.withgoogle.com", Ladder);
-        assert_eq!(c2.base, "withgoogle.com");
-        assert_eq!(c2.sans, vec!["*.withgoogle.com", "withgoogle.com"]);
-        assert!(host_covered_by(&c2.sans, "csp.withgoogle.com"));
-        assert!(host_covered_by(&c2.sans, "withgoogle.com"));
+        // `github.io` and `withgoogle.com` are PSL *private*-section suffixes.
+        // Under ICANN-only rules they are ordinary registrable domains, so an
+        // upstream that genuinely serves `*.github.io` can be mirrored as-is.
+        let l = list();
+        assert!(l.wildcard_is_mintable("github.io"));
+        assert!(l.wildcard_is_mintable("withgoogle.com"));
+        // The ICANN suffix underneath them is still a boundary.
+        assert!(!l.wildcard_is_mintable("io"));
     }
 
     // -- Coverage predicate -------------------------------------------------
@@ -394,22 +240,23 @@ mod tests {
         assert!(!host_covered_by(&sans, "other.com"));
     }
 
-    // -- Degenerate inputs: always exact, regardless of mode ----------------
-
     #[test]
-    fn ip_literal_is_exact_in_every_mode() {
-        for m in [Exact, Wildcard, Ladder] {
-            let c = list().plan("127.0.0.1", m);
-            assert_eq!(c.base, "127.0.0.1");
-            assert_eq!(c.sans, vec!["127.0.0.1"]);
-        }
+    fn coverage_predicate_rejects_an_empty_wildcard_label() {
+        // `.example.com` has an empty leftmost label, so it is not a host a
+        // wildcard may cover, and a bare `*` never covers anything.
+        let sans = vec!["*.example.com".to_string()];
+        assert!(!host_covered_by(&sans, ".example.com"));
+        assert!(!host_covered_by(&["*".to_string()], "example.com"));
+        // An empty SAN list covers nothing.
+        assert!(!host_covered_by(&[], "example.com"));
     }
 
     #[test]
-    fn bare_suffix_has_no_registrable_and_is_exact() {
-        // "com" is a public suffix with no registrable domain.
-        let c = list().plan("com", Ladder);
-        assert_eq!(c.base, "com");
-        assert_eq!(c.sans, vec!["com"]);
+    fn coverage_predicate_rejects_a_wildcard_at_the_apex_it_names() {
+        // `*.example.com` does not cover `example.com` itself — the rule a client
+        // applies, and the reason an apex needs its own bare SAN.
+        let sans = vec!["*.example.com".to_string()];
+        assert!(!host_covered_by(&sans, "example.com"));
+        assert!(host_covered_by(&sans, "www.example.com"));
     }
 }

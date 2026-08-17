@@ -10,17 +10,18 @@ hierarchical (route → listener → global) for maximum flexibility: almost eve
 setting can be pinned per route and otherwise inherits outward.
 
 It merges two capabilities:
-- **Dynamic per-SNI certificate issuance** — no per-site cert maintenance;
-  any subdomain gets a valid (wildcard) cert the first time it is requested,
-  from a local CA you trust once. Wildcards are public-suffix-aware; certs are
-  persisted and cached.
+- **Dynamic per-SNI certificate issuance** — no per-site cert maintenance; any
+  name gets a valid cert the first time it is requested, from a local CA you trust
+  once. Coverage is not guessed: the first handshake is answered exactly, and
+  wider coverage is mirrored from the upstream's own certificate. Certs are
+  cached and persisted.
 - **ECH re-origination** — hide the true SNI from the path to a CDN edge, giving
   ECH to clients/environments that can't do it themselves.
 
 ## How it works
 
 ```
-                         issue per-SNI cert (wildcard, cached, persisted)
+                    issue per-SNI cert (exact, then mirrored from upstream)
                          ┌────────────────────────────────────────┐
                          │                                        ▼
  client ──TLS(SNI)/HTTP──▶ sni-gate :443 ── route by SNI/Host ──▶ upstream
@@ -97,7 +98,7 @@ from its template with `override_sni = ""`.
 
 Regular expressions in `match_sni` must be declared as `[regexes.<name>]` entries
 and referenced with an `@` prefix. Each regex carries a `scope_suffix` declaration
-that enables wildcard certificate issuance to coexist safely with regex routes.
+that lets mirrored wildcards coexist safely with regex routes.
 
 ```toml
 [regexes.cdn-upos]
@@ -160,54 +161,50 @@ target; it only sets the upstream TLS server name for `tls`/`ech`. A connection
 routed to a reflecting route that carries no SNI/Host is closed (there is
 nothing to reflect).
 
-## Certificate issuance modes
+## Certificate coverage
 
-Every per-SNI leaf is anchored at the **registrable domain**, so one certificate
-serves a whole domain within its [certificate scope](#certificate-scopes), and
-`[issuance] mode` chooses how much of it a request contributes. For an inbound
-SNI of `b.a.example.com` (registrable `example.com`):
+How much a certificate covers is **not configurable**. Guessing it is what breaks
+HTTP/2: a certificate broader than the upstream's own authorizes the browser to
+coalesce requests the upstream will answer with `403`. Coverage is therefore
+**mirrored from the upstream's real certificate**, never proposed by this gateway.
 
-| `mode`     | anchor        | names this host contributes                          |
-|------------|---------------|------------------------------------------------------|
-| `exact`    | `example.com` | `b.a.example.com`                                     |
-| `wildcard` | `example.com` | `*.a.example.com`                                     |
-| `ladder`   | `example.com` | `*.a.example.com`, `*.example.com`, `example.com`     |
+**Exact first.** The first connection for a host whose upstream has never been
+observed is answered with a certificate for that one name — no wildcard. Nothing
+can coalesce onto it, so no request can arrive that the upstream has not vouched
+for.
 
-The only wildcard that usefully covers a host `H` is `*.parent(H)` — `*.H` would
-cover subdomains a leaf host usually never has. So a level's `*.X` wildcard is
-emitted **only when some accessed host actually has `X` as its parent**: a CDN
-leaf like `rr5.googlevideo.com` never yields the useless `*.rr5.googlevideo.com`.
-`wildcard` contributes just the parent wildcard (host + siblings); `ladder`
-contributes the whole ancestor chain (host, every ancestor domain, and their
-siblings). `exact` contributes only the bare host.
+**Then mirror what the upstream presented.** When a TLS-terminating route hands
+the connection to a TLS/ECH upstream, the upstream's leaf is read as part of the
+handshake that was happening anyway — no extra probe, no blocking — and its DNS
+SANs become this gateway's coverage for that host. If `cf.example.net` answers a
+handshake for `qy0.ru` with `{qy0.ru, mzz.qy0.ru}`, that is exactly what the
+client is served, so `t4.qy0.ru` cannot coalesce onto it. If the same upstream
+answers a handshake for `t4.qy0.ru` with `{qy0.ru, *.qy0.ru}`, that connection
+does carry the wildcard — coalescing is preserved precisely where the upstream
+accepts it.
 
-`mode` is an **upper bound** on breadth, not a promise of it: a proposed name is
-withheld when it would also cover a host this listener routes to a *different*
-upstream. See [Certificate scopes](#certificate-scopes) — that clipping is what
-keeps routing honest, and the effective coverage of every route is printed at
-startup.
+Observed SANs are keyed by the **requested** name, so a set learned for
+`t4.qy0.ru` is never served to a client asking for `qy0.ru`.
 
-**One certificate per (scope, registrable domain), accumulating, never re-signed
-for a name it already covers.** Before signing, the resolver checks whether the
-anchor's cached/persisted certificate already covers the host; if so it is reused.
-If not, the host's names are **merged** into it and it is re-issued — so siblings
-(`c.a.example.com`, `www.example.com`, …) and even deeper new branches all fold
-into one leaf rather than each minting a redundant one. Switching modes is
-seamless (a certificate that does not cover the host is just re-issued). Leaves
-stay small — bounded by the distinct sub-hierarchies actually seen.
+**Rotation is handled by comparing every handshake.** The raw observed set is
+stored alongside the certificate. When a later handshake presents a different set
+— including a *narrower* one, which is the case that reintroduces `403` if ignored
+— the cached leaf is invalidated and re-signed against the new set.
 
-The registrable domain is computed from the public-suffix list's **ICANN section
-only**. Real registry suffixes (`co.uk`, `co.jp`) remain boundaries, so `*.co.jp`
-is never issued; private-section entries (`github.io`, `withgoogle.com`) are
-treated as ordinary registrable domains, so `csp.withgoogle.com` is served by a
-`withgoogle.com` leaf (`{*.withgoogle.com, withgoogle.com}`). IP literals and
-hosts with no registrable domain always fall back to `exact`. The wildcard is
-never lifted above the registrable domain, so `*.com` can never be produced.
+**Clipping.** A mirrored name is dropped when the upstream vouches for it but this
+listener would route it elsewhere (see [Certificate
+scopes](#certificate-scopes)), or when it is a wildcard directly above a public
+suffix (`*.com`, `*.co.uk`) — no real upstream needs one, and honoring it would
+hand out a certificate for an entire registry. The public-suffix list's **ICANN
+section only** decides that: `co.uk` and `co.jp` are boundaries, while
+private-section entries (`github.io`, `withgoogle.com`) are ordinary domains, so a
+genuine `*.withgoogle.com` from an upstream is mirrored. Dropped names are logged
+with the reason. If clipping removes everything, the exact name is served.
 
-```toml
-[issuance]
-mode = "wildcard"   # exact | wildcard | ladder
-```
+Certificates are persisted per `(scope, host)` as `certs/<scope>/<host>.crt`
+together with the observed set that produced them, so a restart resumes mirroring
+instead of re-learning it. There is nothing to migrate and no mode to switch: a
+leaf that does not match what the upstream currently presents is simply re-issued.
 
 ## Certificate scopes
 
@@ -263,20 +260,20 @@ The scope directory is what stops two destinations from overwriting each other's
 file — without it, a reload would serve one certificate to both routes and
 re-widen coverage.
 
-Names **within** one scope may share a wildcard, so a client can still coalesce
-between them. That is deliberate: it is exactly what the real origin's own
-wildcard certificate already permits, and the request reaches the same configured
-destination, which demultiplexes on `:authority` as any origin does. To forbid
-coalescing entirely, set `mode = "exact"` — every certificate is then reduced to
-the single name that requested it.
+Names **within** one scope may share a mirrored wildcard, so a client can still
+coalesce between them. That is deliberate: the upstream's own certificate already
+permits it, and the request reaches the same configured destination, which
+demultiplexes on `:authority` as any origin does. Nothing needs to be turned off
+to stay safe — a host whose upstream has not been observed is served an exact
+certificate, and an upstream that never presents a wildcard never yields one.
 
-At startup each route's effective coverage is logged, and every withheld name is
-reported at `INFO` with the conflicting host named:
+Every mirroring decision is logged at `INFO`, including each name clipping
+dropped:
 
 ```
-withholding wildcard coverage  route=cf-ech
-  withheld=["*.example.com (subdomains -> default_route catchall)",
-            "example.com (example.com -> catchall)"]
+mirrored upstream certificate coverage (clipped to this route scope)
+  scope=ech_cf.0sm.com_443-1f3a9c07b2d45e18 host=t4.example.com
+  sans=["t4.example.com", "example.com"] dropped=["*.example.com"]
 ```
 
 That is a report, not a failure — routing is unaffected. It means the routing

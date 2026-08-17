@@ -51,14 +51,18 @@
 //! # What sharing within a scope means
 //!
 //! Names in one scope may share a wildcard, so a client can still coalesce
-//! between them. That is deliberate: it is exactly what the real origin's own
-//! wildcard certificate already permits, and the request reaches the same
-//! configured destination, which demultiplexes on `:authority` as any origin
+//! between them. That is deliberate: such a wildcard is only ever served because
+//! the upstream's own certificate was observed to carry it (see
+//! [`crate::resolver`]), so the coalesced request reaches a destination that
+//! already vouches for the name and demultiplexes on `:authority` as any origin
 //! does. For a reflecting route the sibling's socket was dialed for a sibling
 //! name — again precisely what coalescing against a wildcard-serving origin does
-//! without this gateway in the path. An operator who wants no coalescing at all
-//! can set `[issuance] mode = "exact"`, which reduces every certificate to the
-//! single name that requested it.
+//! without this gateway in the path.
+//!
+//! Scope confinement is therefore the second of two independent gates, not the
+//! only one: coverage must first have been mirrored from a real upstream
+//! certificate, and must then be confined to a single scope. A name that fails
+//! either test is never served.
 
 use std::sync::Arc;
 

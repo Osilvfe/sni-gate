@@ -10,9 +10,10 @@
 //!     reflected as the dial target, with the configured port.
 //!   * named template: a route that carries only `match_sni` + `use` inherits
 //!     its `type`/`upstream` from a `[templates.*]` bundle and still works.
-//!   * ladder issuance: `[issuance] mode = "ladder"` anchors one leaf at the
-//!     registrable domain (compact ancestor-wildcard SANs); a sibling reuses it
-//!     with no second signature, persisted as a single `certs/<registrable>.crt`.
+//!   * issuance with no upstream observation: a host whose upstream SANs have
+//!     never been seen is answered with an exact leaf covering only that name —
+//!     a sibling is not covered and gets its own leaf, each persisted as
+//!     `certs/<scope>/<host>.crt` under the route's single scope directory.
 //!   * WebSocket-style half-close: a request that half-closes still receives a
 //!     full response back (the regression fixed in the proxy splice).
 //!   * HTTP/2 on an `http` route: the client negotiates h2 and the decrypted
@@ -253,14 +254,15 @@ addr = "127.0.0.1:{listen}"
 }
 
 #[test]
-fn ladder_issuance_mode_end_to_end() {
-    // `[issuance] mode = "ladder"` anchors ONE certificate at the registrable
-    // domain, covering the ancestor chain with compact parent wildcards (no
-    // useless `*.leaf`). Prove end-to-end: a deep-SNI handshake succeeds and the
-    // leaf carries the compact ladder; a sibling reuses it with no second
-    // signature; a deeper new branch is MERGED into the same certificate; and it
-    // is persisted as a single `certs/<registrable>.crt` (no per-host file, no
-    // mode subdirectory).
+fn unobserved_upstreams_yield_only_exact_certificates() {
+    // Coverage is mirrored from the upstream's real certificate, never guessed.
+    // An `http` route terminates TLS and forwards plaintext, so there is no
+    // upstream certificate to observe — and the certificates served must stay
+    // exact indefinitely, one per host, with no wildcard anywhere.
+    //
+    // This is the property that removes the reported 403 at the root: nothing
+    // this gateway serves authorizes coalescing that the upstream has not been
+    // seen to permit.
     let dir = tempdir();
     let (backend, _bh) = spawn_mock_backend();
     let listen = free_port();
@@ -274,8 +276,6 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[issuance]
-mode = "ladder"
 [store]
 enabled = true
 dir = "certs"
@@ -296,42 +296,34 @@ addr = "127.0.0.1:{listen}"
 
     let ca_path = dir.path().join("ca").join("ca.crt");
     let sans = drive_tls_collect_sans(listen, &ca_path, "b.a.deep.example");
-    // Compact ladder anchored at the registrable domain (deep.example): a
-    // wildcard per ancestor level plus the bare apex — and crucially NO
-    // `*.b.a.deep.example` leaf wildcard.
-    let mut got = sans.clone();
-    got.sort();
-    let mut want = vec!["*.a.deep.example", "*.deep.example", "deep.example"];
-    want.sort();
-    assert_eq!(got, want, "unexpected ladder SANs");
-    assert!(
-        !sans.iter().any(|s| s == "*.b.a.deep.example"),
-        "must not emit the useless leaf wildcard"
+    assert_eq!(
+        sans,
+        vec!["b.a.deep.example".to_string()],
+        "an unobserved upstream must yield exactly the requested name"
     );
 
-    // A sibling under the same registrable domain reuses the SAME certificate
-    // (covered by *.a.deep.example): its handshake succeeds, no re-sign.
-    drive_tls_http(listen, &ca_path, "c.a.deep.example");
+    // A sibling gets its own exact certificate; it is not covered by the first.
+    assert!(
+        !host_covered(&sans, "c.a.deep.example"),
+        "the first leaf must not cover a sibling, got {sans:?}"
+    );
+    let sibling = drive_tls_collect_sans(listen, &ca_path, "c.a.deep.example");
+    assert_eq!(sibling, vec!["c.a.deep.example".to_string()]);
 
-    // A deeper, previously-uncovered branch is merged into the SAME cert file:
-    // after it, the leaf carries both `*.a.deep.example` and `*.x.deep.example`.
-    let merged = drive_tls_collect_sans(listen, &ca_path, "q.x.deep.example");
-    for expected in ["*.a.deep.example", "*.x.deep.example", "*.deep.example"] {
-        assert!(
-            merged.iter().any(|s| s == expected),
-            "expected accumulated SAN {expected:?}, got {merged:?}"
-        );
-    }
+    // Both handshakes still carry real traffic.
+    drive_tls_http(listen, &ca_path, "b.a.deep.example");
 
-    // Exactly one certificate, keyed by the registrable domain, inside this
-    // route's certificate-scope directory (`certs/<scope>/deep.example.crt`) —
-    // one file for the whole domain, no per-host leaf. The scope level is what
-    // keeps two routes that forward differently from overwriting each other.
+    // One file per host, inside this route's single certificate-scope directory
+    // (`certs/<scope>/<host>.crt`). The scope level is what keeps two routes that
+    // forward differently from overwriting each other's file.
     let crt_files = collect_certs(&dir.path().join("certs"));
     assert_eq!(
         crt_files,
-        vec!["deep.example.crt".to_string()],
-        "expected a single registrable-anchored cert, got {crt_files:?}"
+        vec![
+            "b.a.deep.example.crt".to_string(),
+            "c.a.deep.example.crt".to_string()
+        ],
+        "expected one persisted certificate per host, got {crt_files:?}"
     );
     let scopes = collect_scope_dirs(&dir.path().join("certs"));
     assert_eq!(
@@ -381,7 +373,7 @@ fn cross_route_coalescing_is_structurally_impossible() {
     // The reported bug, as an end-to-end assertion on real signed certificates.
     //
     // Two names under one registrable domain, deliberately routed to DIFFERENT
-    // upstreams, with `mode = "ladder"` asking for the widest possible coverage:
+    // upstreams:
     //
     //   apex.coalesce.test      -> backend A
     //   static.coalesce.test    -> backend B  (via default_route)
@@ -394,7 +386,11 @@ fn cross_route_coalescing_is_structurally_impossible() {
     //
     // What must hold now: neither certificate is valid for a name the other
     // route owns. That removes the browser's *permission* to coalesce, which is
-    // the only one of the three preconditions this program controls.
+    // the only one of the three preconditions this program controls. Two
+    // independent mechanisms each enforce it — coverage is only ever mirrored
+    // from an upstream certificate, and a mirrored name is dropped unless every
+    // host it covers routes into the same certificate scope — so the assertion
+    // holds no matter what the upstreams here were to serve.
     let dir = tempdir();
     let (backend_a, _ha) = spawn_mock_backend();
     let (backend_b, _hb) = spawn_mock_backend();
@@ -409,8 +405,6 @@ cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
 common_name = "E2E CA"
 leaf_validity_days = 90
-[issuance]
-mode = "ladder"
 [store]
 enabled = true
 dir = "certs"
@@ -434,9 +428,9 @@ addr = "127.0.0.1:{listen}"
     wait_port(listen);
     let ca_path = dir.path().join("ca").join("ca.crt");
 
-    // The apex, on its own route. `ladder` proposes `*.coalesce.test`, but every
-    // other host under that wildcard falls to `default_route` — a different
-    // upstream — so the wildcard must be withheld.
+    // The apex, on its own route. Every other host under `*.coalesce.test` falls
+    // to `default_route` — a different upstream — so that wildcard could never be
+    // served here even if an upstream offered it.
     let apex_sans = drive_tls_collect_sans(listen, &ca_path, "apex.coalesce.test");
     assert!(
         !apex_sans.iter().any(|s| s == "*.coalesce.test"),
@@ -585,8 +579,9 @@ fn drive_tls_http(listen: u16, ca_path: &std::path::Path, sni: &'static str) {
 }
 
 /// Connect over TLS presenting `sni` (trusting the CA at `ca_path`), complete
-/// the handshake, and return the DNS SANs of the leaf the gateway issued. Proves
-/// the issuance mode's coverage against the real, signed certificate.
+/// the handshake, and return the DNS SANs of the leaf the gateway issued. Asserts
+/// served coverage against the real, signed certificate rather than an internal
+/// decision, so a bug between deciding coverage and signing it cannot hide.
 fn drive_tls_collect_sans(
     listen: u16,
     ca_path: &std::path::Path,

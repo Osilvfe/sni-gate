@@ -1,7 +1,7 @@
 //! Public Suffix List management: loading, auto-update, and hot-reload.
 //!
-//! The PSL determines the registrable-domain anchor for issued certificates.
-//! This module supports three modes:
+//! The PSL marks the registry boundaries a minted wildcard must not cross (see
+//! [`crate::suffix`]). This module supports three modes:
 //!
 //! - **Embedded**: compiled-in PSL, zero dependencies, may be stale.
 //! - **File (manual)**: user maintains the file, sni-gate loads it.
@@ -327,6 +327,15 @@ mod tests {
     use super::*;
     use crate::config::PslSource;
 
+    /// Whether a *genuine* PSL is in effect: `example.com` sits under a
+    /// registrable domain while `co.uk` is a registry boundary. Only a real list
+    /// separates the two — the implicit "the last label is the suffix" rule that
+    /// an empty or truncated list falls back to would call both registrable, so
+    /// this distinguishes a loaded list from a silently broken one.
+    fn real_psl_loaded(psl: &SuffixList) -> bool {
+        psl.wildcard_is_mintable("example.com") && !psl.wildcard_is_mintable("co.uk")
+    }
+
     #[tokio::test]
     async fn load_embedded() {
         let cfg = PslConfig {
@@ -334,9 +343,10 @@ mod tests {
             ..Default::default()
         };
         let psl = load_initial(&cfg).await.unwrap();
-        // Sanity check: .com should be a public suffix
-        let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
-        assert_eq!(plan.base, "example.com");
+        assert!(
+            real_psl_loaded(&psl),
+            "the embedded list must be a real PSL"
+        );
     }
 
     #[tokio::test]
@@ -355,8 +365,9 @@ com
         std::fs::write(&path, psl_content).unwrap();
 
         let psl = load_from_file(&path).await.unwrap();
-        let plan = psl.plan("example.test", crate::config::IssuanceMode::Exact);
-        assert_eq!(plan.base, "example.test");
+        // `test` is a declared suffix, so `example.test` is registrable below it.
+        assert!(psl.wildcard_is_mintable("example.test"));
+        assert!(!psl.wildcard_is_mintable("test"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -382,9 +393,10 @@ com
             Ok(psl) => {
                 // Should have downloaded and loaded
                 assert!(path.exists());
-                // Verify it's a real PSL
-                let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
-                assert_eq!(plan.base, "example.com");
+                assert!(
+                    real_psl_loaded(&psl),
+                    "the downloaded list must be a real PSL"
+                );
             }
             Err(e) => {
                 // Network failure is acceptable in tests
@@ -419,9 +431,10 @@ com
         };
 
         let psl = load_initial(&cfg).await.unwrap();
-        // Should use the existing file (not download)
-        let plan = psl.plan("example.test", crate::config::IssuanceMode::Exact);
-        assert_eq!(plan.base, "example.test");
+        // Should use the existing file (not download): it declares `test`, which
+        // the real list does not, so this proves *which* list is in effect.
+        assert!(psl.wildcard_is_mintable("example.test"));
+        assert!(!psl.wildcard_is_mintable("test"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -482,8 +495,10 @@ com
                 assert!(path.exists());
 
                 // Should be readable
-                let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
-                assert_eq!(plan.base, "example.com");
+                assert!(
+                    real_psl_loaded(&psl),
+                    "the downloaded list must be a real PSL"
+                );
             }
             Err(e) => {
                 // Network failure is acceptable in tests
@@ -518,8 +533,10 @@ com
         );
 
         let psl = result.unwrap();
-        let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
-        assert_eq!(plan.base, "example.com");
+        assert!(
+            real_psl_loaded(&psl),
+            "the embedded fallback must be a real PSL"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -552,8 +569,9 @@ com
         };
 
         let psl = load_initial(&cfg).await.unwrap();
-        let plan = psl.plan("example.test", crate::config::IssuanceMode::Exact);
-        assert_eq!(plan.base, "example.test");
+        // The stale file, not the embedded list: it declares `test`.
+        assert!(psl.wildcard_is_mintable("example.test"));
+        assert!(!psl.wildcard_is_mintable("test"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -574,8 +592,10 @@ com
         };
 
         let psl = load_initial(&cfg).await.unwrap();
-        let plan = psl.plan("example.com", crate::config::IssuanceMode::Exact);
-        assert_eq!(plan.base, "example.com");
+        assert!(
+            real_psl_loaded(&psl),
+            "the embedded fallback must be a real PSL"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

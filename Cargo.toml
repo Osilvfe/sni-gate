@@ -65,7 +65,7 @@ strip = true
 [dev-dependencies]
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
-# Parse SANs out of the leaf the gateway issues, to assert issuance-mode coverage
+# Parse SANs out of the leaf the gateway issues, to assert served coverage
 # end-to-end. Same version as the runtime dependency.
 x509-parser = "0.18"
 # For PSL fallback tests: backdate file mtime to simulate stale files.

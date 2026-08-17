@@ -38,11 +38,11 @@ pub struct Config {
     #[serde(default)]
     pub global: Global,
 
-    /// Certificate authority + issuance settings (dynamic per-SNI certs).
+    /// The local CA that signs dynamic per-SNI leaves: key material, validity,
+    /// and trust-store installation. What each leaf *covers* is not configured
+    /// here — it is derived from the upstream's own certificate at handshake
+    /// time (see [`crate::resolver`]).
     pub ca: CaConfig,
-
-    #[serde(default)]
-    pub issuance: IssuanceConfig,
 
     #[serde(default)]
     pub store: StoreConfig,
@@ -71,15 +71,15 @@ pub struct Config {
 
     /// Named regular expressions for SNI/Host matching. A `[regexes.<name>]`
     /// table declares a regex pattern together with its scope suffix — the set
-    /// of domain suffixes the pattern may match. This scope information enables
-    /// wildcard certificate issuance to safely coexist with regex routes: a
-    /// wildcard is refused only when it would cover a name some regex in a
-    /// different route scope could match.
+    /// of domain suffixes the pattern may match. This scope information lets
+    /// wildcard coverage safely coexist with regex routes: a wildcard is withheld
+    /// only when it would cover a name some regex in a different route scope could
+    /// match.
     ///
     /// Regex routes are referenced in `match_sni` with an `@` prefix:
     /// `match_sni = ["@cdn-pattern", ".example.com"]`. Inline regex syntax
-    /// (`~pattern`) is no longer supported; all regexes must be declared and
-    /// named here. See [`RegexDef`].
+    /// (`~pattern`) is not supported; all regexes must be declared and named
+    /// here. See [`RegexDef`].
     #[serde(default)]
     pub regexes: HashMap<String, RegexDef>,
 
@@ -458,18 +458,25 @@ pub struct Template {
 /// # Why this exists
 ///
 /// Regular expressions in route patterns cannot be statically analyzed to
-/// determine their match scope, which creates a correctness problem for wildcard
-/// certificate issuance: a wildcard `*.example.com` must not be issued if some
-/// regex in a *different* route scope could match hosts under `example.com`,
-/// because HTTP/2 connection coalescing would let the browser send a request for
-/// that regex-matched host on the wildcard connection, bypassing SNI-based
-/// routing entirely. See [`crate::certscope`] for the full rationale.
+/// determine their match scope, which creates a correctness problem for any
+/// wildcard a certificate carries: a wildcard `*.example.com` must not be served
+/// if some regex in a *different* route scope could match hosts under
+/// `example.com`, because HTTP/2 connection coalescing would let the browser send
+/// a request for that regex-matched host on the wildcard connection, bypassing
+/// SNI-based routing entirely. See [`crate::certscope`] for the full rationale.
 ///
-/// The inline regex syntax (`~pattern`) cannot carry scope information, so it
-/// forces a conservative refusal: *any* out-of-scope regex blocks *all*
-/// wildcards. Named regexes solve this by requiring an explicit `scope_suffix`
-/// declaration: the operator states which domain suffixes the pattern may match,
-/// and wildcard issuance uses that to precisely determine when a conflict exists.
+/// This applies to wildcards mirrored from an upstream certificate exactly as it
+/// applied to wildcards this gateway once proposed on its own: the upstream
+/// vouches for the name, but it cannot know how *this* listener routes the other
+/// hosts the wildcard would cover.
+///
+/// A named regex carries the scope information that makes this decidable: the
+/// operator states which domain suffixes the pattern may match, and the
+/// confinement check uses that to determine precisely whether a wildcard would
+/// cross into another scope. The inline syntax (`~pattern`) has nowhere to put
+/// that declaration, leaving no sound answer but to withhold every wildcard on
+/// the listener — so it is rejected at load time rather than silently degrading
+/// coverage.
 ///
 /// # Configuration
 ///
@@ -511,15 +518,16 @@ pub struct Template {
 /// compiled to verify it is a valid regex. No attempt is made to verify that
 /// the pattern's actual matches align with the declared scope — that
 /// responsibility lies with the operator. An incorrect declaration is a
-/// configuration error, not a runtime failure: it may cause wildcards to be
-/// refused when they would be safe, or (if the scope is under-declared) allow
-/// wildcards that should be refused, leading to incorrect routing.
+/// configuration error, not a runtime failure: over-declaring the scope withholds
+/// wildcards that would have been safe, costing only connection reuse, while
+/// under-declaring it admits a wildcard that should have been withheld, which
+/// misroutes coalesced requests.
 ///
-/// # Inline regex deprecation
+/// # Inline regex syntax
 ///
-/// The inline syntax `match_sni = ["~^pattern$"]` is no longer supported. All
-/// regex patterns must be declared as named `[regexes.<name>]` entries with an
-/// explicit `scope_suffix`. This is enforced at config load time.
+/// The inline syntax `match_sni = ["~^pattern$"]` is not supported. All regex
+/// patterns must be declared as named `[regexes.<name>]` entries with an explicit
+/// `scope_suffix`. This is enforced at config load time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegexDef {
@@ -540,9 +548,8 @@ pub struct RegexDef {
     ///
     /// This is a **conservative declaration**: it is the operator's responsibility
     /// to ensure the pattern does not match hosts outside the declared scope. An
-    /// incorrect declaration may allow wildcard certificates to be issued when
-    /// they should be refused, leading to incorrect routing via HTTP/2 connection
-    /// coalescing.
+    /// incorrect declaration may allow a wildcard to be served when it should be
+    /// withheld, leading to incorrect routing via HTTP/2 connection coalescing.
     pub scope_suffix: Vec<String>,
 }
 
@@ -916,47 +923,6 @@ pub struct CaConfig {
     pub leaf_validity_days: u32,
     #[serde(default)]
     pub install_to_system_root: bool,
-}
-
-/// What set of names a per-SNI leaf certificate should cover. Evaluated against
-/// the registrable domain via the public-suffix list; IP literals and hosts with
-/// no registrable domain always fall back to [`IssuanceMode::Exact`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum IssuanceMode {
-    /// Only the requested host itself — no wildcard.
-    Exact,
-    /// The host and its direct subdomains: `{host, *.host}`. The default.
-    #[default]
-    Wildcard,
-    /// The host and every ancestor domain up to the registrable domain, each
-    /// with its single-level wildcard (e.g. `b.a.example.com` →
-    /// `{b.a.example.com, *.b.a.example.com, a.example.com, *.a.example.com,
-    /// example.com, *.example.com}`).
-    Ladder,
-}
-
-/// Per-SNI issuance policy.
-///
-/// `mode` is an **upper bound** on how much one certificate may cover, not a
-/// promise: a proposed wildcard is withheld when some host it would cover routes
-/// to a different upstream on the same listener, because issuing it would let a
-/// client reuse one HTTP/2 connection for both and bypass routing entirely (see
-/// [`crate::certscope`]). The effective coverage of every route is printed at
-/// startup.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IssuanceConfig {
-    /// Name-coverage mode; the upper bound before route-scope clipping.
-    #[serde(default)]
-    pub mode: IssuanceMode,
-}
-
-impl IssuanceConfig {
-    /// The configured issuance mode.
-    pub fn resolved_mode(&self) -> IssuanceMode {
-        self.mode
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2852,27 +2818,18 @@ addr = "0.0.0.0:443"
     }
 
     #[test]
-    fn issuance_mode_resolution() {
-        for (toml_src, want) in [
-            (r#"mode = "exact""#, IssuanceMode::Exact),
-            (r#"mode = "wildcard""#, IssuanceMode::Wildcard),
-            (r#"mode = "ladder""#, IssuanceMode::Ladder),
-        ] {
-            let c: IssuanceConfig = toml::from_str(toml_src).unwrap();
-            assert_eq!(c.resolved_mode(), want, "for {toml_src}");
-        }
-        // Unset → the default.
-        let c = IssuanceConfig::default();
-        assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
-        let c: IssuanceConfig = toml::from_str("").unwrap();
-        assert_eq!(c.resolved_mode(), IssuanceMode::Wildcard);
-
-        // There is exactly one way to express the mode: the removed legacy
-        // boolean is now an unknown field, so a stale config fails loudly at load
-        // rather than being silently reinterpreted.
+    fn an_unknown_top_level_table_is_rejected_by_name() {
+        // A setting the gateway does not understand must fail loudly at load and
+        // name itself in the error. Silently ignoring it would let an operator
+        // believe a knob is in effect when nothing reads it.
+        let err = toml::from_str::<Config>(&format!(
+            "{CA}[not-a-real-section]\nmode = \"whatever\"\n\n\
+             [[listener]]\naddr = \"0.0.0.0:443\"\n"
+        ))
+        .expect_err("an unknown top-level table must be rejected, not ignored");
         assert!(
-            toml::from_str::<IssuanceConfig>(r#"wildcard = true"#).is_err(),
-            "the legacy `wildcard` flag must be rejected, not ignored"
+            err.to_string().contains("not-a-real-section"),
+            "the error must name the offending table, got: {err}"
         );
     }
 
