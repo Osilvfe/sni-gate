@@ -76,6 +76,12 @@ struct Cli {
     /// Path to the TOML configuration file.
     #[arg(short, long, default_value = "sni-gate.toml")]
     config: PathBuf,
+
+    /// Install the CA into the OS trusted-root store, then exit. Generates the
+    /// CA first if the `[ca]` paths are empty. Idempotent; needs elevated
+    /// privileges (Administrator on Windows, root/sudo on macOS/Linux).
+    #[arg(long)]
+    install_ca: bool,
 }
 
 fn main() -> ExitCode {
@@ -97,6 +103,16 @@ fn main() -> ExitCode {
     };
     init_tracing(&cfg.global.log);
 
+    if cli.install_ca {
+        return match install_ca(&cfg) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %format!("{e:#}"), "CA installation failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -117,6 +133,43 @@ fn main() -> ExitCode {
     }
 }
 
+/// Load the configured CA, generating it on first use.
+fn load_ca(cfg: &Config) -> Result<CertificateAuthority> {
+    CertificateAuthority::load_or_generate(CaParams {
+        cert_path: &cfg.ca.cert_path,
+        key_path: &cfg.ca.key_path,
+        common_name: &cfg.ca.common_name,
+        organization: &cfg.ca.organization,
+        country: &cfg.ca.country,
+        leaf_validity_days: cfg.ca.leaf_validity_days,
+    })
+    .context("initializing certificate authority")
+}
+
+/// `--install-ca`: put the CA in the OS trusted-root store and stop.
+///
+/// Unlike the startup path, a failure here is the whole point of the run, so
+/// it propagates and sets a non-zero exit code.
+fn install_ca(cfg: &Config) -> Result<()> {
+    let ca = load_ca(cfg)?;
+    let outcome = trust::ensure_installed(ca.cert_der())
+        .context("installing the CA into the OS trusted-root store")?;
+    log_ca_installed(&outcome);
+    Ok(())
+}
+
+fn log_ca_installed(outcome: &trust::Outcome) {
+    let fingerprint = outcome.fingerprint();
+    match outcome {
+        trust::Outcome::Installed { .. } => {
+            tracing::warn!(fingerprint, "installed CA into the OS trusted-root store");
+        }
+        trust::Outcome::AlreadyTrusted { .. } => {
+            info!(fingerprint, "CA already trusted; store unchanged");
+        }
+    }
+}
+
 async fn run(cfg: Config) -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -125,19 +178,16 @@ async fn run(cfg: Config) -> Result<()> {
     );
 
     // --- Dynamic certificate stack (shared across all listeners) ---
-    let ca = CertificateAuthority::load_or_generate(CaParams {
-        cert_path: &cfg.ca.cert_path,
-        key_path: &cfg.ca.key_path,
-        common_name: &cfg.ca.common_name,
-        organization: &cfg.ca.organization,
-        country: &cfg.ca.country,
-        leaf_validity_days: cfg.ca.leaf_validity_days,
-    })
-    .context("initializing certificate authority")?;
+    let ca = load_ca(&cfg)?;
 
     if cfg.ca.install_to_system_root {
-        if let Err(e) = trust::ensure_installed(ca.cert_der()) {
-            tracing::warn!(error = %e, "could not install CA into system root store");
+        // A gateway that cannot reach the root store still serves traffic, so
+        // this is a warning rather than a startup failure.
+        match trust::ensure_installed(ca.cert_der()) {
+            Ok(outcome) => log_ca_installed(&outcome),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not install CA into system root store");
+            }
         }
     }
 

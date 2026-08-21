@@ -49,11 +49,18 @@ toml = "0.9"
 humantime-serde = "1"
 base64 = "0.22"
 url = "2"
-sha1 = "0.11"
+sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 time = "0.3"
+
+# Trusted-root installation: CryptoAPI on Windows, nothing extra elsewhere.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [profile.release]
 opt-level = 3

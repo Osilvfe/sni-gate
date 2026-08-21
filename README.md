@@ -684,20 +684,36 @@ See [`sni-gate.example.toml`](sni-gate.example.toml) for every option.
 The CA is generated on first run at the `[ca]` paths. Import the **certificate**
 (never the key) into each device that should trust issued certs:
 
-```powershell
-# this machine, as Administrator
-powershell -ExecutionPolicy Bypass -File scripts\install-ca-windows.ps1
+```sh
+# this machine; generates the CA first if needed
+# Windows: needs Administrator
+# macOS/Linux: needs root/sudo
+sni-gate.exe --install-ca          # Windows
+sudo ./sni-gate --install-ca       # macOS/Linux
 ```
 
-Or set `ca.install_to_system_root = true` to install it automatically on startup
-(idempotent; Administrator required). For other devices, distribute `ca/ca.crt`
-and import it into their trusted-root store.
+**Windows** writes to the Local Machine Trusted Root Certification Authorities
+store through CryptoAPI in-process — no PowerShell, no `certutil`, no temp
+file. **macOS** uses the standard `security add-trusted-cert` tool.
+**Linux** detects your distribution (Debian/Ubuntu/RHEL/Fedora/Arch) and uses
+the appropriate certificate-management command (`update-ca-certificates`,
+`update-ca-trust`, or `trust extract-compat`).
+
+Installation is idempotent across all platforms: if a certificate with the same
+fingerprint is already trusted, the store is left untouched. Restart the
+browser afterwards to pick up the change.
+
+Setting `ca.install_to_system_root = true` does the same thing on every startup
+instead, and only warns if the store cannot be reached, so the gateway still
+serves traffic. For other devices, distribute `ca/ca.crt` and import it into
+their trusted-root store.
 
 ## Security notes
 
 - `ca/ca.key` is a trusted-root private key. Keep it local; it is gitignored.
 - Terminating TLS means sni-gate sees plaintext for terminating route types.
-- Binding to 443/80 requires Administrator on Windows.
+- Binding to 443/80 requires elevated privileges: Administrator on Windows,
+  root/sudo on macOS/Linux.
 
 ## Logging
 

@@ -921,6 +921,9 @@ pub struct CaConfig {
     pub country: String,
     #[serde(default = "default_leaf_validity_days")]
     pub leaf_validity_days: u32,
+    /// Add the CA to the OS trusted-root store on every startup. Requires
+    /// elevated privileges (Administrator on Windows, root/sudo on macOS/Linux).
+    /// Idempotent; startup only warns if it fails.
     #[serde(default)]
     pub install_to_system_root: bool,
 }

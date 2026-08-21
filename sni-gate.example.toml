@@ -90,7 +90,9 @@ common_name = "SNI Gate Local CA"
 organization = ""             # optional O on the CA and issued leaves
 country = ""                  # optional C
 leaf_validity_days = 397
-install_to_system_root = false  # opt-in; Administrator on Windows; idempotent
+install_to_system_root = false  # trust the CA on every startup; needs elevated
+                                # privileges (Administrator/root), idempotent,
+                                # warns on failure. `--install-ca` does it once.
 
 # Certificate coverage is not configurable, because guessing it is what breaks
 # HTTP/2. The first handshake for an unknown name is answered with an EXACT
