@@ -1,9 +1,10 @@
-//! Stateless QUIC v1 Initial inspection for raw SNI routing.
+//! Stateless QUIC v1/v2 Initial inspection for raw SNI routing.
 //!
 //! QUIC Initial packets use publicly derivable keys. We decrypt only those
 //! packets, reassemble their CRYPTO frames, and inspect the TLS ClientHello;
 //! raw routes still forward every original UDP datagram untouched.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
@@ -16,11 +17,44 @@ use sha2::Sha256;
 use crate::peek::{parse_tls_sni, TlsParse};
 
 pub const MAX_CLIENT_HELLO: usize = 16 * 1024;
-const QUIC_V1: u32 = 1;
+const QUIC_V1: u32 = 0x0000_0001;
+const QUIC_V2: u32 = 0x6b33_43cf;
 const INITIAL_SALT_V1: [u8; 20] = [
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xbd, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc,
     0xbb, 0x7f, 0x0a, 0xa0,
 ];
+const INITIAL_SALT_V2: [u8; 20] = [
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
+];
+
+struct VersionParams {
+    salt: &'static [u8; 20],
+    initial_type: u8,
+    key_label: &'static [u8],
+    iv_label: &'static [u8],
+    hp_label: &'static [u8],
+}
+
+fn version_params(version: u32) -> Option<VersionParams> {
+    match version {
+        QUIC_V1 => Some(VersionParams {
+            salt: &INITIAL_SALT_V1,
+            initial_type: 0x00,
+            key_label: b"quic key",
+            iv_label: b"quic iv",
+            hp_label: b"quic hp",
+        }),
+        QUIC_V2 => Some(VersionParams {
+            salt: &INITIAL_SALT_V2,
+            initial_type: 0x10,
+            key_label: b"quicv2 key",
+            iv_label: b"quicv2 iv",
+            hp_label: b"quicv2 hp",
+        }),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InitialSni {
@@ -31,11 +65,12 @@ pub enum InitialSni {
 }
 
 /// Reassembles one client's Initial CRYPTO stream, bounded before address
-/// validation so a fragmented ClientHello cannot exhaust memory.
+/// validation so a fragmented ClientHello cannot exhaust memory. Byte-granular
+/// storage makes overlapping retransmissions safe: identical bytes are ignored,
+/// while contradictory overlap is rejected as malformed input.
 #[derive(Debug, Default)]
 pub struct InitialInspector {
-    crypto: BTreeMap<u64, Vec<u8>>,
-    retained: usize,
+    crypto: BTreeMap<u64, u8>,
 }
 
 impl InitialInspector {
@@ -72,6 +107,8 @@ impl InitialInspector {
         while at < payload.len() {
             match read_varint(payload, &mut at)? {
                 0x00 | 0x01 => {} // PADDING and PING
+                0x02 => skip_ack(payload, &mut at, false)?,
+                0x03 => skip_ack(payload, &mut at, true)?,
                 0x06 => {
                     let offset = read_varint(payload, &mut at)?;
                     let len = read_varint(payload, &mut at)? as usize;
@@ -80,7 +117,7 @@ impl InitialInspector {
                     at = end;
                     self.insert_crypto(offset, data)?;
                 }
-                0x02 | 0x03 => skip_ack(payload, &mut at)?,
+                0x1c => skip_transport_close(payload, &mut at)?,
                 _ => return Err(()),
             }
         }
@@ -89,25 +126,28 @@ impl InitialInspector {
 
     fn insert_crypto(&mut self, offset: u64, data: &[u8]) -> Result<(), ()> {
         let end = offset.checked_add(data.len() as u64).ok_or(())?;
-        if end as usize > MAX_CLIENT_HELLO || self.retained + data.len() > MAX_CLIENT_HELLO {
+        if end > MAX_CLIENT_HELLO as u64 {
             return Err(());
         }
-        if self.crypto.contains_key(&offset) {
-            return Ok(()); // harmless retransmission
+        for (index, byte) in data.iter().copied().enumerate() {
+            let pos = offset.checked_add(index as u64).ok_or(())?;
+            match self.crypto.entry(pos) {
+                Entry::Vacant(entry) => {
+                    entry.insert(byte);
+                }
+                Entry::Occupied(entry) if *entry.get() == byte => {}
+                Entry::Occupied(_) => return Err(()),
+            }
         }
-        self.retained += data.len();
-        self.crypto.insert(offset, data.to_vec());
         Ok(())
     }
 
     fn client_hello(&self) -> Option<Vec<u8>> {
-        let mut at = 0u64;
         let mut out = Vec::new();
-        while let Some(part) = self.crypto.get(&at) {
-            out.extend_from_slice(part);
-            at += part.len() as u64;
-            if out.len() >= MAX_CLIENT_HELLO {
-                return None;
+        for offset in 0..MAX_CLIENT_HELLO as u64 {
+            match self.crypto.get(&offset) {
+                Some(byte) => out.push(*byte),
+                None => break,
             }
         }
         (!out.is_empty()).then_some(out)
@@ -120,13 +160,17 @@ struct DecryptedInitial {
 }
 
 fn decrypt_initial(packet: &[u8]) -> Result<Option<DecryptedInitial>, ()> {
-    if packet.len() < 7 || packet[0] & 0x80 == 0 {
+    if packet.len() < 7 || packet[0] & 0xc0 != 0xc0 {
         return Ok(None);
     }
     let version = u32::from_be_bytes(packet[1..5].try_into().map_err(|_| ())?);
-    if version != QUIC_V1 || packet[0] & 0x30 != 0 {
+    let Some(params) = version_params(version) else {
+        return Ok(None);
+    };
+    if packet[0] & 0x30 != params.initial_type {
         return Ok(None);
     }
+
     let mut at = 5usize;
     let dcid_len = *packet.get(at).ok_or(())? as usize;
     at += 1;
@@ -134,7 +178,8 @@ fn decrypt_initial(packet: &[u8]) -> Result<Option<DecryptedInitial>, ()> {
     let dcid = packet.get(at..dcid_end).ok_or(())?;
     at = dcid_end;
     let scid_len = *packet.get(at).ok_or(())? as usize;
-    at += 1 + scid_len;
+    at += 1;
+    at = at.checked_add(scid_len).ok_or(())?;
     if at > packet.len() {
         return Err(());
     }
@@ -147,7 +192,7 @@ fn decrypt_initial(packet: &[u8]) -> Result<Option<DecryptedInitial>, ()> {
     let pn_at = at;
     let sample = packet.get(pn_at + 4..pn_at + 20).ok_or(())?;
 
-    let keys = InitialKeys::client(dcid)?;
+    let keys = InitialKeys::client(version, dcid)?;
     let mask = keys.header_mask(sample)?;
     let first = packet[0] ^ (mask[0] & 0x0f);
     let pn_len = (first as usize & 0x03) + 1;
@@ -182,6 +227,26 @@ fn decrypt_initial(packet: &[u8]) -> Result<Option<DecryptedInitial>, ()> {
     }))
 }
 
+struct InitialMaterial {
+    key: [u8; 16],
+    iv: [u8; 12],
+    hp: [u8; 16],
+}
+
+fn derive_initial_material(version: u32, dcid: &[u8]) -> Result<InitialMaterial, ()> {
+    let params = version_params(version).ok_or(())?;
+    let (initial_secret, _) = Hkdf::<Sha256>::extract(Some(params.salt), dcid);
+    let mut client_secret = [0u8; 32];
+    expand_label(initial_secret.as_slice(), b"client in", &mut client_secret)?;
+    let mut key = [0u8; 16];
+    let mut iv = [0u8; 12];
+    let mut hp = [0u8; 16];
+    expand_label(&client_secret, params.key_label, &mut key)?;
+    expand_label(&client_secret, params.iv_label, &mut iv)?;
+    expand_label(&client_secret, params.hp_label, &mut hp)?;
+    Ok(InitialMaterial { key, iv, hp })
+}
+
 struct InitialKeys {
     aead: Aes128Gcm,
     iv: [u8; 12],
@@ -189,22 +254,12 @@ struct InitialKeys {
 }
 
 impl InitialKeys {
-    fn client(dcid: &[u8]) -> Result<Self, ()> {
-        let initial = Hkdf::<Sha256>::new(Some(&INITIAL_SALT_V1), dcid);
-        let mut initial_secret = [0u8; 32];
-        initial.expand(&[], &mut initial_secret).map_err(|_| ())?;
-        let mut client_secret = [0u8; 32];
-        expand_label(&initial_secret, b"client in", &mut client_secret)?;
-        let mut key = [0u8; 16];
-        let mut iv = [0u8; 12];
-        let mut hp = [0u8; 16];
-        expand_label(&client_secret, b"quic key", &mut key)?;
-        expand_label(&client_secret, b"quic iv", &mut iv)?;
-        expand_label(&client_secret, b"quic hp", &mut hp)?;
+    fn client(version: u32, dcid: &[u8]) -> Result<Self, ()> {
+        let material = derive_initial_material(version, dcid)?;
         Ok(Self {
-            aead: Aes128Gcm::new_from_slice(&key).map_err(|_| ())?,
-            iv,
-            hp,
+            aead: Aes128Gcm::new_from_slice(&material.key).map_err(|_| ())?,
+            iv: material.iv,
+            hp: material.hp,
         })
     }
 
@@ -250,15 +305,30 @@ fn read_varint(bytes: &[u8], at: &mut usize) -> Result<u64, ()> {
     Ok(value)
 }
 
-fn skip_ack(bytes: &[u8], at: &mut usize) -> Result<(), ()> {
+fn skip_ack(bytes: &[u8], at: &mut usize, ecn: bool) -> Result<(), ()> {
     read_varint(bytes, at)?; // largest acknowledged
     read_varint(bytes, at)?; // ack delay
     let ranges = read_varint(bytes, at)?;
     read_varint(bytes, at)?; // first ack range
     for _ in 0..ranges {
-        read_varint(bytes, at)?;
-        read_varint(bytes, at)?;
+        read_varint(bytes, at)?; // gap
+        read_varint(bytes, at)?; // ack range length
     }
+    if ecn {
+        read_varint(bytes, at)?; // ECT(0)
+        read_varint(bytes, at)?; // ECT(1)
+        read_varint(bytes, at)?; // CE
+    }
+    Ok(())
+}
+
+fn skip_transport_close(bytes: &[u8], at: &mut usize) -> Result<(), ()> {
+    read_varint(bytes, at)?; // error code
+    read_varint(bytes, at)?; // triggering frame type
+    let reason_len = read_varint(bytes, at)? as usize;
+    let end = at.checked_add(reason_len).ok_or(())?;
+    bytes.get(*at..end).ok_or(())?;
+    *at = end;
     Ok(())
 }
 
@@ -278,18 +348,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reassembles_fragmented_initial_crypto_and_extracts_sni() {
-        let hello = client_hello("router.test");
-        let split = hello.len() / 2;
+    fn derives_rfc9001_v1_client_initial_keys() {
+        let dcid = hex("8394c8f03e515708");
+        let material = derive_initial_material(QUIC_V1, &dcid).unwrap();
+        assert_eq!(material.key, hex16("1f369613dd76d5467730efcbe3b1a22d"));
+        assert_eq!(material.iv, hex12("fa044b2f42a3fd3b46fb255c"));
+        assert_eq!(material.hp, hex16("9f50449e04a0e810283a1e9933adedd2"));
+    }
+
+    #[test]
+    fn reassembles_fragmented_initial_crypto_and_extracts_sni_v1() {
+        assert_fragmented_sni(QUIC_V1);
+    }
+
+    #[test]
+    fn reassembles_fragmented_initial_crypto_and_extracts_sni_v2() {
+        assert_fragmented_sni(QUIC_V2);
+    }
+
+    #[test]
+    fn accepts_identical_overlapping_crypto_retransmission() {
+        let hello = client_hello("overlap.test");
         let dcid = b"01234567";
-        let first = seal_initial(dcid, 1, 0, &hello[..split]);
-        let second = seal_initial(dcid, 2, split as u64, &hello[split..]);
+        let first = seal_initial(QUIC_V1, dcid, 1, 0, &hello[..40], &[]);
+        let second = seal_initial(QUIC_V1, dcid, 2, 20, &hello[20..], &[]);
         let mut inspector = InitialInspector::default();
         assert_eq!(inspector.ingest(&first), InitialSni::NeedMore);
         assert_eq!(
             inspector.ingest(&second),
-            InitialSni::Name("router.test".to_string())
+            InitialSni::Name("overlap.test".to_string())
         );
+    }
+
+    #[test]
+    fn rejects_conflicting_overlapping_crypto() {
+        let mut inspector = InitialInspector::default();
+        inspector.insert_crypto(0, b"abc").unwrap();
+        assert_eq!(inspector.insert_crypto(1, b"Z"), Err(()));
+    }
+
+    #[test]
+    fn accepts_retry_token_on_followup_initial() {
+        let hello = client_hello("retry.test");
+        let packet = seal_initial(QUIC_V1, b"new-dcid", 7, 0, &hello, b"retry-token");
+        let mut inspector = InitialInspector::default();
+        assert_eq!(
+            inspector.ingest(&packet),
+            InitialSni::Name("retry.test".to_string())
+        );
+    }
+
+    #[test]
+    fn skips_ack_ecn_and_transport_close_frames() {
+        let mut ack_ecn = vec![0x03];
+        ack_ecn.extend([0, 0, 0, 0, 0, 0, 0]);
+        let mut at = 1;
+        assert_eq!(skip_ack(&ack_ecn, &mut at, true), Ok(()));
+        assert_eq!(at, ack_ecn.len());
+
+        let close = [0x1c, 0x01, 0x06, 0x03, b'b', b'y', b'e'];
+        let mut at = 1;
+        assert_eq!(skip_transport_close(&close, &mut at), Ok(()));
+        assert_eq!(at, close.len());
     }
 
     #[test]
@@ -307,26 +427,49 @@ mod tests {
         }
     }
 
-    fn seal_initial(dcid: &[u8], packet_number: u64, crypto_offset: u64, crypto: &[u8]) -> Vec<u8> {
+    fn assert_fragmented_sni(version: u32) {
+        let hello = client_hello("router.test");
+        let split = hello.len() / 2;
+        let dcid = b"01234567";
+        let first = seal_initial(version, dcid, 1, 0, &hello[..split], &[]);
+        let second = seal_initial(version, dcid, 2, split as u64, &hello[split..], &[]);
+        let mut inspector = InitialInspector::default();
+        assert_eq!(inspector.ingest(&first), InitialSni::NeedMore);
+        assert_eq!(
+            inspector.ingest(&second),
+            InitialSni::Name("router.test".to_string())
+        );
+    }
+
+    fn seal_initial(
+        version: u32,
+        dcid: &[u8],
+        packet_number: u64,
+        crypto_offset: u64,
+        crypto: &[u8],
+        token: &[u8],
+    ) -> Vec<u8> {
         let mut plain = Vec::new();
         plain.push(0x06); // CRYPTO
         plain.extend(varint(crypto_offset));
         plain.extend(varint(crypto.len() as u64));
         plain.extend_from_slice(crypto);
 
+        let params = version_params(version).unwrap();
         let pn_len = 2usize;
         let length = pn_len + plain.len() + 16;
-        let mut header = vec![0xc1]; // long, fixed bit, Initial, two-byte PN
-        header.extend_from_slice(&QUIC_V1.to_be_bytes());
+        let mut header = vec![0xc1 | params.initial_type];
+        header.extend_from_slice(&version.to_be_bytes());
         header.push(dcid.len() as u8);
         header.extend_from_slice(dcid);
         header.push(0); // SCID length
-        header.push(0); // token length
+        header.extend(varint(token.len() as u64));
+        header.extend_from_slice(token);
         header.extend(varint(length as u64));
         let pn_at = header.len();
         header.extend_from_slice(&(packet_number as u16).to_be_bytes());
 
-        let keys = InitialKeys::client(dcid).unwrap();
+        let keys = InitialKeys::client(version, dcid).unwrap();
         let nonce = keys.nonce(packet_number);
         let mut body = plain;
         let tag = keys
@@ -352,6 +495,26 @@ mod tests {
         } else {
             panic!("test value is too large")
         }
+    }
+
+    fn hex(input: &str) -> Vec<u8> {
+        input
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).unwrap();
+                let lo = (pair[1] as char).to_digit(16).unwrap();
+                ((hi << 4) | lo) as u8
+            })
+            .collect()
+    }
+
+    fn hex16(input: &str) -> [u8; 16] {
+        hex(input).try_into().unwrap()
+    }
+
+    fn hex12(input: &str) -> [u8; 12] {
+        hex(input).try_into().unwrap()
     }
 
     fn client_hello(host: &str) -> Vec<u8> {
