@@ -197,9 +197,7 @@ impl FlowTable {
     /// Short headers do not carry a CID length. Try every legal length against
     /// the CIDs we have learned and accept only one unambiguous owning flow.
     fn short_header_owner(&self, datagram: &[u8]) -> Option<FlowId> {
-        let Some(first) = datagram.first() else {
-            return None;
-        };
+        let first = datagram.first()?;
         if first & 0x80 != 0 || datagram.len() <= 1 {
             return None;
         }
@@ -634,6 +632,15 @@ fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
     }
 }
 
+struct RawFlowContext {
+    listener: Arc<UdpSocket>,
+    flows: Flows,
+    flow_id: FlowId,
+    route: Arc<RouteRuntime>,
+    sni: String,
+    packets: Vec<Vec<u8>>,
+}
+
 async fn spawn_raw_flow(
     listener: Arc<UdpSocket>,
     flows: Flows,
@@ -655,36 +662,37 @@ async fn spawn_raw_flow(
         return;
     }
 
+    let cleanup_flows = flows.clone();
+    let context = RawFlowContext {
+        listener,
+        flows,
+        flow_id,
+        route,
+        sni,
+        packets,
+    };
     tokio::spawn(async move {
-        if let Err(error) = run_raw_flow(
-            listener,
-            flows.clone(),
-            flow_id,
-            route,
-            sni,
-            packets,
-            rx,
-            peer_rx,
-        )
-        .await
-        {
+        if let Err(error) = run_raw_flow(context, rx, peer_rx).await {
             debug!(flow_id, error = %format!("{error:#}"), "QUIC raw flow failed");
         }
-        flows.lock().await.remove(flow_id);
+        cleanup_flows.lock().await.remove(flow_id);
         debug!(flow_id, "QUIC raw flow closed");
     });
 }
 
 async fn run_raw_flow(
-    listener: Arc<UdpSocket>,
-    flows: Flows,
-    flow_id: FlowId,
-    route: Arc<RouteRuntime>,
-    sni: String,
-    packets: Vec<Vec<u8>>,
+    context: RawFlowContext,
     mut rx: mpsc::Receiver<Vec<u8>>,
     peer_rx: watch::Receiver<SocketAddr>,
 ) -> Result<()> {
+    let RawFlowContext {
+        listener,
+        flows,
+        flow_id,
+        route,
+        sni,
+        packets,
+    } = context;
     let host = route
         .upstream_host
         .clone()

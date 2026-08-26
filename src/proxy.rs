@@ -31,7 +31,7 @@
 //!   speaks h2c, but never silently downgrades the route.
 
 #[path = "upstream_certs.rs"]
-mod upstream_certs;
+pub(crate) mod upstream_certs;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

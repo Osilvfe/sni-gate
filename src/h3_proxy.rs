@@ -5,9 +5,6 @@
 //! HTTP/3 request semantics. Request authority is re-routed per stream so H3
 //! connection coalescing can never bypass the listener's route boundaries.
 
-#[path = "upstream_certs.rs"]
-mod upstream_certs;
-
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -20,7 +17,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::config::{RouteType, SniPolicy};
-use crate::proxy::{ListenerState, RouteRuntime};
+use crate::proxy::{upstream_certs, ListenerState, RouteRuntime};
 use crate::resolver::DynamicResolver;
 
 pub async fn serve_inbound(
