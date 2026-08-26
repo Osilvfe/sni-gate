@@ -588,7 +588,20 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                         InspectResult::NeedMore => None,
                         InspectResult::Invalid => {
                             table.remove(id);
-                            debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            if let Some(ingress) = &h3_ingress {
+                                // A live QUIC connection can legitimately send a later Initial
+                                // using connection state that the stateless inspector does not
+                                // possess. Let Quinn, which owns that state, make the authoritative
+                                // validity decision instead of dropping the datagram here.
+                                dispatch_to_h3(ingress, peer, datagram);
+                                debug!(
+                                    %peer,
+                                    flow_id = id,
+                                    "forwarding statelessly-uninspectable QUIC Initial to H3 endpoint"
+                                );
+                            } else {
+                                debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            }
                             None
                         }
                         InspectResult::Routed { sni, packets } => {
@@ -725,10 +738,17 @@ fn start_h3_endpoint(
                             connection.close(0u32.into(), b"route is not HTTP/3");
                             return;
                         }
+                        let diagnostics = connection.clone();
                         if let Err(error) =
                             h3_proxy::serve_inbound(connection, peer, state, route_id, sni).await
                         {
-                            debug!(%peer, error = %format!("{error:#}"), "H3 connection failed");
+                            debug!(
+                                %peer,
+                                error = %format!("{error:#}"),
+                                close_reason = ?diagnostics.close_reason(),
+                                stats = ?diagnostics.stats(),
+                                "H3 connection failed"
+                            );
                         }
                     }
                     Err(error) => {

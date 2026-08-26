@@ -65,7 +65,9 @@ addr = "127.0.0.1:{quic_port}"
     // above Quinn's 1,472-byte default: the shared endpoint must accept it into
     // Quinn's receive contract and let QUIC discard the garbage packet without
     // turning it into a fatal socket error.
-    let oversized = vec![0u8; 60_000];
+    // Stay above the historical 1,472-byte cap while remaining portable to
+    // macOS, whose default UDP socket limit rejects very large loopback payloads.
+    let oversized = vec![0u8; 8 * 1024];
     let attacker = UdpSocket::bind("127.0.0.1:0").expect("bind attacker UDP socket");
     for _ in 0..5 {
         attacker
