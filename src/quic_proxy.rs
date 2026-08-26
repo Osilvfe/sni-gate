@@ -1,9 +1,9 @@
 //! QUIC listener, including raw SNI-routed UDP forwarding and H3 dispatch.
 
-#[path = "quic_socket.rs"]
-mod quic_socket;
 #[path = "h3_proxy.rs"]
 mod h3_proxy;
+#[path = "quic_socket.rs"]
+mod quic_socket;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -383,7 +383,10 @@ impl FlowTable {
 enum InspectResult {
     NeedMore,
     Invalid,
-    Routed { sni: String, packets: Vec<Vec<u8>> },
+    Routed {
+        sni: String,
+        packets: Vec<Vec<u8>>,
+    },
 }
 
 /// Serve one UDP/QUIC listener.
@@ -559,8 +562,8 @@ fn start_h3_endpoint(
     let quic_crypto = QuicServerConfig::try_from(server_crypto)
         .context("converting H3 rustls config to Quinn server crypto")?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let (socket, ingress) = SharedQuicSocket::new(listener)
-        .context("initializing shared Quinn UDP socket")?;
+    let (socket, ingress) =
+        SharedQuicSocket::new(listener).context("initializing shared Quinn UDP socket")?;
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         Some(server_config),
@@ -577,11 +580,9 @@ fn start_h3_endpoint(
                 let peer = incoming.remote_address();
                 match incoming.await {
                     Ok(connection) => {
-                        let handshake = connection
-                            .handshake_data()
-                            .and_then(|data| {
-                                data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
-                            });
+                        let handshake = connection.handshake_data().and_then(|data| {
+                            data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
+                        });
                         let sni = handshake
                             .as_ref()
                             .and_then(|data| data.server_name.as_deref())
@@ -607,14 +608,8 @@ fn start_h3_endpoint(
                             connection.close(0u32.into(), b"route is not HTTP/3");
                             return;
                         }
-                        if let Err(error) = h3_proxy::serve_inbound(
-                            connection,
-                            peer,
-                            state,
-                            route_id,
-                            sni,
-                        )
-                        .await
+                        if let Err(error) =
+                            h3_proxy::serve_inbound(connection, peer, state, route_id, sni).await
                         {
                             debug!(%peer, error = %format!("{error:#}"), "H3 connection failed");
                         }
