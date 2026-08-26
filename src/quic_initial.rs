@@ -147,7 +147,7 @@ impl InitialInspector {
                 }
             } else {
                 self.crypto[pos] = byte;
-                self.present.set(pos, true);
+                self.present[pos] = true;
             }
         }
         Ok(())
