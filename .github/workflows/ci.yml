@@ -46,14 +46,14 @@ jobs:
               "loop {",
               indent + "    let resolver = match inbound.accept().await {",
               indent + "        Ok(Some(resolver)) => resolver,",
-              indent + "        Ok(None) => return Ok::<(), anyhow::Error>(()),",
+              indent + "        Ok(None) => break,",
               indent + "        Err(error) if error.is_h3_no_error() => {",
               indent + "            debug!(",
               indent + "                %peer,",
               indent + "                route = %context.route_name,",
               indent + '                "H3 connection closed normally"',
               indent + "            );",
-              indent + "            return Ok::<(), anyhow::Error>(());",
+              indent + "            break;",
               indent + "        }",
               indent + "        Err(error) => {",
               indent + '            return Err(error).context("accepting HTTP/3 request");',
@@ -61,20 +61,6 @@ jobs:
               indent + "    };",
           ])
           text = text.replace(needle, replacement, 1)
-
-          ok_line = "Ok::<(), anyhow::Error>(())"
-          if text.count(ok_line) != 2:
-              # one is the new normal-close arm; the other is the old loop-tail
-              raise SystemExit(f"unexpected H3 Ok marker count: {text.count(ok_line)}")
-          tail_pattern = re.compile(r'(?m)^\s*Ok::<\(\), anyhow::Error>\(\(\)\)\s*$')
-          matches = list(tail_pattern.finditer(text))
-          if len(matches) != 1:
-              # The normal-close arm has a trailing semicolon and does not match.
-              raise SystemExit(f"H3 loop tail mismatch: {len(matches)}")
-          start, end = matches[0].span()
-          if end < len(text) and text[end:end+1] == "\n":
-              end += 1
-          text = text[:start] + text[end:]
 
           upstream_pattern = re.compile(
               r'(?m)^(\s*)let error = poll_fn\(\|cx\| driver\.poll_close\(cx\)\)\.await;\n'
