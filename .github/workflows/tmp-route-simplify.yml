@@ -25,7 +25,18 @@ jobs:
           components: rustfmt, clippy
 
       - name: Apply configuration model simplification
-        run: python scripts/tmp_route_simplify.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("README.md")
+          text = p.read_text()
+          old = 'For `type = "ech"` and `type = "h3-ech"` routes, the ECHConfigList is sourced by\n'
+          new = 'For `type = "ech"` routes on TCP or QUIC, the ECHConfigList is sourced by\n'
+          if text.count(old) != 1:
+              raise SystemExit(f"README ECH wording: expected one match, found {text.count(old)}")
+          p.write_text(text.replace(old, new, 1))
+          PY
+          python scripts/tmp_route_simplify.py
 
       - name: Format
         run: cargo fmt --all
