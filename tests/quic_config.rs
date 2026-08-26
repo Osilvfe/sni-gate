@@ -106,6 +106,48 @@ transport = "quic"
 }
 
 #[test]
+fn canonical_h3_ech_route_spelling_is_accepted() {
+    let cfg = load(
+        r#"
+[[listener]]
+addr = "127.0.0.1:8443"
+transport = "quic"
+  [[listener.route]]
+  name = "web-h3-ech"
+  type = "h3-ech"
+  match_sni = ["h3-ech.example"]
+"#,
+    )
+    .expect("h3-ech is the canonical QUIC ECH route spelling");
+
+    assert_eq!(
+        cfg.listeners[0].routes[0].route_type,
+        Some(RouteType::H3Ech)
+    );
+}
+
+#[test]
+fn legacy_h3ech_route_spelling_remains_accepted() {
+    let cfg = load(
+        r#"
+[[listener]]
+addr = "127.0.0.1:8443"
+transport = "quic"
+  [[listener.route]]
+  name = "legacy-h3-ech"
+  type = "h3ech"
+  match_sni = ["legacy-h3-ech.example"]
+"#,
+    )
+    .expect("legacy h3ech spelling should remain backward compatible");
+
+    assert_eq!(
+        cfg.listeners[0].routes[0].route_type,
+        Some(RouteType::H3Ech)
+    );
+}
+
+#[test]
 fn tcp_listener_rejects_h3_route() {
     let error = load(
         r#"
