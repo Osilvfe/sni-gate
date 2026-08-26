@@ -383,10 +383,7 @@ impl FlowTable {
 enum InspectResult {
     NeedMore,
     Invalid,
-    Routed {
-        sni: String,
-        packets: Vec<Vec<u8>>,
-    },
+    Routed { sni: String, packets: Vec<Vec<u8>> },
 }
 
 /// Serve one UDP/QUIC listener.
