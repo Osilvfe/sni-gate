@@ -1,12 +1,11 @@
 name: tmp-h3-followup-initial
 on:
   push:
-    branches:
-      - tmp/h3-followup-initial
+    branches: [tmp/h3-followup-initial]
 permissions:
   contents: write
 jobs:
-  patch:
+  patch-test-commit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -14,12 +13,12 @@ jobs:
           ref: tmp/h3-followup-initial
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
-      - name: Apply patch
+      - name: Patch follow-up Initial handling
+        shell: python
         run: |
-          cat > /tmp/patch.py <<'PY'
           from pathlib import Path
 
-          p = Path("src/quic_proxy.rs")
+          p = Path('src/quic_proxy.rs')
           s = p.read_text()
           old = '''                        InspectResult::Invalid => {
                             table.remove(id);
@@ -47,7 +46,7 @@ jobs:
                         }
 '''
           if old not in s:
-              raise SystemExit("invalid Initial arm anchor missing")
+              raise SystemExit('invalid Initial arm anchor missing')
           s = s.replace(old, new, 1)
 
           old = '''                        if let Err(error) =
@@ -70,30 +69,26 @@ jobs:
                         }
 '''
           if old not in s:
-              raise SystemExit("H3 diagnostics anchor missing")
+              raise SystemExit('H3 diagnostics anchor missing')
           s = s.replace(old, new, 1)
           p.write_text(s)
 
-          p = Path("tests/quic_h3_resilience.rs")
+          p = Path('tests/quic_h3_resilience.rs')
           s = p.read_text()
-          old = '''    let oversized = vec![0u8; 60_000];
-'''
-          new = '''    // Stay above the historical 1,472-byte cap while remaining portable to
-    // macOS, whose default UDP socket limit rejects very large loopback payloads.
-    let oversized = vec![0u8; 8 * 1024];
-'''
+          old = '    let oversized = vec![0u8; 60_000];\n'
+          new = ('    // Stay above the historical 1,472-byte cap while remaining portable to\n'
+                 '    // macOS, whose default UDP socket limit rejects very large loopback payloads.\n'
+                 '    let oversized = vec![0u8; 8 * 1024];\n')
           if old not in s:
-              raise SystemExit("oversized test anchor missing")
+              raise SystemExit('oversized test anchor missing')
           s = s.replace(old, new, 1)
           p.write_text(s)
-          PY
-          python3 /tmp/patch.py
       - run: cargo fmt --all
-      - name: Focused tests
+      - name: Focused regression tests
         run: cargo test --locked --test quic_h3_resilience --test http23_auto_e2e
-      - name: Clippy
+      - name: Clippy affected targets
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Commit patch
+      - name: Commit generated patch
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
