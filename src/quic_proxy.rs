@@ -27,6 +27,7 @@ const MAX_INITIAL_DATAGRAMS: usize = 8;
 const MAX_INITIAL_BYTES: usize = 32 * 1024;
 const MAX_FLOWS: usize = 4096;
 const MAX_CID_LEN: usize = 20;
+const MAX_CIDS_PER_FLOW: usize = 32;
 const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOW_QUEUE: usize = 128;
 const UDP_BUF: usize = 65_535;
@@ -40,7 +41,13 @@ struct FlowTable {
     next_id: FlowId,
     entries: HashMap<FlowId, FlowEntry>,
     peers: HashMap<SocketAddr, HashSet<FlowId>>,
-    cids: HashMap<Vec<u8>, HashSet<FlowId>>,
+    /// CIDs accepted for long-header lookup. This contains the client's one
+    /// initial DCID plus server-issued SCIDs observed from the configured
+    /// upstream. It is deliberately not expanded from arbitrary client packets.
+    routing_cids: HashMap<Vec<u8>, HashSet<FlowId>>,
+    /// Only server-issued CIDs are eligible for short-header matching. A
+    /// client-chosen Initial DCID must never become a short-header prefix token.
+    short_cids: HashMap<Vec<u8>, HashSet<FlowId>>,
 }
 
 impl Default for FlowTable {
@@ -49,14 +56,16 @@ impl Default for FlowTable {
             next_id: 1,
             entries: HashMap::new(),
             peers: HashMap::new(),
-            cids: HashMap::new(),
+            routing_cids: HashMap::new(),
+            short_cids: HashMap::new(),
         }
     }
 }
 
 struct FlowEntry {
     peer: SocketAddr,
-    cids: HashSet<Vec<u8>>,
+    routing_cids: HashSet<Vec<u8>>,
+    short_cids: HashSet<Vec<u8>>,
     state: FlowState,
 }
 
@@ -156,10 +165,11 @@ impl FlowTable {
 
     /// Resolve a client datagram to an existing flow.
     ///
-    /// CID lookup wins over the source UDP address. That is required both for
-    /// NAT rebinding and for multiple QUIC connections sharing one client UDP
-    /// socket. An unknown Initial is deliberately *not* address-fallback routed:
-    /// it starts a new connection even when the same peer already has another.
+    /// Known CID lookup wins over the source UDP address. Unknown long headers
+    /// never fall back to the peer address: accepting one that way would let a
+    /// client continuously invent DCIDs and poison the flow's ownership state.
+    /// Peer fallback is reserved for raw-only short-header traffic, whose CID
+    /// length is not encoded on the wire.
     fn flow_id_for(
         &self,
         peer: SocketAddr,
@@ -167,13 +177,9 @@ impl FlowTable {
         allow_peer_fallback: bool,
     ) -> Option<FlowId> {
         if let Some(header) = LongHeader::parse(datagram) {
-            if let Some(id) = self.unique_cid_owner(header.dcid) {
-                return Some(id);
-            }
-            if header.is_initial() {
-                return None;
-            }
-        } else if let Some(id) = self.short_header_owner(datagram) {
+            return self.unique_routing_cid_owner(header.dcid);
+        }
+        if let Some(id) = self.short_header_owner(datagram) {
             return Some(id);
         }
         allow_peer_fallback
@@ -181,11 +187,11 @@ impl FlowTable {
             .flatten()
     }
 
-    fn unique_cid_owner(&self, cid: &[u8]) -> Option<FlowId> {
+    fn unique_routing_cid_owner(&self, cid: &[u8]) -> Option<FlowId> {
         if cid.is_empty() {
             return None;
         }
-        let owners = self.cids.get(cid)?;
+        let owners = self.routing_cids.get(cid)?;
         (owners.len() == 1).then(|| *owners.iter().next().expect("one CID owner"))
     }
 
@@ -195,7 +201,7 @@ impl FlowTable {
     }
 
     /// Short headers do not carry a CID length. Try every legal length against
-    /// the CIDs we have learned and accept only one unambiguous owning flow.
+    /// server-issued CIDs only and accept one unambiguous owning flow.
     fn short_header_owner(&self, datagram: &[u8]) -> Option<FlowId> {
         let first = datagram.first()?;
         if first & 0x80 != 0 || datagram.len() <= 1 {
@@ -204,7 +210,7 @@ impl FlowTable {
         let mut candidate = None;
         let max = MAX_CID_LEN.min(datagram.len() - 1);
         for len in 1..=max {
-            let Some(owners) = self.cids.get(&datagram[1..1 + len]) else {
+            let Some(owners) = self.short_cids.get(&datagram[1..1 + len]) else {
                 continue;
             };
             if owners.len() != 1 {
@@ -232,13 +238,14 @@ impl FlowTable {
             id,
             FlowEntry {
                 peer,
-                cids: HashSet::new(),
+                routing_cids: HashSet::new(),
+                short_cids: HashSet::new(),
                 state: FlowState::Inspecting(InspectingFlow::new(now)),
             },
         );
         self.peers.entry(peer).or_default().insert(id);
         if let Some(cid) = initial_dcid {
-            self.add_cid(id, cid);
+            self.add_routing_cid(id, cid, false);
         }
         id
     }
@@ -277,32 +284,35 @@ impl FlowTable {
         true
     }
 
-    fn add_cid(&mut self, id: FlowId, cid: &[u8]) {
+    fn add_routing_cid(&mut self, id: FlowId, cid: &[u8], short_header: bool) {
         if cid.is_empty() || cid.len() > MAX_CID_LEN {
             return;
         }
-        let inserted = self
-            .entries
-            .get_mut(&id)
-            .is_some_and(|entry| entry.cids.insert(cid.to_vec()));
-        if inserted {
-            self.cids.entry(cid.to_vec()).or_default().insert(id);
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        let already_known = entry.routing_cids.contains(cid);
+        if !already_known && entry.routing_cids.len() >= MAX_CIDS_PER_FLOW {
+            return;
         }
-    }
-
-    /// A client long-header DCID is a server-side routing CID. Record it while
-    /// the source address is still known so a later address change can use it.
-    fn observe_client_datagram(&mut self, id: FlowId, datagram: &[u8]) {
-        if let Some(header) = LongHeader::parse(datagram) {
-            self.add_cid(id, header.dcid);
+        let inserted = entry.routing_cids.insert(cid.to_vec());
+        if inserted {
+            self.routing_cids
+                .entry(cid.to_vec())
+                .or_default()
+                .insert(id);
+        }
+        if short_header && entry.short_cids.insert(cid.to_vec()) {
+            self.short_cids.entry(cid.to_vec()).or_default().insert(id);
         }
     }
 
     /// A server long-header SCID is a CID the client can use as its future DCID.
-    /// This is the most important CID learned during the handshake.
+    /// Upstream packets arrive through a connected UDP socket, so this is the
+    /// only dynamic CID-learning direction trusted by the raw flow table.
     fn observe_upstream_datagram(&mut self, id: FlowId, datagram: &[u8]) {
         if let Some(header) = LongHeader::parse(datagram) {
-            self.add_cid(id, header.scid);
+            self.add_routing_cid(id, header.scid, true);
         }
     }
 
@@ -346,15 +356,26 @@ impl FlowTable {
         if remove_peer {
             self.peers.remove(&entry.peer);
         }
-        for cid in entry.cids {
-            let remove_cid = if let Some(ids) = self.cids.get_mut(&cid) {
+        for cid in entry.routing_cids {
+            let remove_cid = if let Some(ids) = self.routing_cids.get_mut(&cid) {
                 ids.remove(&id);
                 ids.is_empty()
             } else {
                 false
             };
             if remove_cid {
-                self.cids.remove(&cid);
+                self.routing_cids.remove(&cid);
+            }
+        }
+        for cid in entry.short_cids {
+            let remove_cid = if let Some(ids) = self.short_cids.get_mut(&cid) {
+                ids.remove(&id);
+                ids.is_empty()
+            } else {
+                false
+            };
+            if remove_cid {
+                self.short_cids.remove(&cid);
             }
         }
     }
@@ -439,7 +460,6 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             if table.migrate_peer(id, peer) {
                 debug!(%peer, flow_id = id, "QUIC flow client address changed");
             }
-            table.observe_client_datagram(id, datagram);
 
             if let Some(tx) = table.forwarding_sender(id) {
                 Some((id, Some(tx), None))
@@ -624,7 +644,7 @@ fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
     match ingress.try_send(peer, datagram) {
         Ok(()) => {}
         Err(TrySendError::Full(InboundDatagram { .. })) => {
-            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full");
+            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full or packet is oversized");
         }
         Err(TrySendError::Closed(InboundDatagram { .. })) => {
             debug!(%peer, "dropping QUIC datagram because H3 endpoint is closed");
@@ -791,18 +811,20 @@ mod tests {
     }
 
     #[test]
-    fn known_cid_rebinds_forwarding_flow_to_new_peer() {
+    fn known_server_cid_rebinds_forwarding_flow_to_new_peer() {
         let now = Instant::now();
         let old_peer: SocketAddr = "127.0.0.1:2000".parse().unwrap();
         let new_peer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        let dcid = b"server01";
         let mut flows = FlowTable::default();
-        let id = flows.insert_inspecting(old_peer, now, Some(dcid));
+        let id = flows.insert_inspecting(old_peer, now, Some(b"initial1"));
+        let server_cid = b"server01";
+        let response = long_header(QUIC_V1, 0xc0, b"client01", server_cid);
+        flows.observe_upstream_datagram(id, &response);
         let (tx, _rx) = mpsc::channel(1);
         let (peer_tx, peer_rx) = watch::channel(old_peer);
         assert!(flows.promote(id, tx, peer_tx));
 
-        let packet = long_header(QUIC_V1, 0xc0, dcid, b"client01");
+        let packet = long_header(QUIC_V1, 0xe0, server_cid, b"client02");
         assert_eq!(flows.flow_id_for(new_peer, &packet, true), Some(id));
         assert!(flows.migrate_peer(id, new_peer));
         assert_eq!(*peer_rx.borrow(), new_peer);
@@ -822,6 +844,28 @@ mod tests {
     }
 
     #[test]
+    fn unknown_non_initial_long_header_does_not_peer_fallback() {
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:4500".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let _ = flows.insert_inspecting(peer, now, Some(b"firstcid"));
+
+        let unknown = long_header(QUIC_V1, 0xe0, b"invented", b"client03");
+        assert_eq!(flows.flow_id_for(peer, &unknown, true), None);
+    }
+
+    #[test]
+    fn client_initial_cid_is_not_eligible_for_short_header_matching() {
+        let peer: SocketAddr = "127.0.0.1:4700".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let _ = flows.insert_inspecting(peer, Instant::now(), Some(b"clientcid"));
+        let mut short = vec![0x40];
+        short.extend_from_slice(b"clientcid");
+        short.extend_from_slice(b"ciphertext");
+        assert_eq!(flows.short_header_owner(&short), None);
+    }
+
+    #[test]
     fn upstream_scid_routes_short_header_after_rebinding() {
         let now = Instant::now();
         let old_peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
@@ -836,6 +880,25 @@ mod tests {
         short.extend_from_slice(server_cid);
         short.extend_from_slice(b"ciphertext");
         assert_eq!(flows.flow_id_for(new_peer, &short, true), Some(id));
+    }
+
+    #[test]
+    fn learned_cids_are_bounded_per_flow() {
+        let peer: SocketAddr = "127.0.0.1:6250".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let id = flows.insert_inspecting(peer, Instant::now(), Some(b"initial1"));
+
+        for value in 0u8..100 {
+            let scid = [value; 8];
+            let response = long_header(QUIC_V1, 0xc0, b"client04", &scid);
+            flows.observe_upstream_datagram(id, &response);
+        }
+
+        let entry = flows.entries.get(&id).unwrap();
+        assert_eq!(entry.routing_cids.len(), MAX_CIDS_PER_FLOW);
+        assert_eq!(entry.short_cids.len(), MAX_CIDS_PER_FLOW - 1);
+        assert_eq!(flows.routing_cids.len(), MAX_CIDS_PER_FLOW);
+        assert_eq!(flows.short_cids.len(), MAX_CIDS_PER_FLOW - 1);
     }
 
     #[test]
