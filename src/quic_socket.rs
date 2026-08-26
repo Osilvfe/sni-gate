@@ -99,9 +99,7 @@ impl AsyncUdpSocket for SharedQuicSocket {
         let mut rx = match self.rx.lock() {
             Ok(rx) => rx,
             Err(_) => {
-                return Poll::Ready(Err(io::Error::other(
-                    "shared QUIC receive queue poisoned",
-                )))
+                return Poll::Ready(Err(io::Error::other("shared QUIC receive queue poisoned")))
             }
         };
         match Pin::new(&mut *rx).poll_recv(cx) {
