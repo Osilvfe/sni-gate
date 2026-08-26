@@ -25,6 +25,16 @@ use crate::router::Router;
 #[path = "h3_proxy/tests.rs"]
 mod tests;
 
+#[derive(Clone)]
+struct H3ProxyContext {
+    router: Arc<Router>,
+    handshake_route: usize,
+    handshake_sni: String,
+    route_name: String,
+    reflects_dial_host: bool,
+    reflects_server_name: bool,
+}
+
 pub async fn serve_inbound(
     connection: quinn::Connection,
     peer: SocketAddr,
@@ -37,37 +47,27 @@ pub async fn serve_inbound(
         .get(handshake_route)
         .cloned()
         .ok_or_else(|| anyhow!("invalid H3 route index {handshake_route}"))?;
-    let reflects_dial_host = route.upstream_host.is_none();
-    let reflects_server_name = matches!(route.sni_policy, SniPolicy::Reflect | SniPolicy::Omit);
+    let context = H3ProxyContext {
+        router: state.router.clone(),
+        handshake_route,
+        handshake_sni: handshake_sni.clone(),
+        route_name: route.name.clone(),
+        reflects_dial_host: route.upstream_host.is_none(),
+        reflects_server_name: matches!(route.sni_policy, SniPolicy::Reflect | SniPolicy::Omit),
+    };
 
     let upstream = connect_upstream_h3(&route, &handshake_sni, peer, &state.cert_resolver).await?;
-    proxy_inbound_h3(
-        connection,
-        peer,
-        state.router.clone(),
-        handshake_route,
-        handshake_sni,
-        route.name.clone(),
-        reflects_dial_host,
-        reflects_server_name,
-        upstream,
-    )
-    .await
+    proxy_inbound_h3_inner(connection, peer, context, upstream).await
 }
 
 /// Proxy an established inbound HTTP/3 connection through an already-created
 /// upstream HTTP/3 client connection. Keeping transport establishment separate
 /// from request semantics makes the latter independently testable without
 /// weakening production certificate verification.
-async fn proxy_inbound_h3(
+async fn proxy_inbound_h3_inner(
     connection: quinn::Connection,
     peer: SocketAddr,
-    router: Arc<Router>,
-    handshake_route: usize,
-    handshake_sni: String,
-    route_name: String,
-    reflects_dial_host: bool,
-    reflects_server_name: bool,
+    context: H3ProxyContext,
     upstream: UpstreamH3,
 ) -> Result<()> {
     let quic = h3_quinn::Connection::new(connection);
@@ -76,9 +76,7 @@ async fn proxy_inbound_h3(
         .context("starting inbound HTTP/3 connection")?;
 
     while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
-        let router = router.clone();
-        let sni = handshake_sni.clone();
-        let route_name = route_name.clone();
+        let context = context.clone();
         let mut sender = upstream.sender.clone();
         tokio::spawn(async move {
             let result = async {
@@ -91,24 +89,24 @@ async fn proxy_inbound_h3(
                     .uri()
                     .authority()
                     .map(|authority| authority.host())
-                    .unwrap_or(sni.as_str());
-                let request_route = router.match_host(authority);
+                    .unwrap_or(context.handshake_sni.as_str());
+                let request_route = context.router.match_host(authority);
                 if !authority_reuses_upstream(
                     request_route,
-                    handshake_route,
+                    context.handshake_route,
                     authority,
-                    &sni,
-                    reflects_dial_host,
-                    reflects_server_name,
+                    &context.handshake_sni,
+                    context.reflects_dial_host,
+                    context.reflects_server_name,
                 ) {
                     debug!(
                         %peer,
-                        sni = %sni,
+                        sni = %context.handshake_sni,
                         %authority,
-                        handshake_route,
+                        handshake_route = context.handshake_route,
                         request_route = ?request_route,
-                        reflects_dial_host,
-                        reflects_server_name,
+                        reflects_dial_host = context.reflects_dial_host,
+                        reflects_server_name = context.reflects_server_name,
                         "rejecting coalesced H3 request that would change upstream identity"
                     );
                     return empty_response(stream, StatusCode::MISDIRECTED_REQUEST).await;
@@ -116,7 +114,7 @@ async fn proxy_inbound_h3(
 
                 debug!(
                     %peer,
-                    route = %route_name,
+                    route = %context.route_name,
                     %authority,
                     method = %request.method(),
                     "forwarding HTTP/3 request"
@@ -132,7 +130,7 @@ async fn proxy_inbound_h3(
             if let Err(error) = result {
                 warn!(
                     %peer,
-                    route = %route_name,
+                    route = %context.route_name,
                     error = %format!("{error:#}"),
                     "HTTP/3 request failed"
                 );
@@ -140,6 +138,35 @@ async fn proxy_inbound_h3(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn proxy_inbound_h3(
+    connection: quinn::Connection,
+    peer: SocketAddr,
+    router: Arc<Router>,
+    handshake_route: usize,
+    handshake_sni: String,
+    route_name: String,
+    reflects_dial_host: bool,
+    reflects_server_name: bool,
+    upstream: UpstreamH3,
+) -> Result<()> {
+    proxy_inbound_h3_inner(
+        connection,
+        peer,
+        H3ProxyContext {
+            router,
+            handshake_route,
+            handshake_sni,
+            route_name,
+            reflects_dial_host,
+            reflects_server_name,
+        },
+        upstream,
+    )
+    .await
 }
 
 /// Whether a request on an already-established inbound H3 connection can reuse
@@ -352,7 +379,7 @@ async fn connect_ech_quinn(
     }
 }
 
-/// Quinn 0.11.11 / quinn-proto 0.11.15 flatten the rustls handshake error into
+/// Quinn 0.11.11 / quinn-proto 0.11.x flatten the rustls handshake error into
 /// a QUIC transport error and retain only its human-readable reason. Keep the
 /// matching deliberately narrow so unrelated TLS failures are never retried as
 /// ECH rotations. A successful real-ECH rustls handshake is necessarily ECH-
