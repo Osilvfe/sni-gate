@@ -1,0 +1,272 @@
+use std::collections::HashMap;
+use std::future::poll_fn;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::{Buf, Bytes};
+use http::{HeaderMap, Request, Response, StatusCode};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use tokio::time::timeout;
+
+use super::{proxy_inbound_h3, Router, UpstreamH3};
+
+const FRONT_SNI: &str = "front.h3.test";
+const UPSTREAM_SNI: &str = "upstream.h3.test";
+const OTHER_SNI: &str = "other.h3.test";
+const REQUEST_BODY: &[u8] = b"request-through-h3-proxy";
+const RESPONSE_BODY: &[u8] = b"response-through-h3-proxy";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
+        FRONT_SNI.to_string(),
+        UPSTREAM_SNI.to_string(),
+    ])
+    .expect("generate H3 test certificate");
+    let cert_der = cert.der().clone();
+    let key_der = signing_key.serialize_der();
+
+    let upstream_endpoint = quinn::Endpoint::server(
+        h3_server_config(cert_der.clone(), key_der.clone()),
+        localhost_ephemeral(),
+    )
+    .expect("bind upstream H3 server");
+    let upstream_addr = upstream_endpoint.local_addr().unwrap();
+    let upstream_server = tokio::spawn({
+        let endpoint = upstream_endpoint.clone();
+        async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("upstream QUIC connection")
+                .await
+                .expect("upstream QUIC handshake");
+            let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+                .await
+                .expect("start upstream H3 server");
+
+            let resolver = h3
+                .accept()
+                .await
+                .expect("accept upstream H3 request")
+                .expect("one upstream H3 request");
+            let (request, mut stream) = resolver
+                .resolve_request()
+                .await
+                .expect("resolve upstream H3 request");
+            assert_eq!(request.method(), http::Method::POST);
+            assert_eq!(request.uri().authority().unwrap().as_str(), FRONT_SNI);
+            assert_eq!(request.headers()["x-request-header"], "preserved");
+
+            let mut request_body = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.expect("read request data") {
+                request_body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            }
+            assert_eq!(request_body, REQUEST_BODY);
+            let request_trailers = stream
+                .recv_trailers()
+                .await
+                .expect("read request trailers")
+                .expect("request trailers present");
+            assert_eq!(request_trailers["x-request-trailer"], "preserved");
+
+            let response = Response::builder()
+                .status(StatusCode::CREATED)
+                .header("x-response-header", "preserved")
+                .body(())
+                .unwrap();
+            stream
+                .send_response(response)
+                .await
+                .expect("send upstream response headers");
+            stream
+                .send_data(Bytes::from_static(RESPONSE_BODY))
+                .await
+                .expect("send upstream response body");
+            let mut response_trailers = HeaderMap::new();
+            response_trailers.insert("x-response-trailer", "preserved".parse().unwrap());
+            stream
+                .send_trailers(response_trailers)
+                .await
+                .expect("send upstream response trailers");
+
+            assert!(
+                timeout(Duration::from_millis(500), h3.accept())
+                    .await
+                    .is_err(),
+                "cross-route request must not reach the upstream H3 connection"
+            );
+        }
+    });
+
+    let upstream_client_endpoint =
+        quinn::Endpoint::client(localhost_ephemeral()).expect("bind proxy upstream client");
+    let upstream_connection = upstream_client_endpoint
+        .connect_with(
+            h3_client_config(cert_der.clone()),
+            upstream_addr,
+            UPSTREAM_SNI,
+        )
+        .expect("start proxy upstream QUIC connection")
+        .await
+        .expect("proxy upstream QUIC handshake");
+    let (mut upstream_driver, upstream_sender) =
+        h3::client::new(h3_quinn::Connection::new(upstream_connection))
+            .await
+            .expect("start proxy upstream H3 client");
+    let upstream_driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| upstream_driver.poll_close(cx)).await;
+    });
+    let upstream = UpstreamH3 {
+        _endpoint: upstream_client_endpoint,
+        sender: upstream_sender,
+    };
+
+    let gateway_endpoint = quinn::Endpoint::server(
+        h3_server_config(cert_der.clone(), key_der),
+        localhost_ephemeral(),
+    )
+    .expect("bind gateway H3 server");
+    let gateway_addr = gateway_endpoint.local_addr().unwrap();
+    let router = Arc::new(
+        Router::build(
+            &[
+                vec![FRONT_SNI.to_string()],
+                vec![OTHER_SNI.to_string()],
+            ],
+            None,
+            &HashMap::new(),
+        )
+        .expect("build H3 test router"),
+    );
+    let gateway_task = tokio::spawn({
+        let endpoint = gateway_endpoint.clone();
+        async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("inbound QUIC connection")
+                .await
+                .expect("inbound QUIC handshake");
+            let peer = connection.remote_address();
+            proxy_inbound_h3(
+                connection,
+                peer,
+                router,
+                0,
+                FRONT_SNI.to_string(),
+                "h3-test".to_string(),
+                upstream,
+            )
+            .await
+            .expect("proxy inbound H3 connection");
+        }
+    });
+
+    let client_endpoint =
+        quinn::Endpoint::client(localhost_ephemeral()).expect("bind H3 test client");
+    let connection = client_endpoint
+        .connect_with(h3_client_config(cert_der), gateway_addr, FRONT_SNI)
+        .expect("start inbound QUIC connection")
+        .await
+        .expect("inbound QUIC handshake");
+    let close_handle = connection.clone();
+    let (mut client_driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("start inbound H3 client");
+    let client_driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| client_driver.poll_close(cx)).await;
+    });
+
+    let request = Request::post(format!("https://{FRONT_SNI}/upload"))
+        .header("x-request-header", "preserved")
+        .body(())
+        .unwrap();
+    let mut stream = sender
+        .send_request(request)
+        .await
+        .expect("send proxied H3 request");
+    stream
+        .send_data(Bytes::from_static(REQUEST_BODY))
+        .await
+        .expect("send proxied H3 body");
+    let mut request_trailers = HeaderMap::new();
+    request_trailers.insert("x-request-trailer", "preserved".parse().unwrap());
+    stream
+        .send_trailers(request_trailers)
+        .await
+        .expect("send proxied H3 trailers");
+
+    let response = stream
+        .recv_response()
+        .await
+        .expect("receive proxied H3 response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers()["x-response-header"], "preserved");
+    let mut response_body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.expect("read response data") {
+        response_body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+    assert_eq!(response_body, RESPONSE_BODY);
+    let response_trailers = stream
+        .recv_trailers()
+        .await
+        .expect("read response trailers")
+        .expect("response trailers present");
+    assert_eq!(response_trailers["x-response-trailer"], "preserved");
+
+    let blocked = Request::get(format!("https://{OTHER_SNI}/blocked"))
+        .body(())
+        .unwrap();
+    let mut blocked_stream = sender
+        .send_request(blocked)
+        .await
+        .expect("send cross-route H3 request");
+    blocked_stream.finish().await.expect("finish blocked request");
+    let blocked_response = blocked_stream
+        .recv_response()
+        .await
+        .expect("receive 421 response");
+    assert_eq!(blocked_response.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert!(blocked_stream
+        .recv_data()
+        .await
+        .expect("read empty 421 body")
+        .is_none());
+
+    drop(sender);
+    close_handle.close(0u32.into(), b"test complete");
+    upstream_server.await.expect("upstream H3 task");
+    let _ = timeout(Duration::from_secs(2), gateway_task).await;
+    upstream_driver_task.abort();
+    client_driver_task.abort();
+}
+
+fn localhost_ephemeral() -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)
+}
+
+fn h3_server_config(cert: CertificateDer<'static>, key_der: Vec<u8>) -> quinn::ServerConfig {
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], PrivatePkcs8KeyDer::from(key_der).into())
+        .expect("build H3 rustls server config");
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let crypto = QuicServerConfig::try_from(tls).expect("build H3 Quinn server crypto");
+    quinn::ServerConfig::with_crypto(Arc::new(crypto))
+}
+
+fn h3_client_config(cert: CertificateDer<'static>) -> quinn::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).expect("trust H3 test certificate");
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let crypto = QuicClientConfig::try_from(tls).expect("build H3 Quinn client crypto");
+    quinn::ClientConfig::new(Arc::new(crypto))
+}

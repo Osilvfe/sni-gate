@@ -21,6 +21,9 @@ use crate::proxy::{upstream_certs, ListenerState, RouteRuntime};
 use crate::resolver::DynamicResolver;
 use crate::router::Router;
 
+#[cfg(test)]
+mod tests;
+
 pub async fn serve_inbound(
     connection: quinn::Connection,
     peer: SocketAddr,
