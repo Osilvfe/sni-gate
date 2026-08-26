@@ -583,6 +583,7 @@ async fn run_raw_flow(
         upstream.send(packet).await?;
     }
 
+    let peer = *peer_rx.borrow();
     info!(flow_id, %peer, route = %route.name, upstream = %upstream_addr, "QUIC raw flow established");
     let idle = route.idle_timeout;
     let mut buf = vec![0u8; UDP_BUF];
@@ -636,8 +637,7 @@ mod tests {
         let mut flows = FlowTable::default();
         let stale_id = flows.insert_inspecting("127.0.0.1:1000".parse().unwrap(), stale, None);
         let live_id = flows.insert_inspecting("127.0.0.1:1001".parse().unwrap(), now, None);
-        let forwarding_id =
-            flows.insert_inspecting("127.0.0.1:1002".parse().unwrap(), now, None);
+        let forwarding_id = flows.insert_inspecting("127.0.0.1:1002".parse().unwrap(), now, None);
         let (tx, _rx) = mpsc::channel(1);
         let (peer_tx, _peer_rx) = watch::channel("127.0.0.1:1002".parse().unwrap());
         assert!(flows.promote(forwarding_id, tx, peer_tx));
