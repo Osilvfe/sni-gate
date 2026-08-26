@@ -4,9 +4,6 @@
 //! packets, reassemble their CRYPTO frames, and inspect the TLS ClientHello;
 //! raw routes still forward every original UDP datagram untouched.
 
-use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
-
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use aes_gcm::aead::AeadInPlace;
@@ -65,12 +62,14 @@ pub enum InitialSni {
 }
 
 /// Reassembles one client's Initial CRYPTO stream, bounded before address
-/// validation so a fragmented ClientHello cannot exhaust memory. Byte-granular
-/// storage makes overlapping retransmissions safe: identical bytes are ignored,
-/// while contradictory overlap is rejected as malformed input.
+/// validation so a fragmented ClientHello cannot exhaust memory. Storage is
+/// linear in the highest observed offset rather than one tree node per byte;
+/// the presence bitmap preserves sparse/overlap semantics while keeping the
+/// hard 16 KiB cap cheap even under hostile fragmentation.
 #[derive(Debug, Default)]
 pub struct InitialInspector {
-    crypto: BTreeMap<u64, u8>,
+    crypto: Vec<u8>,
+    present: Vec<bool>,
 }
 
 impl InitialInspector {
@@ -97,9 +96,15 @@ impl InitialInspector {
                 TlsParse::NeedMore => InitialSni::NeedMore,
                 TlsParse::NotClientHello => InitialSni::Invalid,
             },
-            None if saw_initial || !self.crypto.is_empty() => InitialSni::NeedMore,
+            None if saw_initial || !self.present.is_empty() => InitialSni::NeedMore,
             None => InitialSni::NeedMore,
         }
+    }
+
+    /// Approximate heap retained by the CRYPTO reassembly buffers. Vec<bool>
+    /// is bit-packed, so count one byte per eight logical presence bits.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.crypto.len() + self.present.len().div_ceil(8)
     }
 
     fn add_frames(&mut self, payload: &[u8]) -> Result<(), ()> {
@@ -125,32 +130,36 @@ impl InitialInspector {
     }
 
     fn insert_crypto(&mut self, offset: u64, data: &[u8]) -> Result<(), ()> {
-        let end = offset.checked_add(data.len() as u64).ok_or(())?;
-        if end > MAX_CLIENT_HELLO as u64 {
+        let start = usize::try_from(offset).map_err(|_| ())?;
+        let end = start.checked_add(data.len()).ok_or(())?;
+        if end > MAX_CLIENT_HELLO {
             return Err(());
         }
+        if self.crypto.len() < end {
+            self.crypto.resize(end, 0);
+            self.present.resize(end, false);
+        }
         for (index, byte) in data.iter().copied().enumerate() {
-            let pos = offset.checked_add(index as u64).ok_or(())?;
-            match self.crypto.entry(pos) {
-                Entry::Vacant(entry) => {
-                    entry.insert(byte);
+            let pos = start + index;
+            if self.present[pos] {
+                if self.crypto[pos] != byte {
+                    return Err(());
                 }
-                Entry::Occupied(entry) if *entry.get() == byte => {}
-                Entry::Occupied(_) => return Err(()),
+            } else {
+                self.crypto[pos] = byte;
+                self.present.set(pos, true);
             }
         }
         Ok(())
     }
 
     fn client_hello(&self) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        for offset in 0..MAX_CLIENT_HELLO as u64 {
-            match self.crypto.get(&offset) {
-                Some(byte) => out.push(*byte),
-                None => break,
-            }
-        }
-        (!out.is_empty()).then_some(out)
+        let contiguous = self
+            .present
+            .iter()
+            .position(|present| !*present)
+            .unwrap_or(self.present.len());
+        (contiguous != 0).then(|| self.crypto[..contiguous].to_vec())
     }
 }
 
@@ -190,14 +199,19 @@ fn decrypt_initial(packet: &[u8]) -> Result<Option<DecryptedInitial>, ()> {
     }
     let length = read_varint(packet, &mut at)? as usize;
     let pn_at = at;
-    let sample = packet.get(pn_at + 4..pn_at + 20).ok_or(())?;
+    let packet_end = pn_at.checked_add(length).ok_or(())?;
+    let sample_start = pn_at.checked_add(4).ok_or(())?;
+    let sample_end = sample_start.checked_add(16).ok_or(())?;
+    if packet_end > packet.len() || sample_end > packet_end {
+        return Err(());
+    }
+    let sample = packet.get(sample_start..sample_end).ok_or(())?;
 
     let keys = InitialKeys::client(version, dcid)?;
     let mask = keys.header_mask(sample)?;
     let first = packet[0] ^ (mask[0] & 0x0f);
     let pn_len = (first as usize & 0x03) + 1;
-    let packet_end = pn_at.checked_add(length).ok_or(())?;
-    if packet_end > packet.len() || length < pn_len + 16 {
+    if length < pn_len + 16 {
         return Err(());
     }
     let mut header = packet[..pn_at + pn_len].to_vec();
@@ -385,6 +399,16 @@ mod tests {
         let mut inspector = InitialInspector::default();
         inspector.insert_crypto(0, b"abc").unwrap();
         assert_eq!(inspector.insert_crypto(1, b"Z"), Err(()));
+    }
+
+    #[test]
+    fn sparse_crypto_storage_stays_bounded() {
+        let mut inspector = InitialInspector::default();
+        inspector
+            .insert_crypto((MAX_CLIENT_HELLO - 1) as u64, b"x")
+            .unwrap();
+        assert!(inspector.buffered_bytes() <= MAX_CLIENT_HELLO + MAX_CLIENT_HELLO / 8 + 1);
+        assert!(inspector.client_hello().is_none());
     }
 
     #[test]
