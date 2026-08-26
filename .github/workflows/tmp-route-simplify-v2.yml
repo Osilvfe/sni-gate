@@ -1,0 +1,57 @@
+name: Temporary route type simplification v2
+
+on:
+  push:
+    branches:
+      - work/config-route-simplify
+
+permissions:
+  contents: write
+
+jobs:
+  simplify-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: work/config-route-simplify
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
+
+      - name: Apply configuration model simplification
+        run: python scripts/tmp_route_simplify.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Sanity-check public route vocabulary
+        run: |
+          ! rg -n 'type = "h3"|type = "h3-ech"|type = "h3ech"' README.md sni-gate.example.toml
+          rg -n 'runtime_route_type|RouteType::H3|RouteType::H3Ech' src tests
+
+      - name: Commit validated source changes
+        run: |
+          rm -f \
+            scripts/tmp_route_simplify.py \
+            scripts/sitecustomize.py \
+            .ci-route-simplify-trigger \
+            .ci-route-simplify-trigger-v2 \
+            .github/workflows/tmp-route-simplify.yml \
+            .github/workflows/tmp-route-simplify-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "refactor(config): make route types transport-agnostic"
+          git push origin HEAD:work/config-route-simplify
