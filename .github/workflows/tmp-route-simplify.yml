@@ -1,0 +1,46 @@
+name: Temporary route type simplification
+
+on:
+  push:
+    branches:
+      - work/config-route-simplify
+
+permissions:
+  contents: write
+
+jobs:
+  simplify-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply configuration model simplification
+        run: python scripts/tmp_route_simplify.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Show remaining H3 naming references
+        run: |
+          rg -n 'h3-ech|h3ech|RouteType::H3|RouteType::H3Ech|type = "h3' src tests README.md sni-gate.example.toml || true
+
+      - name: Commit validated source changes
+        run: |
+          rm -f scripts/tmp_route_simplify.py .github/workflows/tmp-route-simplify.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "refactor(config): make route types transport-agnostic"
+          git push origin HEAD:work/config-route-simplify
