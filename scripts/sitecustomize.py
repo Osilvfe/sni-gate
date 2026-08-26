@@ -9,6 +9,9 @@ if count != 1:
     raise RuntimeError(f"README ECH wording: expected one match, found {count}")
 p.write_text(text.replace(old, new, 1))
 
-# This is a one-shot CI preflight. Delete the tracked helper before the main
-# transform runs so the validated source commit cannot retain CI scaffolding.
+# This is a one-shot CI preflight. Delete all tracked trigger helpers before the
+# main transform runs so the validated source commit cannot retain CI scaffolding.
 Path(__file__).unlink()
+marker = Path(".ci-route-simplify-trigger")
+if marker.exists():
+    marker.unlink()
