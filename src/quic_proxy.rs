@@ -343,15 +343,14 @@ impl FlowTable {
     }
 
     fn inspecting_stats(&self) -> (usize, usize) {
-        self.entries.values().fold((0usize, 0usize), |stats, entry| {
-            match &entry.state {
-                FlowState::Inspecting(flow) => (
-                    stats.0 + 1,
-                    stats.1.saturating_add(flow.retained_bytes()),
-                ),
+        self.entries
+            .values()
+            .fold((0usize, 0usize), |stats, entry| match &entry.state {
+                FlowState::Inspecting(flow) => {
+                    (stats.0 + 1, stats.1.saturating_add(flow.retained_bytes()))
+                }
                 FlowState::Forwarding { .. } => stats,
-            }
-        })
+            })
     }
 
     fn evict_oldest_inspecting(&mut self) -> bool {
@@ -904,9 +903,7 @@ mod tests {
 
         let mut oldest = None;
         for index in 0..MAX_INSPECTING_FLOWS {
-            let peer: SocketAddr = format!("127.0.0.1:{}", 10_000 + index)
-                .parse()
-                .unwrap();
+            let peer: SocketAddr = format!("127.0.0.1:{}", 10_000 + index).parse().unwrap();
             let id = flows.insert_inspecting(peer, now + Duration::from_millis(index as u64), None);
             oldest.get_or_insert(id);
         }
