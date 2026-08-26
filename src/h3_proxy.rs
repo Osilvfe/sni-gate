@@ -82,7 +82,22 @@ async fn proxy_inbound_h3_inner(
     let idle_timeout = context.idle_timeout;
 
     let serve = async {
-        while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
+        loop {
+            let resolver = match inbound.accept().await {
+                Ok(Some(resolver)) => resolver,
+                Ok(None) => break,
+                Err(error) if error.is_h3_no_error() => {
+                    debug!(
+                        %peer,
+                        route = %context.route_name,
+                        "H3 connection closed normally"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).context("accepting HTTP/3 request");
+                }
+            };
             let context = context.clone();
             let activity = activity.clone();
             let mut sender = upstream.sender.clone();
@@ -339,8 +354,16 @@ async fn connect_upstream_h3(
         .context("starting upstream HTTP/3 client")?;
     let route_name = route.name.clone();
     tokio::spawn(async move {
-        let error = poll_fn(|cx| driver.poll_close(cx)).await;
-        debug!(route = %route_name, error = %error, "upstream H3 driver closed");
+        let close = poll_fn(|cx| driver.poll_close(cx)).await;
+        if close.is_h3_no_error() {
+            debug!(route = %route_name, "upstream H3 driver closed normally");
+        } else {
+            debug!(
+                route = %route_name,
+                error = %close,
+                "upstream H3 driver closed with error"
+            );
+        }
     });
 
     Ok(UpstreamH3 {

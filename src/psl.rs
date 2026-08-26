@@ -233,7 +233,7 @@ fn spawn_update_task(cfg: PslConfig, interval: Duration) {
                 Ok(age) if age > cfg.max_age => {
                     tracing::info!(age = ?age, max_age = ?cfg.max_age, "PSL file stale, updating");
                     if let Err(e) = download_and_save(&cfg).await {
-                        tracing::error!(error = %e, "failed to update PSL");
+                        tracing::warn!(error = %e, "failed to update PSL");
                     }
                     // Note: reload happens via file watcher if auto_reload is enabled
                 }
@@ -263,7 +263,7 @@ fn spawn_reload_task(cfg: PslConfig, psl: Arc<SuffixList>) -> Result<()> {
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "file watcher error");
+                tracing::warn!(error = %e, "file watcher error");
             }
         }
     })
@@ -288,11 +288,11 @@ fn spawn_reload_task(cfg: PslConfig, psl: Arc<SuffixList>) -> Result<()> {
                         tracing::info!("PSL reloaded successfully");
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "failed to reload PSL (invalid file)");
+                        tracing::warn!(error = %e, "failed to reload PSL (invalid file)");
                     }
                 },
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to read PSL file");
+                    tracing::warn!(error = %e, "failed to read PSL file");
                 }
             })
             .await
@@ -322,11 +322,11 @@ fn spawn_sighup_handler(cfg: PslConfig, psl: Arc<SuffixList>) {
                         tracing::info!("PSL reloaded successfully");
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "PSL reload failed");
+                        tracing::warn!(error = %e, "PSL reload failed");
                     }
                 },
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to read PSL file");
+                    tracing::warn!(error = %e, "failed to read PSL file");
                 }
             })
             .await
