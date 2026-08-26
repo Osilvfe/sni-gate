@@ -22,11 +22,9 @@ const RESPONSE_BODY: &[u8] = b"response-through-h3-proxy";
 async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
-        FRONT_SNI.to_string(),
-        UPSTREAM_SNI.to_string(),
-    ])
-    .expect("generate H3 test certificate");
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec![FRONT_SNI.to_string(), UPSTREAM_SNI.to_string()])
+            .expect("generate H3 test certificate");
     let cert_der = cert.der().clone();
     let key_der = signing_key.serialize_der();
 
@@ -134,10 +132,7 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
     let gateway_addr = gateway_endpoint.local_addr().unwrap();
     let router = Arc::new(
         Router::build(
-            &[
-                vec![FRONT_SNI.to_string()],
-                vec![OTHER_SNI.to_string()],
-            ],
+            &[vec![FRONT_SNI.to_string()], vec![OTHER_SNI.to_string()]],
             None,
             &HashMap::new(),
         )
@@ -226,7 +221,10 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
         .send_request(blocked)
         .await
         .expect("send cross-route H3 request");
-    blocked_stream.finish().await.expect("finish blocked request");
+    blocked_stream
+        .finish()
+        .await
+        .expect("finish blocked request");
     let blocked_response = blocked_stream
         .recv_response()
         .await
