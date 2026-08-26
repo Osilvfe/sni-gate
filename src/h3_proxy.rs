@@ -8,11 +8,13 @@
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -33,6 +35,7 @@ struct H3ProxyContext {
     route_name: String,
     reflects_dial_host: bool,
     reflects_server_name: bool,
+    idle_timeout: Duration,
 }
 
 pub async fn serve_inbound(
@@ -54,6 +57,7 @@ pub async fn serve_inbound(
         route_name: route.name.clone(),
         reflects_dial_host: route.upstream_host.is_none(),
         reflects_server_name: matches!(route.sni_policy, SniPolicy::Reflect | SniPolicy::Omit),
+        idle_timeout: route.idle_timeout,
     };
 
     let upstream = connect_upstream_h3(&route, &handshake_sni, peer, &state.cert_resolver).await?;
@@ -74,70 +78,83 @@ async fn proxy_inbound_h3_inner(
     let mut inbound = h3::server::Connection::new(quic)
         .await
         .context("starting inbound HTTP/3 connection")?;
+    let activity = Arc::new(Notify::new());
+    let idle_timeout = context.idle_timeout;
 
-    while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
-        let context = context.clone();
-        let mut sender = upstream.sender.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let (request, stream) = resolver
-                    .resolve_request()
-                    .await
-                    .context("resolving HTTP/3 request headers")?;
+    let serve = async {
+        while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
+            let context = context.clone();
+            let activity = activity.clone();
+            let mut sender = upstream.sender.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let (request, stream) = resolver
+                        .resolve_request()
+                        .await
+                        .context("resolving HTTP/3 request headers")?;
+                    activity.notify_one();
 
-                let authority = request
-                    .uri()
-                    .authority()
-                    .map(|authority| authority.host())
-                    .unwrap_or(context.handshake_sni.as_str());
-                let request_route = context.router.match_host(authority);
-                if !authority_reuses_upstream(
-                    request_route,
-                    context.handshake_route,
-                    authority,
-                    &context.handshake_sni,
-                    context.reflects_dial_host,
-                    context.reflects_server_name,
-                ) {
+                    let authority = request
+                        .uri()
+                        .authority()
+                        .map(|authority| authority.host())
+                        .unwrap_or(context.handshake_sni.as_str());
+                    let request_route = context.router.match_host(authority);
+                    if !authority_reuses_upstream(
+                        request_route,
+                        context.handshake_route,
+                        authority,
+                        &context.handshake_sni,
+                        context.reflects_dial_host,
+                        context.reflects_server_name,
+                    ) {
+                        debug!(
+                            %peer,
+                            sni = %context.handshake_sni,
+                            %authority,
+                            handshake_route = context.handshake_route,
+                            request_route = ?request_route,
+                            reflects_dial_host = context.reflects_dial_host,
+                            reflects_server_name = context.reflects_server_name,
+                            "rejecting coalesced H3 request that would change upstream identity"
+                        );
+                        return empty_response(stream, StatusCode::MISDIRECTED_REQUEST).await;
+                    }
+
                     debug!(
                         %peer,
-                        sni = %context.handshake_sni,
+                        route = %context.route_name,
                         %authority,
-                        handshake_route = context.handshake_route,
-                        request_route = ?request_route,
-                        reflects_dial_host = context.reflects_dial_host,
-                        reflects_server_name = context.reflects_server_name,
-                        "rejecting coalesced H3 request that would change upstream identity"
+                        method = %request.method(),
+                        "forwarding HTTP/3 request"
                     );
-                    return empty_response(stream, StatusCode::MISDIRECTED_REQUEST).await;
+                    let upstream_stream = sender
+                        .send_request(request)
+                        .await
+                        .context("sending upstream HTTP/3 request headers")?;
+                    proxy_stream(stream, upstream_stream, &activity).await
                 }
+                .await;
 
-                debug!(
-                    %peer,
-                    route = %context.route_name,
-                    %authority,
-                    method = %request.method(),
-                    "forwarding HTTP/3 request"
-                );
-                let upstream_stream = sender
-                    .send_request(request)
-                    .await
-                    .context("sending upstream HTTP/3 request headers")?;
-                proxy_stream(stream, upstream_stream).await
-            }
-            .await;
+                if let Err(error) = result {
+                    warn!(
+                        %peer,
+                        route = %context.route_name,
+                        error = %format!("{error:#}"),
+                        "HTTP/3 request failed"
+                    );
+                }
+            });
+        }
+        Ok::<(), anyhow::Error>(())
+    };
 
-            if let Err(error) = result {
-                warn!(
-                    %peer,
-                    route = %context.route_name,
-                    error = %format!("{error:#}"),
-                    "HTTP/3 request failed"
-                );
-            }
-        });
+    tokio::select! {
+        result = serve => result,
+        _ = h3_idle_guard(&activity, idle_timeout) => {
+            Err(anyhow!("H3 route {} idle timeout", context.route_name))
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -163,6 +180,7 @@ async fn proxy_inbound_h3(
             route_name,
             reflects_dial_host,
             reflects_server_name,
+            idle_timeout: Duration::ZERO,
         },
         upstream,
     )
@@ -192,6 +210,22 @@ fn authority_reuses_upstream(
         return true;
     }
     !(reflects_dial_host || reflects_server_name)
+}
+
+/// Resolve only after the H3 application layer has seen no request/response
+/// headers, DATA, or trailers for `idle`. QUIC keepalives and transport ACKs do
+/// not count as application activity. Zero disables the route-level timeout.
+async fn h3_idle_guard(activity: &Notify, idle: Duration) {
+    if idle.is_zero() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    loop {
+        match timeout(idle, activity.notified()).await {
+            Ok(()) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 struct UpstreamH3 {
@@ -420,6 +454,7 @@ where
 async fn proxy_stream<SI, SO>(
     inbound: h3::server::RequestStream<SI, bytes::Bytes>,
     upstream: h3::client::RequestStream<SO, bytes::Bytes>,
+    activity: &Notify,
 ) -> Result<()>
 where
     SI: h3::quic::BidiStream<bytes::Bytes>,
@@ -430,10 +465,12 @@ where
 
     let upload = async {
         while let Some(mut chunk) = inbound_recv.recv_data().await? {
+            activity.notify_one();
             let bytes = chunk.copy_to_bytes(chunk.remaining());
             upstream_send.send_data(bytes).await?;
         }
         if let Some(trailers) = inbound_recv.recv_trailers().await? {
+            activity.notify_one();
             upstream_send.send_trailers(trailers).await?;
         }
         upstream_send.finish().await?;
@@ -442,12 +479,15 @@ where
 
     let download = async {
         let response = upstream_recv.recv_response().await?;
+        activity.notify_one();
         inbound_send.send_response(response).await?;
         while let Some(mut chunk) = upstream_recv.recv_data().await? {
+            activity.notify_one();
             let bytes = chunk.copy_to_bytes(chunk.remaining());
             inbound_send.send_data(bytes).await?;
         }
         if let Some(trailers) = upstream_recv.recv_trailers().await? {
+            activity.notify_one();
             inbound_send.send_trailers(trailers).await?;
         }
         inbound_send.finish().await?;
