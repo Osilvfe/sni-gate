@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 use crate::config::{RouteType, SniPolicy};
 use crate::proxy::{upstream_certs, ListenerState, RouteRuntime};
 use crate::resolver::DynamicResolver;
+use crate::router::Router;
 
 pub async fn serve_inbound(
     connection: quinn::Connection,
@@ -34,16 +35,40 @@ pub async fn serve_inbound(
         .ok_or_else(|| anyhow!("invalid H3 route index {handshake_route}"))?;
 
     let upstream = connect_upstream_h3(&route, &handshake_sni, peer, &state.cert_resolver).await?;
+    proxy_inbound_h3(
+        connection,
+        peer,
+        state.router.clone(),
+        handshake_route,
+        handshake_sni,
+        route.name.clone(),
+        upstream,
+    )
+    .await
+}
 
+/// Proxy an established inbound HTTP/3 connection through an already-created
+/// upstream HTTP/3 client connection. Keeping transport establishment separate
+/// from request semantics makes the latter independently testable without
+/// weakening production certificate verification.
+async fn proxy_inbound_h3(
+    connection: quinn::Connection,
+    peer: SocketAddr,
+    router: Arc<Router>,
+    handshake_route: usize,
+    handshake_sni: String,
+    route_name: String,
+    upstream: UpstreamH3,
+) -> Result<()> {
     let quic = h3_quinn::Connection::new(connection);
     let mut inbound = h3::server::Connection::new(quic)
         .await
         .context("starting inbound HTTP/3 connection")?;
 
     while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
-        let state = state.clone();
+        let router = router.clone();
         let sni = handshake_sni.clone();
-        let route = route.clone();
+        let route_name = route_name.clone();
         let mut sender = upstream.sender.clone();
         tokio::spawn(async move {
             let result = async {
@@ -57,7 +82,7 @@ pub async fn serve_inbound(
                     .authority()
                     .map(|authority| authority.host())
                     .unwrap_or(sni.as_str());
-                let request_route = state.router.match_host(authority);
+                let request_route = router.match_host(authority);
                 if request_route != Some(handshake_route) {
                     debug!(
                         %peer,
@@ -72,7 +97,7 @@ pub async fn serve_inbound(
 
                 debug!(
                     %peer,
-                    route = %route.name,
+                    route = %route_name,
                     %authority,
                     method = %request.method(),
                     "forwarding HTTP/3 request"
@@ -88,7 +113,7 @@ pub async fn serve_inbound(
             if let Err(error) = result {
                 warn!(
                     %peer,
-                    route = %route.name,
+                    route = %route_name,
                     error = %format!("{error:#}"),
                     "HTTP/3 request failed"
                 );
