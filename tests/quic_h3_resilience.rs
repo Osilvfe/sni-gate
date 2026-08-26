@@ -19,8 +19,7 @@ fn oversized_udp_does_not_kill_h3_endpoint() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let dir = tempdir();
-    let quic_port = free_udp_port();
-    let ready_port = free_tcp_port();
+    let quic_port = free_dual_port();
 
     // Keep a UDP port open but intentionally do not speak QUIC. After the
     // inbound handshake the gateway will spend its connect timeout trying this
@@ -35,6 +34,9 @@ fn oversized_udp_does_not_kill_h3_endpoint() {
 resolver = "system"
 unmatched = "close"
 
+[global.http3]
+enabled = true
+
 [ca]
 cert_path = "ca/ca.crt"
 key_path = "ca/ca.key"
@@ -44,27 +46,20 @@ leaf_validity_days = 90
 [psl]
 source = "embedded"
 
-# Put QUIC first so it is spawned before the TCP readiness listener below.
+# One configured TCP listener; [global.http3] synthesizes UDP on this port.
 [[listener]]
 addr = "127.0.0.1:{quic_port}"
-transport = "quic"
   [[listener.route]]
   name = "h3-alive"
-  type = "h3"
+  type = "tls"
   match_sni = ["{TEST_SNI}"]
   upstream = "127.0.0.1:{upstream_port}"
   override_sni = "{TEST_SNI}"
   connect_timeout = "5s"
-
-# A TCP listener gives us an observable startup barrier. No route is required:
-# the readiness connection is simply closed by the global unmatched policy.
-[[listener]]
-addr = "127.0.0.1:{ready_port}"
-transport = "tcp"
 "#
     );
     let _gateway = spawn_sni_gate(&config, dir.path());
-    wait_tcp_port(ready_port);
+    wait_tcp_port(quic_port);
 
     // Quinn's endpoint config determines the receive-buffer contract used by
     // SharedQuicSocket. Send a packet exactly one byte above that contract. The
@@ -130,20 +125,17 @@ transport = "tcp"
     drop(upstream);
 }
 
-fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn free_dual_port() -> u16 {
+    for _ in 0..100 {
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("reserve candidate TCP port");
+        let port = tcp.local_addr().unwrap().port();
+        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+            drop(udp);
+            drop(tcp);
+            return port;
+        }
+    }
+    panic!("could not find a port free for both TCP and UDP");
 }
 
 fn wait_tcp_port(port: u16) {

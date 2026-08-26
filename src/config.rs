@@ -18,7 +18,7 @@
 //! `use = "<name>"`. The [`Effective`] view computes the flattened settings for
 //! one route so the data path never has to re-walk the hierarchy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -109,6 +109,10 @@ pub struct Global {
     #[serde(default)]
     pub http2: Option<Http2Config>,
 
+    /// Outermost `[http3]` defaults for automatic QUIC companions.
+    #[serde(default)]
+    pub http3: Option<Http3Config>,
+
     /// Policy for connections matching no route and no default_route.
     #[serde(default)]
     pub unmatched: FailPolicy,
@@ -161,6 +165,10 @@ pub struct Listener {
     /// Listener-scope `[http2]` defaults, between `[global.http2]` and per-route.
     #[serde(default)]
     pub http2: Option<Http2Config>,
+
+    /// Listener-scope `[http3]` defaults.
+    #[serde(default)]
+    pub http3: Option<Http3Config>,
 
     /// Routes matched by inbound SNI/Host.
     #[serde(default, rename = "route")]
@@ -302,6 +310,10 @@ pub struct Route {
     #[serde(default)]
     pub http2: Option<Http2Config>,
 
+    /// Automatic HTTP/3/QUIC companion settings at route scope.
+    #[serde(default)]
+    pub http3: Option<Http3Config>,
+
     /// Optional PEM cert chain pinned for local termination when this route's
     /// name is presented. Falls back to the dynamic CA issuer.
     #[serde(default)]
@@ -385,6 +397,19 @@ pub struct Http2Config {
     pub probe_timeout: Option<Duration>,
 }
 
+/// Per-scope automatic HTTP/3 companion settings.
+///
+/// Enabling this on an eligible TCP route synthesizes the same numeric UDP
+/// listener and maps `tls -> h3`, `ech -> h3-ech`, and `raw -> raw`.
+/// Cleartext `http` is not protocol-translated and therefore has no mapping.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http3Config {
+    /// Enable automatic QUIC companion generation. Inherits; default false.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
 /// What a failed startup h2c probe should do.
 ///
 /// The probe *validates*, it never *decides*: no mode silently downgrades a route
@@ -460,6 +485,10 @@ pub struct Template {
     /// HTTP/2 settings; merged field-by-field into the HTTP/2 ladder here.
     #[serde(default)]
     pub http2: Option<Http2Config>,
+
+    /// HTTP/3 companion settings supplied by this template.
+    #[serde(default)]
+    pub http3: Option<Http3Config>,
 
     /// Overridable knobs; inserted into the fallback ladder at this scope.
     #[serde(flatten)]
@@ -1089,6 +1118,12 @@ pub struct EffectiveHttp2 {
     pub probe_timeout: Duration,
 }
 
+/// The fully-resolved `[http3]` switch for one route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveHttp3 {
+    pub enabled: bool,
+}
+
 impl Config {
     /// Load and validate a configuration file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -1463,6 +1498,7 @@ impl Config {
                 self.validate_transport_route(a, r, rt_tpl)?;
                 self.validate_ech(a, r, rt_tpl, ln_tpl)?;
                 self.validate_http2(r, rt_tpl)?;
+                self.validate_http3(a, r, rt_tpl)?;
             }
             if let Some(d) = &a.default_route {
                 let rt_tpl = self.template_for(&d.use_template)?;
@@ -1470,6 +1506,7 @@ impl Config {
                 self.validate_transport_route(a, d, rt_tpl)?;
                 self.validate_ech(a, d, rt_tpl, ln_tpl)?;
                 self.validate_http2(d, rt_tpl)?;
+                self.validate_http3(a, d, rt_tpl)?;
             }
         }
         if self.ca.leaf_validity_days < 1 {
@@ -1772,6 +1809,129 @@ impl Config {
         }
     }
 
+    /// The five HTTP/3 tiers in deepest-to-shallowest order.
+    fn http3_tiers<'a>(
+        &'a self,
+        listener: &'a Listener,
+        route: &'a Route,
+        rt_tpl: Option<&'a Template>,
+        ln_tpl: Option<&'a Template>,
+    ) -> Vec<&'a Http3Config> {
+        [
+            route.http3.as_ref(),
+            rt_tpl.and_then(|t| t.http3.as_ref()),
+            listener.http3.as_ref(),
+            ln_tpl.and_then(|t| t.http3.as_ref()),
+            self.global.http3.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Resolve whether automatic HTTP/3 is enabled for one configured route.
+    pub fn effective_http3(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+        ln_tpl: Option<&Template>,
+    ) -> EffectiveHttp3 {
+        let tiers = self.http3_tiers(listener, route, rt_tpl, ln_tpl);
+        EffectiveHttp3 {
+            enabled: tiers.iter().find_map(|h| h.enabled).unwrap_or(false),
+        }
+    }
+
+    /// Map a TCP route type to the route type used by its QUIC companion.
+    pub fn http3_companion_route_type(route_type: RouteType) -> Option<RouteType> {
+        match route_type {
+            RouteType::Tls => Some(RouteType::H3),
+            RouteType::Ech => Some(RouteType::H3Ech),
+            RouteType::Raw => Some(RouteType::Raw),
+            RouteType::Http | RouteType::H3 | RouteType::H3Ech => None,
+        }
+    }
+
+    fn http3_companion_route(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        ln_tpl: Option<&Template>,
+    ) -> Result<Option<Route>, ConfigError> {
+        let rt_tpl = self.template_for(&route.use_template)?;
+        if !self
+            .effective_http3(listener, route, rt_tpl, ln_tpl)
+            .enabled
+        {
+            return Ok(None);
+        }
+        let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
+            ConfigError::Invalid(format!("route {}: missing type", route.label()))
+        })?;
+        let Some(companion_type) = Self::http3_companion_route_type(route_type) else {
+            return Ok(None);
+        };
+        let mut companion = route.clone();
+        // Explicitly mapped type wins over a route template carrying the TCP type.
+        companion.route_type = Some(companion_type);
+        companion.http3 = None;
+        Ok(Some(companion))
+    }
+
+    /// Build the automatic QUIC companion for one configured TCP listener.
+    pub fn http3_companion_listener(
+        &self,
+        listener: &Listener,
+    ) -> Result<Option<Listener>, ConfigError> {
+        if listener.transport != ListenerTransport::Tcp {
+            return Ok(None);
+        }
+        let ln_tpl = self.template_for(&listener.use_template)?;
+        let mut routes = Vec::new();
+        for route in &listener.routes {
+            if let Some(route) = self.http3_companion_route(listener, route, ln_tpl)? {
+                routes.push(route);
+            }
+        }
+        let default_route = match &listener.default_route {
+            Some(route) => self.http3_companion_route(listener, route, ln_tpl)?,
+            None => None,
+        };
+        if routes.is_empty() && default_route.is_none() {
+            return Ok(None);
+        }
+        let mut companion = listener.clone();
+        companion.transport = ListenerTransport::Quic;
+        companion.routes = routes;
+        companion.default_route = default_route;
+        companion.http3 = None;
+        Ok(Some(companion))
+    }
+
+    /// Return the listeners that should actually be bound at runtime.
+    /// Explicit QUIC on an address always owns UDP and suppresses synthesis there.
+    pub fn expanded_listeners(&self) -> Result<Vec<Listener>, ConfigError> {
+        let explicit_quic: HashSet<SocketAddr> = self
+            .listeners
+            .iter()
+            .filter(|l| l.transport == ListenerTransport::Quic)
+            .map(|l| l.addr)
+            .collect();
+        let mut expanded = Vec::with_capacity(self.listeners.len().saturating_mul(2));
+        for listener in &self.listeners {
+            expanded.push(listener.clone());
+            if listener.transport == ListenerTransport::Tcp
+                && !explicit_quic.contains(&listener.addr)
+            {
+                if let Some(companion) = self.http3_companion_listener(listener)? {
+                    expanded.push(companion);
+                }
+            }
+        }
+        Ok(expanded)
+    }
+
     /// Reject an *explicit* HTTP/2 opt-in on a `raw` route. Only the two
     /// route-scope tiers count: a value inherited from the listener or global
     /// scope is a broad default that `raw` routes simply ignore, whereas writing
@@ -1797,6 +1957,37 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// Reject an explicit HTTP/3 opt-in where automatic mapping is impossible.
+    /// Listener/global defaults remain broad defaults and unsupported route types skip them.
+    fn validate_http3(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+    ) -> Result<(), ConfigError> {
+        let explicit = [route.http3.as_ref(), rt_tpl.and_then(|t| t.http3.as_ref())]
+            .into_iter()
+            .flatten()
+            .any(|h| h.enabled == Some(true));
+        if !explicit {
+            return Ok(());
+        }
+        let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
+            ConfigError::Invalid(format!("route {}: missing type", route.label()))
+        })?;
+        if listener.transport == ListenerTransport::Tcp
+            && Self::http3_companion_route_type(route_type).is_some()
+        {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "route {}: http3 cannot be enabled explicitly for `{}` on a {:?} listener",
+            route.label(),
+            route_type_name(route_type),
+            listener.transport
+        )))
     }
 
     /// Resolve the concrete protocol type for `route`, taking the route's own

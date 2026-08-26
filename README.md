@@ -68,29 +68,38 @@ The bare-port shorthand binds the **IPv4 wildcard only**, matching nginx's
 `"[::]:443"` to also accept IPv6 connections. Hostnames are not accepted; use a
 literal IP address.
 
-Listeners default to `transport = "tcp"`. Set `transport = "quic"` to bind UDP
-and enable QUIC routes. TCP and QUIC may deliberately share the same numeric
-address because they are different transport namespaces:
+Listeners default to `transport = "tcp"`. TCP and QUIC use different transport
+namespaces, so both may own the same numeric address. For the common case, enable
+HTTP/3 without duplicating listeners or routes:
 
 ```toml
-[[listener]]
-addr = "0.0.0.0:443"
-transport = "tcp"
-# ... TCP routes ...
+[global.http2]
+enabled = true
+
+[global.http3]
+enabled = true
 
 [[listener]]
 addr = "0.0.0.0:443"
-transport = "quic"
-# ... raw / h3 / h3-ech routes ...
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".example.com"]
 ```
 
-A duplicate address on the **same** transport is rejected at startup. Thus two
-TCP listeners on `0.0.0.0:443` are invalid, as are two QUIC listeners there, but
-one of each is valid.
+sni-gate keeps the configured TCP listener and synthesizes a QUIC companion on
+`0.0.0.0:443/UDP`. Eligible route types map as `tls -> h3`, `ech -> h3-ech`,
+and `raw -> raw`. Cleartext `http` is skipped because H3-to-HTTP/1.1/h2c
+translation is not implemented. `[http3]` inherits through route, template,
+listener, listener-template, then global, so narrower scopes may set
+`enabled = false` under a global opt-in.
+
+Advanced deployments may still declare `transport = "quic"` explicitly. An
+explicit QUIC listener on the same address owns UDP and suppresses automatic
+companion generation there, allowing TCP and QUIC routing tables to differ.
 
 ## QUIC / HTTP/3
 
-A QUIC listener accepts only `raw`, `h3`, and `h3-ech` routes.
+HTTP/3 can use an automatic `[http3]` companion or an explicit `transport = "quic"` listener. The resulting QUIC listener accepts only `raw`, `h3`, and `h3-ech` routes; both paths use the same dispatcher and H3 implementation.
 
 ### Raw QUIC
 

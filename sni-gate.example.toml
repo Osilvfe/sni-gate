@@ -48,6 +48,12 @@ unmatched = "close"
 #               but an inherited value here is simply ignored by raw routes
 [global.http2]
 enabled = false
+
+# HTTP/3 companion generation is independent from HTTP/2. Set this true to
+# bind UDP automatically beside eligible TCP listeners. Mapping:
+# tls -> h3, ech -> h3-ech, raw -> raw; cleartext http is skipped.
+[global.http3]
+enabled = false
 # The startup h2c check for `http` routes. It VALIDATES, it never DECIDES: no
 # mode silently downgrades a route to HTTP/1.1, because a probe result goes stale
 # as soon as the backend is reconfigured.
@@ -262,7 +268,7 @@ connect_timeout = "5s"
   match_sni = [".mirror.example"]
 
 # ===========================================================================
-# Listener 3 — QUIC/UDP on 443
+# Listener 3 — explicit QUIC/UDP on 443 (advanced override)
 # ===========================================================================
 # A TCP listener and a QUIC listener may intentionally share the same numeric
 # address: TCP owns 0.0.0.0:443/TCP while this listener owns 0.0.0.0:443/UDP.
