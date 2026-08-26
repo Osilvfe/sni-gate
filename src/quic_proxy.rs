@@ -1,4 +1,7 @@
-//! QUIC listener, including raw SNI-routed UDP forwarding.
+//! QUIC listener, including raw SNI-routed UDP forwarding and H3 dispatch.
+
+#[path = "quic_socket.rs"]
+mod quic_socket;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -6,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -15,6 +19,7 @@ use tracing::{debug, info, warn};
 use crate::config::RouteType;
 use crate::proxy::{ListenerState, RouteRuntime};
 use crate::quic_initial::{InitialInspector, InitialSni};
+use quic_socket::{InboundDatagram, QuicIngress, SharedQuicSocket};
 
 const MAX_INITIAL_DATAGRAMS: usize = 8;
 const MAX_INITIAL_BYTES: usize = 32 * 1024;
@@ -153,7 +158,12 @@ impl FlowTable {
     /// NAT rebinding and for multiple QUIC connections sharing one client UDP
     /// socket. An unknown Initial is deliberately *not* address-fallback routed:
     /// it starts a new connection even when the same peer already has another.
-    fn flow_id_for(&self, peer: SocketAddr, datagram: &[u8]) -> Option<FlowId> {
+    fn flow_id_for(
+        &self,
+        peer: SocketAddr,
+        datagram: &[u8],
+        allow_peer_fallback: bool,
+    ) -> Option<FlowId> {
         if let Some(header) = LongHeader::parse(datagram) {
             if let Some(id) = self.unique_cid_owner(header.dcid) {
                 return Some(id);
@@ -164,7 +174,9 @@ impl FlowTable {
         } else if let Some(id) = self.short_header_owner(datagram) {
             return Some(id);
         }
-        self.unique_peer_owner(peer)
+        allow_peer_fallback
+            .then(|| self.unique_peer_owner(peer))
+            .flatten()
     }
 
     fn unique_cid_owner(&self, cid: &[u8]) -> Option<FlowId> {
@@ -183,7 +195,10 @@ impl FlowTable {
     /// Short headers do not carry a CID length. Try every legal length against
     /// the CIDs we have learned and accept only one unambiguous owning flow.
     fn short_header_owner(&self, datagram: &[u8]) -> Option<FlowId> {
-        if datagram.first().map_or(true, |first| first & 0x80 != 0) || datagram.len() <= 1 {
+        let Some(first) = datagram.first() else {
+            return None;
+        };
+        if first & 0x80 != 0 || datagram.len() <= 1 {
             return None;
         }
         let mut candidate = None;
@@ -377,7 +392,17 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             .with_context(|| format!("binding QUIC listener {}", state.addr))?,
     );
     let flows: Flows = Arc::new(Mutex::new(FlowTable::default()));
-    info!(addr = %state.addr, routes = state.routes.len(), "QUIC listening");
+    let h3 = start_h3_endpoint(listener.clone(), state.clone())?;
+    let h3_ingress = h3.as_ref().map(|(_, ingress)| ingress.clone());
+    // Keep the endpoint alive for the lifetime of the listener.
+    let _h3_endpoint = h3.map(|(endpoint, _)| endpoint);
+    let allow_peer_fallback = h3_ingress.is_none();
+    info!(
+        addr = %state.addr,
+        routes = state.routes.len(),
+        h3 = h3_ingress.is_some(),
+        "QUIC listening"
+    );
 
     let mut buf = vec![0u8; UDP_BUF];
     loop {
@@ -389,14 +414,18 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             let mut table = flows.lock().await;
             table.prune_stale_inspecting(now);
 
-            let id = match table.flow_id_for(peer, datagram) {
+            let id = match table.flow_id_for(peer, datagram, allow_peer_fallback) {
                 Some(id) => id,
                 None => {
                     let initial_dcid = LongHeader::parse(datagram)
                         .filter(LongHeader::is_initial)
                         .map(|header| header.dcid);
                     let Some(initial_dcid) = initial_dcid else {
-                        debug!(%peer, "dropping QUIC datagram with no known flow/CID");
+                        if let Some(ingress) = &h3_ingress {
+                            dispatch_to_h3(ingress, peer, datagram);
+                        } else {
+                            debug!(%peer, "dropping QUIC datagram with no known raw flow/CID");
+                        }
                         continue;
                     };
                     if table.len() >= MAX_FLOWS {
@@ -481,23 +510,116 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             continue;
         };
         let route = state.routes[route_id].clone();
-        if route.route_type != RouteType::Raw {
-            flows.lock().await.remove(flow_id);
-            // H3/H3-ECH termination is installed in the next stage. Refusing
-            // rather than forwarding avoids accidentally treating it as raw.
-            debug!(%peer, flow_id, route = %route.name, "QUIC terminating route not available yet");
-            continue;
+        match route.route_type {
+            RouteType::Raw => {
+                spawn_raw_flow(
+                    listener.clone(),
+                    flows.clone(),
+                    flow_id,
+                    route,
+                    sni,
+                    packets,
+                )
+                .await;
+            }
+            RouteType::H3 | RouteType::H3Ech => {
+                flows.lock().await.remove(flow_id);
+                let Some(ingress) = &h3_ingress else {
+                    warn!(%peer, route = %route.name, "H3 route selected without a Quinn endpoint");
+                    continue;
+                };
+                for packet in packets {
+                    dispatch_to_h3(ingress, peer, &packet);
+                }
+                debug!(%peer, route = %route.name, sni = %display_sni(&sni), "dispatched QUIC flow to H3 endpoint");
+            }
+            RouteType::Tls | RouteType::Ech | RouteType::Http => {
+                flows.lock().await.remove(flow_id);
+                warn!(%peer, route = %route.name, "invalid non-QUIC route reached QUIC dispatcher");
+            }
         }
+    }
+}
 
-        spawn_raw_flow(
-            listener.clone(),
-            flows.clone(),
-            flow_id,
-            route,
-            sni,
-            packets,
-        )
-        .await;
+fn start_h3_endpoint(
+    listener: Arc<UdpSocket>,
+    state: Arc<ListenerState>,
+) -> Result<Option<(quinn::Endpoint, QuicIngress)>> {
+    let enabled = state
+        .routes
+        .iter()
+        .any(|route| matches!(route.route_type, RouteType::H3 | RouteType::H3Ech));
+    if !enabled {
+        return Ok(None);
+    }
+
+    let server_crypto = state.server_configs.h3.as_ref().clone();
+    let quic_crypto = QuicServerConfig::try_from(server_crypto)
+        .context("converting H3 rustls config to Quinn server crypto")?;
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let (socket, ingress) = SharedQuicSocket::new(listener)
+        .context("initializing shared Quinn UDP socket")?;
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .context("creating shared Quinn endpoint")?;
+
+    let accept_endpoint = endpoint.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let peer = incoming.remote_address();
+                match incoming.await {
+                    Ok(connection) => {
+                        let handshake = connection
+                            .handshake_data()
+                            .and_then(|data| {
+                                data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
+                            });
+                        let sni = handshake
+                            .as_ref()
+                            .and_then(|data| data.server_name.as_deref())
+                            .unwrap_or("");
+                        let route = state
+                            .router
+                            .match_host(sni)
+                            .and_then(|id| state.routes.get(id));
+                        debug!(
+                            %peer,
+                            sni = %display_sni(sni),
+                            route = route.map(|route| route.name.as_str()).unwrap_or("<unmatched>"),
+                            "H3 QUIC handshake established"
+                        );
+                        // The shared dispatcher and TLS termination are now live.
+                        // Step 3 replaces this explicit close with the h3 request
+                        // loop, so no connection is accidentally treated as a
+                        // working HTTP/3 proxy before semantic forwarding exists.
+                        connection.close(0u32.into(), b"H3 handler not installed");
+                    }
+                    Err(error) => {
+                        debug!(%peer, error = %error, "H3 QUIC handshake failed");
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(Some((endpoint, ingress)))
+}
+
+fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
+    match ingress.try_send(peer, datagram) {
+        Ok(()) => {}
+        Err(TrySendError::Full(InboundDatagram { .. })) => {
+            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full");
+        }
+        Err(TrySendError::Closed(InboundDatagram { .. })) => {
+            debug!(%peer, "dropping QUIC datagram because H3 endpoint is closed");
+        }
     }
 }
 
@@ -662,7 +784,7 @@ mod tests {
         assert!(flows.promote(id, tx, peer_tx));
 
         let packet = long_header(QUIC_V1, 0xc0, dcid, b"client01");
-        assert_eq!(flows.flow_id_for(new_peer, &packet), Some(id));
+        assert_eq!(flows.flow_id_for(new_peer, &packet, true), Some(id));
         assert!(flows.migrate_peer(id, new_peer));
         assert_eq!(*peer_rx.borrow(), new_peer);
         assert_eq!(flows.unique_peer_owner(old_peer), None);
@@ -677,7 +799,7 @@ mod tests {
         let _ = flows.insert_inspecting(peer, now, Some(b"firstcid"));
 
         let second = long_header(QUIC_V1, 0xc0, b"secondid", b"client02");
-        assert_eq!(flows.flow_id_for(peer, &second), None);
+        assert_eq!(flows.flow_id_for(peer, &second, true), None);
     }
 
     #[test]
@@ -694,7 +816,18 @@ mod tests {
         let mut short = vec![0x40];
         short.extend_from_slice(server_cid);
         short.extend_from_slice(b"ciphertext");
-        assert_eq!(flows.flow_id_for(new_peer, &short), Some(id));
+        assert_eq!(flows.flow_id_for(new_peer, &short, true), Some(id));
+    }
+
+    #[test]
+    fn mixed_listener_does_not_peer_fallback_unknown_datagram_to_raw() {
+        let peer: SocketAddr = "127.0.0.1:6500".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let _ = flows.insert_inspecting(peer, Instant::now(), Some(b"raw-flow"));
+
+        let unknown_short = [0x40, 0xaa, 0xbb, 0xcc];
+        assert_eq!(flows.flow_id_for(peer, &unknown_short, false), None);
+        assert!(flows.flow_id_for(peer, &unknown_short, true).is_some());
     }
 
     #[test]
@@ -705,6 +838,6 @@ mod tests {
         let second = long_header(QUIC_V2, 0xd0, b"v2-second", b"client04");
         let parsed = LongHeader::parse(&second).unwrap();
         assert!(parsed.is_initial());
-        assert_eq!(flows.flow_id_for(peer, &second), None);
+        assert_eq!(flows.flow_id_for(peer, &second, true), None);
     }
 }
