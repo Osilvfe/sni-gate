@@ -368,9 +368,8 @@ where
         }
         if let Some(trailers) = inbound_recv.recv_trailers().await? {
             upstream_send.send_trailers(trailers).await?;
-        } else {
-            upstream_send.finish().await?;
         }
+        upstream_send.finish().await?;
         Ok::<(), h3::error::StreamError>(())
     };
 
@@ -383,9 +382,8 @@ where
         }
         if let Some(trailers) = upstream_recv.recv_trailers().await? {
             inbound_send.send_trailers(trailers).await?;
-        } else {
-            inbound_send.finish().await?;
         }
+        inbound_send.finish().await?;
         Ok::<(), h3::error::StreamError>(())
     };
 
