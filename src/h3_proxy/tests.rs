@@ -91,6 +91,10 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
                 .send_trailers(response_trailers)
                 .await
                 .expect("send upstream response trailers");
+            stream
+                .finish()
+                .await
+                .expect("finish upstream response");
 
             assert!(
                 timeout(Duration::from_millis(500), h3.accept())
@@ -195,6 +199,10 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
         .send_trailers(request_trailers)
         .await
         .expect("send proxied H3 trailers");
+    stream
+        .finish()
+        .await
+        .expect("finish proxied H3 request");
 
     let response = stream
         .recv_response()
