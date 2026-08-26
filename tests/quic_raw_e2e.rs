@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::rustls::pki_types::PrivatePkcs8KeyDer;
-use tokio::io::AsyncWriteExt;
 
 const SNI: &str = "raw.quic.test";
 const PAYLOAD: &[u8] = b"raw-quic-e2e-payload";
@@ -43,9 +42,18 @@ fn raw_quic_route_preserves_a_real_quinn_connection() {
             let incoming = upstream.accept().await.expect("raw upstream connection");
             let connection = incoming.await.expect("raw upstream handshake");
             let (mut send, mut recv) = connection.accept_bi().await.expect("bidirectional stream");
-            let payload = recv.read_to_end(64 * 1024).await.expect("read test payload");
+            let payload = recv
+                .read_to_end(64 * 1024)
+                .await
+                .expect("read test payload");
             send.write_all(&payload).await.expect("echo test payload");
             send.finish().expect("finish echo stream");
+
+            // Keep the endpoint/connection alive until the client closes it.
+            // Dropping the last handles immediately after `finish()` sends a
+            // connection-level close that can race the peer observing the stream
+            // FIN, which tests server lifetime rather than raw passthrough.
+            let _ = connection.closed().await;
         });
 
         let dir = tempdir();
