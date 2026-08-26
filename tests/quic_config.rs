@@ -5,10 +5,15 @@
 //! validation path as `main` without needing to start listeners or load CA key
 //! material.
 
-#[path = "../src/error.rs"]
-mod error;
+// Reusing the production modules in a focused integration-test crate naturally
+// leaves many configuration fields unused in this target. They are exercised by
+// the binary and the config module's own unit tests, not by every test crate.
+#![allow(dead_code)]
+
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/error.rs"]
+mod error;
 
 use std::fs;
 use std::path::PathBuf;
@@ -24,9 +29,7 @@ fn load(body: &str) -> Result<Config, error::ConfigError> {
         "sni-gate-quic-config-{}-{id}.toml",
         std::process::id()
     ));
-    let text = format!(
-        "[ca]\ncert_path = \"ca.crt\"\nkey_path = \"ca.key\"\n{body}"
-    );
+    let text = format!("[ca]\ncert_path = \"ca.crt\"\nkey_path = \"ca.key\"\n{body}");
     fs::write(&path, text).expect("write temporary config");
     let result = Config::load(&path);
     let _ = fs::remove_file(path);
@@ -79,7 +82,9 @@ transport = "quic"
     )
     .expect_err("duplicate QUIC listeners must be rejected");
 
-    assert!(error.to_string().contains("duplicate Quic listener address"));
+    assert!(error
+        .to_string()
+        .contains("duplicate Quic listener address"));
 }
 
 #[test]
@@ -114,7 +119,9 @@ transport = "tcp"
     )
     .expect_err("H3 cannot run on a TCP listener");
 
-    assert!(error.to_string().contains("incompatible with a Tcp listener"));
+    assert!(error
+        .to_string()
+        .contains("incompatible with a Tcp listener"));
 }
 
 #[test]
@@ -131,5 +138,7 @@ transport = "quic"
     )
     .expect_err("TCP TLS routes cannot run on a QUIC listener");
 
-    assert!(error.to_string().contains("incompatible with a Quic listener"));
+    assert!(error
+        .to_string()
+        .contains("incompatible with a Quic listener"));
 }
