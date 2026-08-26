@@ -1,145 +1,69 @@
 from pathlib import Path
 
-p = Path('src/quic_socket.rs')
-s = p.read_text()
-s = s.replace(
-    'pub const DISPATCH_QUEUE: usize = 1024;\n',
-    'pub const DISPATCH_QUEUE: usize = 1024;\n'
-    '/// Receive contract shared by the dispatcher and Quinn endpoint.\n'
-    '/// RFC 9000 allows max_udp_payload_size up to 65,527 bytes. Quinn\'s\n'
-    '/// 1,472-byte default is a conservative Ethernet-MTU choice, not a\n'
-    '/// protocol validity limit; loopback/jumbo paths can legitimately\n'
-    '/// deliver larger datagrams before transport parameters are known.\n'
-    'pub const H3_MAX_UDP_PAYLOAD_SIZE: u16 = 65_527;\n\n'
-    'pub fn h3_endpoint_config() -> io::Result<quinn::EndpointConfig> {\n'
-    '    let mut config = quinn::EndpointConfig::default();\n'
-    '    config\n'
-    '        .max_udp_payload_size(H3_MAX_UDP_PAYLOAD_SIZE)\n'
-    '        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;\n'
-    '    Ok(config)\n'
-    '}\n'
-)
-old = '''    pub fn new(socket: Arc<UdpSocket>) -> io::Result<(Arc<Self>, QuicIngress)> {
-        let state = UdpSocketState::new((&*socket).into())?;
-        let (tx, rx) = mpsc::channel(DISPATCH_QUEUE);
-        // start_h3_endpoint currently uses EndpointConfig::default() as well.
-        // Derive the ingress cap from that config instead of baking in Quinn's
-        // current default value so a dependency upgrade cannot silently drift.
-        let max_datagram_size =
-            quinn::EndpointConfig::default().get_max_udp_payload_size() as usize;
-'''
-new = '''    pub fn new(
-        socket: Arc<UdpSocket>,
-        max_datagram_size: usize,
-    ) -> io::Result<(Arc<Self>, QuicIngress)> {
-        let state = UdpSocketState::new((&*socket).into())?;
-        let (tx, rx) = mpsc::channel(DISPATCH_QUEUE);
-'''
-if old not in s:
-    raise SystemExit('SharedQuicSocket::new anchor missing')
-s = s.replace(old, new, 1)
-s = s.replace(
-    'SharedQuicSocket::new(udp).unwrap()',
-    'SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap()',
-)
-anchor = '''impl QuicIngress {
-    pub fn try_send(
-'''
-repl = '''impl QuicIngress {
-    pub fn max_datagram_size(&self) -> usize {
-        self.max_datagram_size
-    }
-
-    pub fn try_send(
-'''
-if anchor not in s:
-    raise SystemExit('QuicIngress impl anchor missing')
-s = s.replace(anchor, repl, 1)
-p.write_text(s)
-
 p = Path('src/quic_proxy.rs')
 s = p.read_text()
-old = '''    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let (socket, ingress) =
-        SharedQuicSocket::new(listener).context("initializing shared Quinn UDP socket")?;
-    let endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+old = '''                        InspectResult::Invalid => {
+                            table.remove(id);
+                            debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            None
+                        }
 '''
-new = '''    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let endpoint_config = quic_socket::h3_endpoint_config()
-        .context("configuring shared Quinn endpoint receive limit")?;
-    let max_datagram_size = endpoint_config.get_max_udp_payload_size() as usize;
-    let (socket, ingress) = SharedQuicSocket::new(listener, max_datagram_size)
-        .context("initializing shared Quinn UDP socket")?;
-    let endpoint = quinn::Endpoint::new_with_abstract_socket(
-        endpoint_config,
+new = '''                        InspectResult::Invalid => {
+                            table.remove(id);
+                            if let Some(ingress) = &h3_ingress {
+                                // A live QUIC connection can legitimately send a later Initial
+                                // using connection state that the stateless inspector does not
+                                // possess. Let Quinn, which owns that state, make the authoritative
+                                // validity decision instead of dropping the datagram here.
+                                dispatch_to_h3(ingress, peer, datagram);
+                                debug!(
+                                    %peer,
+                                    flow_id = id,
+                                    "forwarding statelessly-uninspectable QUIC Initial to H3 endpoint"
+                                );
+                            } else {
+                                debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            }
+                            None
+                        }
 '''
 if old not in s:
-    raise SystemExit('start_h3_endpoint anchor missing')
+    raise SystemExit('invalid Initial arm anchor missing')
 s = s.replace(old, new, 1)
-old = '''fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
-    match ingress.try_send(peer, datagram) {
-        Ok(()) => {}
-        Err(TrySendError::Full(InboundDatagram { .. })) => {
-            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full or packet is oversized");
-        }
+
+old = '''                        if let Err(error) =
+                            h3_proxy::serve_inbound(connection, peer, state, route_id, sni).await
+                        {
+                            debug!(%peer, error = %format!("{error:#}"), "H3 connection failed");
+                        }
 '''
-new = '''fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
-    if datagram.len() > ingress.max_datagram_size() {
-        debug!(
-            %peer,
-            bytes = datagram.len(),
-            max_bytes = ingress.max_datagram_size(),
-            "dropping oversized QUIC datagram before H3 ingress"
-        );
-        return;
-    }
-    match ingress.try_send(peer, datagram) {
-        Ok(()) => {}
-        Err(TrySendError::Full(InboundDatagram { .. })) => {
-            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full");
-        }
+new = '''                        let diagnostics = connection.clone();
+                        if let Err(error) =
+                            h3_proxy::serve_inbound(connection, peer, state, route_id, sni).await
+                        {
+                            debug!(
+                                %peer,
+                                error = %format!("{error:#}"),
+                                close_reason = ?diagnostics.close_reason(),
+                                stats = ?diagnostics.stats(),
+                                "H3 connection failed"
+                            );
+                        }
 '''
 if old not in s:
-    raise SystemExit('dispatch_to_h3 anchor missing')
+    raise SystemExit('H3 diagnostics anchor missing')
 s = s.replace(old, new, 1)
 p.write_text(s)
 
 p = Path('tests/quic_h3_resilience.rs')
 s = p.read_text()
-old = '''    // Quinn's endpoint config determines the receive-buffer contract used by
-    // SharedQuicSocket. Send a packet exactly one byte above that contract. The
-    // IPv4 UDP payload ceiling is 65,507 bytes, so fail loudly if a future Quinn
-    // default grows beyond what an on-wire regression test can exercise.
-    let quinn_cap = quinn::EndpointConfig::default().get_max_udp_payload_size() as usize;
-    assert!(
-        quinn_cap < 65_507,
-        "Quinn max UDP payload {quinn_cap} leaves no valid oversized IPv4 datagram"
-    );
-    let oversized = vec![0u8; quinn_cap + 1];
-'''
-new = '''    // Exercise a very large but valid IPv4 UDP payload. It is deliberately far
-    // above Quinn's 1,472-byte default: the shared endpoint must accept it into
-    // Quinn's receive contract and let QUIC discard the garbage packet without
-    // turning it into a fatal socket error.
-    let oversized = vec![0u8; 60_000];
-'''
+old = '    let oversized = vec![0u8; 60_000];\n'
+new = (
+    '    // Stay above the historical 1,472-byte cap while remaining portable to\n'
+    '    // macOS, whose default UDP socket limit rejects very large loopback payloads.\n'
+    '    let oversized = vec![0u8; 8 * 1024];\n'
+)
 if old not in s:
-    raise SystemExit('resilience oversized anchor missing')
-s = s.replace(old, new, 1)
-old = '''        let crypto = QuicClientConfig::try_from(tls).expect("build Quinn client crypto");
-        let client_config = quinn::ClientConfig::new(Arc::new(crypto));
-'''
-new = '''        let crypto = QuicClientConfig::try_from(tls).expect("build Quinn client crypto");
-        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-        // Force a jumbo-safe loopback path so this handshake exercises datagrams
-        // above the historical 1,472-byte ingress cap that broke ngtcp2/curl.
-        let mut transport = quinn::TransportConfig::default();
-        transport.initial_mtu(4096);
-        transport.min_mtu(4096);
-        client_config.transport_config(Arc::new(transport));
-'''
-if old not in s:
-    raise SystemExit('client config anchor missing')
+    raise SystemExit('oversized test anchor missing')
 s = s.replace(old, new, 1)
 p.write_text(s)
