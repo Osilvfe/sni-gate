@@ -30,6 +30,9 @@
 //!   TLS. A startup probe (`src/probe.rs`) validates that the backend really
 //!   speaks h2c, but never silently downgrades the route.
 
+#[path = "upstream_certs.rs"]
+mod upstream_certs;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +51,7 @@ use crate::config::{AddressFamily, FailPolicy, ListenerTransport, RouteType, Sni
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::peek::{classify, Inbound};
-use crate::resolver::{observed_dns_sans, DynamicResolver};
+use crate::resolver::DynamicResolver;
 use crate::router::Router;
 
 const COPY_BUF_SIZE: usize = 64 * 1024;
@@ -102,7 +105,7 @@ pub struct ServerConfigs {
     /// `["h2"]` — the upstream selected HTTP/2, so we mirror exactly that.
     pub h2: Arc<ServerConfig>,
     /// `["h2", "http/1.1"]`, h2 preferred. Used by `http` routes, where there is
-    /// no upstream ALPN to mirror and the client's preference decides.
+    /// no upstream ALPN of its own to mirror and the client's preference decides.
     pub h2h1: Arc<ServerConfig>,
     /// `["h3"]`, used by the QUIC/HTTP/3 data path.
     pub h3: Arc<ServerConfig>,
@@ -256,63 +259,25 @@ fn mirror_choice<'a>(
     }
 }
 
-/// Report the upstream's real certificate SANs to this listener's resolver, so
-/// the certificate *this* gateway serves for `sni` mirrors the coverage the
-/// upstream actually grants.
-///
-/// # Why this is on the data path
-///
-/// The upstream's certificate is the only authority on which names it will answer
-/// for over one connection. A gateway that invents a wildcard the upstream does
-/// not back lets a browser coalesce a second origin onto the connection
-/// (RFC 9113 §9.1.1); the upstream then sees an `:authority` outside what its own
-/// handshake authorized and rejects it — the 403 this mechanism exists to remove.
-/// The certificate resolver runs inside the *inbound* handshake and cannot dial
-/// anywhere, so the observation has to arrive from here, where the upstream
-/// handshake actually completes.
-///
-/// # Why it does not block
-///
-/// The connection in hand is already served: its certificate was issued before
-/// the client's ClientHello was answered. What mirroring affects is the client's
-/// **next** connection — the one it could coalesce onto — so there is nothing to
-/// wait for. The common case is an upstream whose certificate has not changed, so
-/// that case is settled inline with a cache lookup and a slice comparison
-/// ([`DynamicResolver::mirror_is_current`]); only a genuine change reaches the
-/// blocking pool, where a signature and two file writes are allowed to take their
-/// time.
+/// TCP rustls adapter for the transport-independent upstream certificate
+/// observer. The policy itself lives in `upstream_certs.rs` and is shared with
+/// Quinn/H3.
 fn record_upstream_coverage(
     state: &ListenerState,
     rt: &RouteRuntime,
     sni: Option<&String>,
     session: &rustls::ClientConnection,
 ) {
-    // A route with a fixed `override_sni` asks every upstream for the same name,
-    // so the certificate it returns says nothing about the *inbound* name this
-    // certificate is for. Mirroring it would attach one upstream's coverage to
-    // every name routed here.
-    if rt.sni_policy != SniPolicy::Reflect {
-        return;
-    }
-    let Some(sni) = sni else { return };
     let Some(chain) = session.peer_certificates() else {
         return;
     };
-
-    let observed = observed_dns_sans(chain);
-    if state.cert_resolver.mirror_is_current(sni, &observed) {
-        return;
-    }
-
-    let resolver = state.cert_resolver.clone();
-    let host = sni.clone();
-    let route = rt.name.clone();
-    // Detached: the certificate it produces is for a future connection, and the
-    // current one must not wait on a signature.
-    tokio::task::spawn_blocking(move || {
-        debug!(route = %route, host = %host, sans = ?observed, "observed upstream certificate");
-        resolver.record_upstream_sans(&host, &observed);
-    });
+    upstream_certs::observe_upstream_certificate(
+        &state.cert_resolver,
+        &rt.name,
+        &rt.sni_policy,
+        sni.map(String::as_str),
+        chain,
+    );
 }
 
 /// Terminate inbound TLS with the dynamic-cert server config, then re-originate.
