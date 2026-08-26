@@ -3,10 +3,13 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::config::RouteType;
@@ -15,11 +18,15 @@ use crate::quic_initial::{InitialInspector, InitialSni};
 
 const MAX_INITIAL_DATAGRAMS: usize = 8;
 const MAX_INITIAL_BYTES: usize = 32 * 1024;
+const MAX_FLOWS: usize = 4096;
+const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOW_QUEUE: usize = 128;
 const UDP_BUF: usize = 65_535;
 
 enum Flow {
     Inspecting(InspectingFlow),
+    /// The queue exists before upstream setup finishes, so packets arriving
+    /// during DNS/socket setup are retained without blocking the listener.
     Forwarding(mpsc::Sender<Vec<u8>>),
 }
 
@@ -27,23 +34,26 @@ struct InspectingFlow {
     inspector: InitialInspector,
     packets: Vec<Vec<u8>>,
     bytes: usize,
+    last_activity: Instant,
 }
 
 impl InspectingFlow {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             inspector: InitialInspector::default(),
             packets: Vec::new(),
             bytes: 0,
+            last_activity: now,
         }
     }
 
-    fn push(&mut self, packet: &[u8]) -> Result<(), ()> {
+    fn push(&mut self, packet: &[u8], now: Instant) -> Result<(), ()> {
         if self.packets.len() == MAX_INITIAL_DATAGRAMS
             || self.bytes.saturating_add(packet.len()) > MAX_INITIAL_BYTES
         {
             return Err(());
         }
+        self.last_activity = now;
         self.bytes += packet.len();
         self.packets.push(packet.to_vec());
         Ok(())
@@ -81,21 +91,33 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             }
         };
         if let Some(tx) = forwarding {
-            if tx.send(datagram.to_vec()).await.is_err() {
-                flows.lock().await.remove(&peer);
+            match tx.try_send(datagram.to_vec()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    debug!(%peer, "dropping QUIC datagram because raw flow queue is full");
+                }
+                Err(TrySendError::Closed(_)) => {
+                    flows.lock().await.remove(&peer);
+                }
             }
             continue;
         }
 
         let decision = {
+            let now = Instant::now();
             let mut map = flows.lock().await;
+            prune_stale_inspecting(&mut map, now);
+            if !map.contains_key(&peer) && map.len() >= MAX_FLOWS {
+                warn!(%peer, max_flows = MAX_FLOWS, "dropping new QUIC flow because listener flow limit is reached");
+                continue;
+            }
             let flow = map
                 .entry(peer)
-                .or_insert_with(|| Flow::Inspecting(InspectingFlow::new()));
+                .or_insert_with(|| Flow::Inspecting(InspectingFlow::new(now)));
             let Flow::Inspecting(flow) = flow else {
                 continue;
             };
-            if flow.push(datagram).is_err() {
+            if flow.push(datagram, now).is_err() {
                 map.remove(&peer);
                 warn!(%peer, "dropping QUIC Initial flight that exceeds inspection limits");
                 continue;
@@ -133,12 +155,15 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             continue;
         }
 
-        if let Err(error) =
-            start_raw_flow(listener.clone(), flows.clone(), peer, route, sni, packets).await
-        {
-            debug!(%peer, error = %format!("{error:#}"), "QUIC raw route setup failed");
-        }
+        spawn_raw_flow(listener.clone(), flows.clone(), peer, route, sni, packets).await;
     }
+}
+
+fn prune_stale_inspecting(map: &mut HashMap<SocketAddr, Flow>, now: Instant) {
+    map.retain(|_, flow| match flow {
+        Flow::Inspecting(flow) => now.duration_since(flow.last_activity) < INITIAL_INSPECTION_TIMEOUT,
+        Flow::Forwarding(_) => true,
+    });
 }
 
 fn take_packets(map: &mut HashMap<SocketAddr, Flow>, peer: SocketAddr) -> Vec<Vec<u8>> {
@@ -148,13 +173,33 @@ fn take_packets(map: &mut HashMap<SocketAddr, Flow>, peer: SocketAddr) -> Vec<Ve
     }
 }
 
-async fn start_raw_flow(
+async fn spawn_raw_flow(
     listener: Arc<UdpSocket>,
     flows: Flows,
     peer: SocketAddr,
     route: Arc<RouteRuntime>,
     sni: String,
     packets: Vec<Vec<u8>>,
+) {
+    let (tx, rx) = mpsc::channel(FLOW_QUEUE);
+    flows.lock().await.insert(peer, Flow::Forwarding(tx));
+
+    tokio::spawn(async move {
+        if let Err(error) = run_raw_flow(listener, peer, route, sni, packets, rx).await {
+            debug!(%peer, error = %format!("{error:#}"), "QUIC raw flow failed");
+        }
+        flows.lock().await.remove(&peer);
+        debug!(%peer, "QUIC raw flow closed");
+    });
+}
+
+async fn run_raw_flow(
+    listener: Arc<UdpSocket>,
+    peer: SocketAddr,
+    route: Arc<RouteRuntime>,
+    sni: String,
+    packets: Vec<Vec<u8>>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let host = route
         .upstream_host
@@ -187,34 +232,25 @@ async fn start_raw_flow(
         upstream.send(packet).await?;
     }
 
-    let (tx, mut rx) = mpsc::channel(FLOW_QUEUE);
-    flows.lock().await.insert(peer, Flow::Forwarding(tx));
     info!(%peer, route = %route.name, upstream = %upstream_addr, "QUIC raw flow established");
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; UDP_BUF];
-        loop {
-            tokio::select! {
-                packet = rx.recv() => match packet {
-                    Some(packet) => {
-                        if upstream.send(&packet).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                },
-                received = upstream.recv(&mut buf) => match received {
-                    Ok(n) => {
-                        if listener.send_to(&buf[..n], peer).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+    let idle = route.idle_timeout;
+    let mut buf = vec![0u8; UDP_BUF];
+    loop {
+        tokio::select! {
+            packet = rx.recv() => match packet {
+                Some(packet) => upstream.send(&packet).await.map(|_| ())?,
+                None => break,
+            },
+            received = upstream.recv(&mut buf) => {
+                let n = received?;
+                listener.send_to(&buf[..n], peer).await?;
+            },
+            _ = tokio::time::sleep(idle), if !idle.is_zero() => {
+                debug!(%peer, route = %route.name, "QUIC raw flow idle timeout");
+                break;
             }
         }
-        flows.lock().await.remove(&peer);
-        debug!(%peer, "QUIC raw flow closed");
-    });
+    }
     Ok(())
 }
 
@@ -223,5 +259,34 @@ fn display_sni(sni: &str) -> &str {
         "<none>"
     } else {
         sni
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_initial_flows_are_pruned_but_forwarding_flows_remain() {
+        let now = Instant::now();
+        let stale = now - INITIAL_INSPECTION_TIMEOUT - Duration::from_millis(1);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut flows = HashMap::from([
+            (
+                "127.0.0.1:1000".parse().unwrap(),
+                Flow::Inspecting(InspectingFlow::new(stale)),
+            ),
+            (
+                "127.0.0.1:1001".parse().unwrap(),
+                Flow::Inspecting(InspectingFlow::new(now)),
+            ),
+            ("127.0.0.1:1002".parse().unwrap(), Flow::Forwarding(tx)),
+        ]);
+
+        prune_stale_inspecting(&mut flows, now);
+
+        assert!(!flows.contains_key(&"127.0.0.1:1000".parse().unwrap()));
+        assert!(flows.contains_key(&"127.0.0.1:1001".parse().unwrap()));
+        assert!(flows.contains_key(&"127.0.0.1:1002".parse().unwrap()));
     }
 }
