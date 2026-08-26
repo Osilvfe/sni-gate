@@ -36,24 +36,14 @@ pub async fn serve_inbound(
         .cloned()
         .ok_or_else(|| anyhow!("invalid H3 route index {handshake_route}"))?;
 
-    let upstream = connect_upstream_h3(
-        &route,
-        &handshake_sni,
-        peer,
-        &state.cert_resolver,
-    )
-    .await?;
+    let upstream = connect_upstream_h3(&route, &handshake_sni, peer, &state.cert_resolver).await?;
 
     let quic = h3_quinn::Connection::new(connection);
     let mut inbound = h3::server::Connection::new(quic)
         .await
         .context("starting inbound HTTP/3 connection")?;
 
-    while let Some(resolver) = inbound
-        .accept()
-        .await
-        .context("accepting HTTP/3 request")?
-    {
+    while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
         let state = state.clone();
         let sni = handshake_sni.clone();
         let route = route.clone();
@@ -178,14 +168,7 @@ async fn connect_upstream_h3(
             .await?
         }
         RouteType::H3Ech => {
-            connect_ech_quinn(
-                &endpoint,
-                upstream_addr,
-                &server_name,
-                route,
-                peer,
-            )
-            .await?
+            connect_ech_quinn(&endpoint, upstream_addr, &server_name, route, peer).await?
         }
         _ => return Err(anyhow!("route {} is not an HTTP/3 route", route.name)),
     };
@@ -196,13 +179,16 @@ async fn connect_upstream_h3(
         .and_then(|data| data.protocol.clone())
         .is_some_and(|protocol| protocol.as_slice() == b"h3");
     if !negotiated_h3 {
-        return Err(anyhow!("upstream QUIC connection did not negotiate h3 ALPN"));
+        return Err(anyhow!(
+            "upstream QUIC connection did not negotiate h3 ALPN"
+        ));
     }
 
-    if let Some(chain) = connection
-        .peer_identity()
-        .and_then(|identity| identity.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
-    {
+    if let Some(chain) = connection.peer_identity().and_then(|identity| {
+        identity
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()
+    }) {
         upstream_certs::observe_upstream_certificate(
             cert_resolver,
             &route.name,
@@ -226,9 +212,8 @@ async fn connect_upstream_h3(
         .context("starting upstream HTTP/3 client")?;
     let route_name = route.name.clone();
     tokio::spawn(async move {
-        if let Err(error) = poll_fn(|cx| driver.poll_close(cx)).await {
-            debug!(route = %route_name, error = %error, "upstream H3 driver closed with error");
-        }
+        let error = poll_fn(|cx| driver.poll_close(cx)).await;
+        debug!(route = %route_name, error = %error, "upstream H3 driver closed");
     });
 
     Ok(UpstreamH3 {
