@@ -184,3 +184,180 @@ transport = "quic"
         .to_string()
         .contains("incompatible with a Quic listener"));
 }
+
+#[test]
+fn global_http2_and_http3_can_coexist_on_one_tcp_listener() {
+    let cfg = load(
+        r#"
+[global.http2]
+enabled = true
+[global.http3]
+enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".web.example"]
+"#,
+    )
+    .unwrap();
+    let tcp = &cfg.listeners[0];
+    let route = &tcp.routes[0];
+    let rt_tpl = cfg.template_for(&route.use_template).unwrap();
+    let ln_tpl = cfg.template_for(&tcp.use_template).unwrap();
+    assert!(cfg.effective_http2(tcp, route, rt_tpl, ln_tpl).enabled);
+    assert!(cfg.effective_http3(tcp, route, rt_tpl, ln_tpl).enabled);
+    let expanded = cfg.expanded_listeners().unwrap();
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[0].transport, ListenerTransport::Tcp);
+    assert_eq!(expanded[0].routes[0].route_type, Some(RouteType::Tls));
+    assert_eq!(expanded[1].transport, ListenerTransport::Quic);
+    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3));
+}
+
+#[test]
+fn route_http3_false_disables_global_default() {
+    let cfg = load(
+        r#"
+[global.http3]
+enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["disabled.example"]
+    [listener.route.http3]
+    enabled = false
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.expanded_listeners().unwrap().len(), 1);
+}
+
+#[test]
+fn listener_http3_false_disables_global_default() {
+    let cfg = load(
+        r#"
+[global.http3]
+enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [listener.http3]
+  enabled = false
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["disabled.example"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.expanded_listeners().unwrap().len(), 1);
+}
+
+#[test]
+fn template_can_enable_http3_companion() {
+    let cfg = load(
+        r#"
+[templates.web]
+type = "tls"
+  [templates.web.http3]
+  enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  use = "web"
+  match_sni = ["template.example"]
+"#,
+    )
+    .unwrap();
+    let expanded = cfg.expanded_listeners().unwrap();
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3));
+}
+
+#[test]
+fn global_http3_maps_ech_and_raw() {
+    let cfg = load(
+        r#"
+[global.http3]
+enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  type = "ech"
+  match_sni = ["private.example"]
+  [[listener.route]]
+  type = "raw"
+  match_sni = ["raw.example"]
+"#,
+    )
+    .unwrap();
+    let expanded = cfg.expanded_listeners().unwrap();
+    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3Ech));
+    assert_eq!(expanded[1].routes[1].route_type, Some(RouteType::Raw));
+}
+
+#[test]
+fn global_http3_skips_cleartext_http_without_translation() {
+    let cfg = load(
+        r#"
+[global.http3]
+enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  type = "http"
+  match_sni = ["plain.example"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.expanded_listeners().unwrap().len(), 1);
+}
+
+#[test]
+fn explicit_route_http3_on_cleartext_http_is_rejected() {
+    let error = load(
+        r#"
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  type = "http"
+  match_sni = ["plain.example"]
+    [listener.route.http3]
+    enabled = true
+"#,
+    )
+    .expect_err("explicit HTTP/3 on cleartext HTTP must be rejected");
+    assert!(error
+        .to_string()
+        .contains("http3 cannot be enabled explicitly"));
+}
+
+#[test]
+fn explicit_quic_listener_suppresses_automatic_companion() {
+    let cfg = load(
+        r#"
+[global.http3]
+enabled = true
+[[listener]]
+addr = "127.0.0.1:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = ["auto.example"]
+[[listener]]
+addr = "127.0.0.1:443"
+transport = "quic"
+  [[listener.route]]
+  type = "raw"
+  match_sni = ["manual.example"]
+"#,
+    )
+    .unwrap();
+    let expanded = cfg.expanded_listeners().unwrap();
+    assert_eq!(expanded.len(), 2);
+    let quic: Vec<_> = expanded
+        .iter()
+        .filter(|l| l.transport == ListenerTransport::Quic)
+        .collect();
+    assert_eq!(quic.len(), 1);
+    assert_eq!(quic[0].routes[0].route_type, Some(RouteType::Raw));
+}

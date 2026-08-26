@@ -34,7 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rustls::{RootCertStore, ServerConfig};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::ca::{CaParams, CertificateAuthority};
@@ -173,9 +173,14 @@ fn log_ca_installed(outcome: &trust::Outcome) {
 }
 
 async fn run(cfg: Config) -> Result<()> {
+    let runtime_listeners = cfg
+        .expanded_listeners()
+        .context("expanding automatic HTTP/3 companion listeners")?;
+    log_http3_expansion(&cfg)?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        listeners = cfg.listeners.len(),
+        configured_listeners = cfg.listeners.len(),
+        listeners = runtime_listeners.len(),
         "starting sni-gate"
     );
 
@@ -228,9 +233,9 @@ async fn run(cfg: Config) -> Result<()> {
 
     let mut probe_targets: Vec<ProbeTarget> = Vec::new();
 
-    // --- Build every listener ---
+    // --- Build configured listeners plus automatic HTTP/3 companions ---
     let mut listener_states: Vec<Arc<ListenerState>> = Vec::new();
-    for listener in &cfg.listeners {
+    for listener in &runtime_listeners {
         let state = build_listener(
             &cfg,
             listener,
@@ -268,6 +273,58 @@ async fn run(cfg: Config) -> Result<()> {
             }
         }
         _ = shutdown_signal() => info!("shutdown signal received; exiting"),
+    }
+    Ok(())
+}
+
+/// Log automatic HTTP/3 expansion decisions that matter to operators.
+fn log_http3_expansion(cfg: &Config) -> Result<()> {
+    for listener in cfg
+        .listeners
+        .iter()
+        .filter(|l| l.transport == ListenerTransport::Tcp)
+    {
+        let explicit_quic = cfg
+            .listeners
+            .iter()
+            .any(|q| q.transport == ListenerTransport::Quic && q.addr == listener.addr);
+        let companion = cfg.http3_companion_listener(listener)?;
+        if explicit_quic {
+            if companion.is_some() {
+                info!(
+                    addr = %listener.addr,
+                    "explicit QUIC listener owns this address; automatic HTTP/3 companion suppressed"
+                );
+            }
+            continue;
+        }
+
+        let ln_tpl = cfg.template_for(&listener.use_template)?;
+        for route in listener.routes.iter().chain(listener.default_route.iter()) {
+            let rt_tpl = cfg.template_for(&route.use_template)?;
+            if !cfg.effective_http3(listener, route, rt_tpl, ln_tpl).enabled {
+                continue;
+            }
+            let Some(route_type) = Config::effective_route_type(route, rt_tpl) else {
+                continue;
+            };
+            if Config::http3_companion_route_type(route_type).is_none() {
+                warn!(
+                    addr = %listener.addr,
+                    route = %route.label(),
+                    route_type = ?route_type,
+                    "automatic HTTP/3 companion skipped: route type has no H3 mapping"
+                );
+            }
+        }
+        if let Some(companion) = companion {
+            info!(
+                addr = %companion.addr,
+                routes = companion.routes.len(),
+                has_default_route = companion.default_route.is_some(),
+                "automatic HTTP/3 companion listener enabled"
+            );
+        }
     }
     Ok(())
 }
