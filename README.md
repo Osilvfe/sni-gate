@@ -4,9 +4,10 @@ A multi-listener **TCP and QUIC** gateway that routes connections by **SNI
 (TLS/QUIC) or Host (HTTP)** to an upstream, and — whenever it terminates TLS —
 **issues a certificate for that name on the fly** from a local CA.
 
-TCP routes support **ECH**, plain **TLS**, cleartext **HTTP**, and **raw** byte
-passthrough. QUIC/UDP routes support **raw** datagram passthrough, **HTTP/3**, and
-**HTTP/3 + ECH** (`h3-ech`). Configuration is hierarchical (route → listener →
+Route types are transport-agnostic: **ECH**, plain **TLS**, cleartext **HTTP**,
+and **raw**. On TCP, terminating `tls`/`ech` routes carry HTTP/1.1 or HTTP/2; on
+QUIC/UDP, the same `tls`/`ech` types terminate and proxy HTTP/3. Configuration is
+hierarchical (route → listener →
 global) for maximum flexibility: almost every setting can be pinned per route and
 otherwise inherits outward.
 
@@ -16,11 +17,11 @@ It combines three capabilities:
   CA you trust once. Coverage is not guessed: the first handshake is answered
   exactly, and wider coverage is mirrored from the upstream's own certificate.
   Certs are cached and persisted.
-- **ECH re-origination** — hide the true SNI from the path to a CDN edge, for both
-  TCP TLS (`ech`) and QUIC HTTP/3 (`h3-ech`) upstreams.
+- **ECH re-origination** — hide the true SNI from the path to a CDN edge; the
+  same `ech` route type works on TCP and QUIC/HTTP/3 listeners.
 - **Shared QUIC dispatch** — one UDP listener can inspect QUIC Initial packets to
-  route transparent `raw` flows while also terminating `h3` / `h3-ech` flows on
-  that same UDP socket.
+  route transparent `raw` flows while also terminating `tls` / `ech` HTTP/3 flows
+  on that same UDP socket.
 
 ## How it works
 
@@ -35,8 +36,8 @@ TCP client ── TLS(SNI)/HTTP ──▶ sni-gate :443/TCP
 QUIC client ── QUIC Initial ───▶ sni-gate :443/UDP
                                   │ inspect Initial SNI (v1/v2)
                                   ├─ raw ──────────────▶ untouched UDP datagrams
-                                  ├─ h3 ───────────────▶ H3 → H3 semantic proxy
-                                  └─ h3-ech ───────────▶ H3 → H3 + upstream ECH
+                                  ├─ tls ──────────────▶ H3 → H3 semantic proxy
+                                  └─ ech ──────────────▶ H3 → H3 + upstream ECH
 ```
 
 For TCP, sni-gate peeks without consuming bytes, routes by TLS SNI or HTTP Host,
@@ -44,7 +45,7 @@ and either splices the raw stream or terminates/re-originates TLS. For QUIC, the
 shared UDP dispatcher decrypts only enough of a QUIC v1/v2 **Initial** to recover
 the ClientHello SNI and choose the route. A `raw` QUIC flow then forwards the
 buffered and subsequent UDP datagrams unchanged; the upstream remains the actual
-QUIC/TLS endpoint. `h3` and `h3-ech` instead terminate inbound QUIC and proxy
+QUIC/TLS endpoint. `tls` and `ech` instead terminate inbound QUIC and proxy
 HTTP/3 messages semantically.
 
 Routing precedence is `exact` > `wildcard *.x` > `suffix .x` > `regex @name` >
@@ -87,9 +88,10 @@ addr = "0.0.0.0:443"
 ```
 
 sni-gate keeps the configured TCP listener and synthesizes a QUIC companion on
-`0.0.0.0:443/UDP`. Eligible route types map as `tls -> h3`, `ech -> h3-ech`,
-and `raw -> raw`. Cleartext `http` is skipped because H3-to-HTTP/1.1/h2c
-translation is not implemented. `[http3]` inherits through route, template,
+`0.0.0.0:443/UDP`. Eligible route types are copied unchanged: `tls`, `ech`, and
+`raw`. On the QUIC companion, `tls` means ordinary H3 termination/re-origination
+and `ech` means H3 with upstream ECH. Cleartext `http` is skipped because
+H3-to-HTTP/1.1/h2c translation is not implemented. `[http3]` inherits through route, template,
 listener, listener-template, then global, so narrower scopes may set
 `enabled = false` under a global opt-in.
 
@@ -99,7 +101,7 @@ companion generation there, allowing TCP and QUIC routing tables to differ.
 
 ## QUIC / HTTP/3
 
-HTTP/3 can use an automatic `[http3]` companion or an explicit `transport = "quic"` listener. The resulting QUIC listener accepts only `raw`, `h3`, and `h3-ech` routes; both paths use the same dispatcher and H3 implementation.
+HTTP/3 can use an automatic `[http3]` companion or an explicit `transport = "quic"` listener. The resulting QUIC listener accepts `raw`, `tls`, and `ech`; both automatic and explicit paths use the same dispatcher and H3 implementation.
 
 ### Raw QUIC
 
@@ -124,17 +126,17 @@ peer tuple as a limited fallback for short-header traffic; a mixed raw + H3 list
 deliberately disables that fallback for unknown packets so H3 traffic cannot be
 captured by a raw flow.
 
-### `h3` and `h3-ech`
+### `tls` and `ech` on QUIC
 
-These are terminating HTTP/3 routes. sni-gate accepts the inbound QUIC
-connection with `h3` ALPN, opens a separate upstream QUIC/H3 connection, and
-forwards HTTP/3 **headers, body DATA, trailers, and response semantics**. This is
-not a UDP byte splice and currently does not translate H3 into HTTP/1.1 or
-HTTP/2.
+These are terminating HTTP/3 routes when used on `transport = "quic"`.
+sni-gate accepts the inbound QUIC connection with `h3` ALPN, opens a separate
+upstream QUIC/H3 connection, and forwards HTTP/3 **headers, body DATA, trailers,
+and response semantics**. This is not a UDP byte splice and currently does not
+translate H3 into HTTP/1.1 or HTTP/2.
 
-`h3` uses ordinary upstream QUIC TLS. `h3-ech` uses ECH on the upstream QUIC TLS
-ClientHello. The canonical config spelling is `type = "h3-ech"`; the earlier
-development spelling `h3ech` remains accepted as a compatibility alias.
+`type = "tls"` uses ordinary upstream QUIC TLS. `type = "ech"` uses ECH on the
+upstream QUIC TLS ClientHello. No H3-specific route type is needed: the listener's
+QUIC transport selects HTTP/3 semantics.
 
 HTTP/3 connection coalescing cannot bypass routing: every inbound request's
 `:authority` is checked against the listener router again. Crossing to a different
@@ -144,7 +146,7 @@ example when the route reflects its dial host or its upstream SNI/verification n
 Same-route coalescing across authorities is allowed only when both the dial target
 and upstream TLS identity are fixed and therefore remain the same connection target.
 
-`idle_timeout` on `h3` / `h3-ech` is measured at the HTTP/3 application layer and is
+`idle_timeout` on terminating QUIC `tls` / `ech` routes is measured at the HTTP/3 application layer and is
 refreshed by request/response headers, DATA, and trailers. QUIC ACKs or transport
 keepalives alone do not keep an otherwise idle proxied request alive.
 
@@ -155,17 +157,14 @@ A complete QUIC example is included in
 
 | Type | Listener transport | Terminates inbound TLS/QUIC? | Issues cert? | Upstream |
 |---|---|---:|---:|---|
-| `ech` | TCP | yes | yes | TLS 1.3 + Encrypted Client Hello |
-| `tls` | TCP | yes | yes | plain TLS (optional override SNI) |
+| `ech` | TCP / QUIC | yes | yes | TCP: TLS 1.3 + ECH; QUIC: HTTP/3 over QUIC TLS + ECH |
+| `tls` | TCP / QUIC | yes | yes | TCP: ordinary TLS; QUIC: HTTP/3 over ordinary QUIC TLS |
 | `http` | TCP | TLS when present | yes when TLS | cleartext HTTP; optional h2 → h2c |
-| `raw` | TCP | no | no | untouched TCP byte stream |
-| `raw` | QUIC/UDP | no | no | untouched UDP datagrams after Initial-SNI routing |
-| `h3` | QUIC/UDP | yes | yes | HTTP/3 over ordinary QUIC TLS |
-| `h3-ech` | QUIC/UDP | yes | yes | HTTP/3 over QUIC TLS + ECH |
+| `raw` | TCP / QUIC | no | no | transport-preserving TCP bytes / QUIC UDP datagrams |
 
-`override_sni` works for terminating upstream TLS modes. For `ech` and `h3-ech`
-it is the protected inner name; for `tls` and `h3` it is the SNI presented to
-the upstream TLS handshake:
+`override_sni` works for terminating upstream TLS modes. For `ech` it is the
+protected inner name on either transport; for `tls` it is the SNI presented to
+the upstream TLS/QUIC handshake:
 
 | `override_sni`  | SNI sent upstream                        |
 |-----------------|------------------------------------------|
@@ -317,10 +316,11 @@ no new TLS handshake, and therefore **no new SNI**. A byte-splicing TCP route
 cannot re-route it after the handshake, so certificate scope is the safety
 boundary there.
 
-HTTP/3 can coalesce origins too, but `h3`/`h3-ech` are semantic rather than byte
-splices. They therefore have an additional guard: every request's `:authority` is
-routed again and a request crossing the handshake route boundary gets **421
-Misdirected Request** before it reaches the existing upstream H3 connection.
+HTTP/3 can coalesce origins too, but terminating QUIC `tls`/`ech` routes are
+semantic rather than byte splices. They therefore have an additional guard: every
+request's `:authority` is routed again and a request crossing the handshake route
+boundary gets **421 Misdirected Request** before it reaches the existing upstream
+H3 connection.
 Certificate clipping still applies because it limits what coalescing the client
 may attempt in the first place.
 
@@ -657,7 +657,7 @@ Concurrent rebuilds are idempotent via generation counters.
 
 ## ECH
 
-For `type = "ech"` and `type = "h3-ech"` routes, the ECHConfigList is sourced by
+For `type = "ech"` routes on TCP or QUIC, the ECHConfigList is sourced by
 an `[ech]` block. Its fields inherit field-by-field from `[listener.ech]` and
 `[global.ech]` (and any template), so shared settings need to be written only
 once; a route's `[ech]` overrides only what differs, and may be omitted entirely

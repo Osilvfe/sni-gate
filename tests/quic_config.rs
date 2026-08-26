@@ -88,7 +88,7 @@ transport = "quic"
 }
 
 #[test]
-fn quic_listener_accepts_h3_route() {
+fn quic_listener_accepts_tls_route_as_h3_runtime() {
     let cfg = load(
         r#"
 [[listener]]
@@ -96,17 +96,22 @@ addr = "127.0.0.1:8443"
 transport = "quic"
   [[listener.route]]
   name = "web-h3"
-  type = "h3"
+  type = "tls"
   match_sni = ["h3.example"]
 "#,
     )
-    .expect("h3 is a valid QUIC route");
+    .expect("tls is a valid terminating QUIC route");
 
-    assert_eq!(cfg.listeners[0].routes[0].route_type, Some(RouteType::H3));
+    let route_type = cfg.listeners[0].routes[0].route_type.unwrap();
+    assert_eq!(route_type, RouteType::Tls);
+    assert_eq!(
+        Config::runtime_route_type(ListenerTransport::Quic, route_type),
+        Some(RouteType::H3)
+    );
 }
 
 #[test]
-fn canonical_h3_ech_route_spelling_is_accepted() {
+fn quic_listener_accepts_ech_route_as_h3_ech_runtime() {
     let cfg = load(
         r#"
 [[listener]]
@@ -114,71 +119,51 @@ addr = "127.0.0.1:8443"
 transport = "quic"
   [[listener.route]]
   name = "web-h3-ech"
-  type = "h3-ech"
+  type = "ech"
   match_sni = ["h3-ech.example"]
 "#,
     )
-    .expect("h3-ech is the canonical QUIC ECH route spelling");
+    .expect("ech is a valid terminating QUIC route");
 
+    let route_type = cfg.listeners[0].routes[0].route_type.unwrap();
+    assert_eq!(route_type, RouteType::Ech);
     assert_eq!(
-        cfg.listeners[0].routes[0].route_type,
+        Config::runtime_route_type(ListenerTransport::Quic, route_type),
         Some(RouteType::H3Ech)
     );
 }
 
 #[test]
-fn legacy_h3ech_route_spelling_remains_accepted() {
-    let cfg = load(
-        r#"
+fn h3_names_are_not_public_route_types() {
+    for route_type in ["h3", "h3-ech", "h3ech"] {
+        let error = load(&format!(
+            r#"
 [[listener]]
 addr = "127.0.0.1:8443"
 transport = "quic"
   [[listener.route]]
-  name = "legacy-h3-ech"
-  type = "h3ech"
-  match_sni = ["legacy-h3-ech.example"]
-"#,
-    )
-    .expect("legacy h3ech spelling should remain backward compatible");
-
-    assert_eq!(
-        cfg.listeners[0].routes[0].route_type,
-        Some(RouteType::H3Ech)
-    );
-}
-
-#[test]
-fn tcp_listener_rejects_h3_route() {
-    let error = load(
-        r#"
-[[listener]]
-addr = "127.0.0.1:8443"
-transport = "tcp"
-  [[listener.route]]
-  type = "h3"
+  type = "{route_type}"
   match_sni = ["h3.example"]
-"#,
-    )
-    .expect_err("H3 cannot run on a TCP listener");
-
-    assert!(error
-        .to_string()
-        .contains("incompatible with a Tcp listener"));
+"#
+        ))
+        .expect_err("H3 naming is runtime-only, not a public route type");
+        assert!(error.to_string().contains(route_type));
+    }
 }
 
 #[test]
-fn quic_listener_rejects_tls_route() {
+fn quic_listener_rejects_cleartext_http_route() {
     let error = load(
         r#"
 [[listener]]
 addr = "127.0.0.1:8443"
 transport = "quic"
   [[listener.route]]
-  type = "tls"
-  match_sni = ["tls.example"]
+  type = "http"
+  match_sni = ["http.example"]
 "#,
     )
-    .expect_err("TCP TLS routes cannot run on a QUIC listener");
+    .expect_err("cleartext HTTP upstream translation is not implemented for QUIC");
 
     assert!(error
         .to_string()
@@ -212,7 +197,14 @@ addr = "127.0.0.1:443"
     assert_eq!(expanded[0].transport, ListenerTransport::Tcp);
     assert_eq!(expanded[0].routes[0].route_type, Some(RouteType::Tls));
     assert_eq!(expanded[1].transport, ListenerTransport::Quic);
-    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3));
+    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::Tls));
+    assert_eq!(
+        Config::runtime_route_type(
+            expanded[1].transport,
+            expanded[1].routes[0].route_type.unwrap()
+        ),
+        Some(RouteType::H3)
+    );
 }
 
 #[test]
@@ -271,7 +263,16 @@ addr = "127.0.0.1:443"
     .unwrap();
     let expanded = cfg.expanded_listeners().unwrap();
     assert_eq!(expanded.len(), 2);
-    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3));
+    let route = &expanded[1].routes[0];
+    assert_eq!(route.route_type, None);
+    let template_name = route.use_template.as_deref().unwrap();
+    let template = cfg.templates.get(template_name).unwrap();
+    let configured_type = Config::effective_route_type(route, Some(template)).unwrap();
+    assert_eq!(configured_type, RouteType::Tls);
+    assert_eq!(
+        Config::runtime_route_type(expanded[1].transport, configured_type),
+        Some(RouteType::H3)
+    );
 }
 
 #[test]
@@ -292,8 +293,15 @@ addr = "127.0.0.1:443"
     )
     .unwrap();
     let expanded = cfg.expanded_listeners().unwrap();
-    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3Ech));
+    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::Ech));
     assert_eq!(expanded[1].routes[1].route_type, Some(RouteType::Raw));
+    assert_eq!(
+        Config::runtime_route_type(
+            expanded[1].transport,
+            expanded[1].routes[0].route_type.unwrap()
+        ),
+        Some(RouteType::H3Ech)
+    );
 }
 
 #[test]

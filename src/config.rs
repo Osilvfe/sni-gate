@@ -144,8 +144,9 @@ pub struct Listener {
     pub addr: SocketAddr,
 
     /// Inbound transport. TCP is the historical/default data path; QUIC binds
-    /// the same numeric address as UDP and accepts `raw`, `h3`, and `h3-ech`
-    /// routes.
+    /// the same numeric address as UDP. Route `type` stays transport-agnostic:
+    /// `raw` is transparent on either transport, while `tls` / `ech` terminate
+    /// TCP as HTTP/1.1-or-h2 and QUIC as HTTP/3.
     #[serde(default)]
     pub transport: ListenerTransport,
 
@@ -183,25 +184,31 @@ pub struct Listener {
 // Route
 // ---------------------------------------------------------------------------
 
-/// How an upstream connection is made.
+/// How an upstream connection is made. The public TOML vocabulary is
+/// transport-agnostic: `raw`, `http`, `tls`, and `ech`. The listener transport
+/// decides whether a terminating TLS/ECH route becomes the TCP or HTTP/3 data
+/// path at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteType {
-    /// Re-originate to the upstream over TLS 1.3 + Encrypted Client Hello.
+    /// Terminate and re-originate with ECH. TCP uses TLS 1.3 + ECH; QUIC uses
+    /// HTTP/3 over QUIC TLS + ECH.
     Ech,
-    /// Re-originate over plain TLS (optionally with an overridden SNI).
+    /// Terminate and re-originate without ECH. TCP uses ordinary TLS; QUIC uses
+    /// HTTP/3 over ordinary QUIC TLS.
     Tls,
-    /// Forward as cleartext HTTP (no upstream TLS).
+    /// Forward to a cleartext HTTP upstream. Currently TCP-only.
     Http,
-    /// Do not terminate: splice the raw TCP byte stream to the upstream.
-    /// No certificate is issued.
+    /// Do not terminate: splice the transport unchanged (TCP bytes or QUIC UDP
+    /// datagrams after Initial-SNI routing). No certificate is issued.
     Raw,
-    /// Terminate inbound QUIC/HTTP/3 and re-originate HTTP/3 over ordinary
-    /// QUIC TLS.
+    /// Runtime-only normalized form of `transport = "quic"` + `type = "tls"`.
+    #[doc(hidden)]
+    #[serde(skip)]
     H3,
-    /// Terminate inbound QUIC/HTTP/3 and re-originate HTTP/3 over QUIC with an
-    /// ECH-protected TLS ClientHello.
-    #[serde(rename = "h3-ech", alias = "h3ech")]
+    /// Runtime-only normalized form of `transport = "quic"` + `type = "ech"`.
+    #[doc(hidden)]
+    #[serde(skip)]
     H3Ech,
 }
 
@@ -1497,7 +1504,7 @@ impl Config {
                 r.validate(false, port, rt_tpl)?;
                 self.validate_transport_route(a, r, rt_tpl)?;
                 self.validate_ech(a, r, rt_tpl, ln_tpl)?;
-                self.validate_http2(r, rt_tpl)?;
+                self.validate_http2(a, r, rt_tpl)?;
                 self.validate_http3(a, r, rt_tpl)?;
             }
             if let Some(d) = &a.default_route {
@@ -1505,7 +1512,7 @@ impl Config {
                 d.validate(true, port, rt_tpl)?;
                 self.validate_transport_route(a, d, rt_tpl)?;
                 self.validate_ech(a, d, rt_tpl, ln_tpl)?;
-                self.validate_http2(d, rt_tpl)?;
+                self.validate_http2(a, d, rt_tpl)?;
                 self.validate_http3(a, d, rt_tpl)?;
             }
         }
@@ -1795,10 +1802,11 @@ impl Config {
         ln_tpl: Option<&Template>,
     ) -> EffectiveHttp2 {
         let tiers = self.http2_tiers(listener, route, rt_tpl, ln_tpl);
-        let supports_http2 = matches!(
-            Self::effective_route_type(route, rt_tpl),
-            Some(RouteType::Http | RouteType::Tls | RouteType::Ech)
-        );
+        let supports_http2 = listener.transport == ListenerTransport::Tcp
+            && matches!(
+                Self::effective_route_type(route, rt_tpl),
+                Some(RouteType::Http | RouteType::Tls | RouteType::Ech)
+            );
         EffectiveHttp2 {
             enabled: supports_http2 && tiers.iter().find_map(|h| h.enabled).unwrap_or(false),
             probe: tiers.iter().find_map(|h| h.probe).unwrap_or_default(),
@@ -1843,12 +1851,12 @@ impl Config {
         }
     }
 
-    /// Map a TCP route type to the route type used by its QUIC companion.
+    /// Whether a TCP route type can be copied into an automatic QUIC
+    /// companion. The public route type itself is preserved; transport-specific
+    /// normalization happens only when the runtime route is built.
     pub fn http3_companion_route_type(route_type: RouteType) -> Option<RouteType> {
         match route_type {
-            RouteType::Tls => Some(RouteType::H3),
-            RouteType::Ech => Some(RouteType::H3Ech),
-            RouteType::Raw => Some(RouteType::Raw),
+            RouteType::Tls | RouteType::Ech | RouteType::Raw => Some(route_type),
             RouteType::Http | RouteType::H3 | RouteType::H3Ech => None,
         }
     }
@@ -1869,12 +1877,12 @@ impl Config {
         let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
             ConfigError::Invalid(format!("route {}: missing type", route.label()))
         })?;
-        let Some(companion_type) = Self::http3_companion_route_type(route_type) else {
+        if Self::http3_companion_route_type(route_type).is_none() {
             return Ok(None);
-        };
+        }
         let mut companion = route.clone();
-        // Explicitly mapped type wins over a route template carrying the TCP type.
-        companion.route_type = Some(companion_type);
+        // Preserve the public type (`tls`, `ech`, or `raw`). QUIC transport is
+        // what selects H3/H3-ECH semantics when this route is built at runtime.
         companion.http3 = None;
         Ok(Some(companion))
     }
@@ -1937,12 +1945,19 @@ impl Config {
     /// scope is a broad default that `raw` routes simply ignore, whereas writing
     /// `enabled = true` on the route itself (or on the template it `use`s) can
     /// only be a mistake.
-    fn validate_http2(&self, route: &Route, rt_tpl: Option<&Template>) -> Result<(), ConfigError> {
+    fn validate_http2(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+    ) -> Result<(), ConfigError> {
         let route_type = Self::effective_route_type(route, rt_tpl);
-        if matches!(
-            route_type,
-            Some(RouteType::Http | RouteType::Tls | RouteType::Ech)
-        ) {
+        if listener.transport == ListenerTransport::Tcp
+            && matches!(
+                route_type,
+                Some(RouteType::Http | RouteType::Tls | RouteType::Ech)
+            )
+        {
             return Ok(());
         }
         let explicit = [route.http2.as_ref(), rt_tpl.and_then(|t| t.http2.as_ref())]
@@ -1951,9 +1966,10 @@ impl Config {
             .any(|h| h.enabled == Some(true));
         if explicit {
             return Err(ConfigError::Invalid(format!(
-                "route {}: http2 cannot be enabled on a `{}` route",
+                "route {}: http2 cannot be enabled on a `{}` route over {:?}",
                 route.label(),
-                route_type.map(route_type_name).unwrap_or("unknown")
+                route_type.map(route_type_name).unwrap_or("unknown"),
+                listener.transport
             )));
         }
         Ok(())
@@ -1990,12 +2006,30 @@ impl Config {
         )))
     }
 
-    /// Resolve the concrete protocol type for `route`, taking the route's own
-    /// `type` first and otherwise the referenced template's.
+    /// Resolve the public/configured route type, taking the route's own `type`
+    /// first and otherwise the referenced template's.
     pub fn effective_route_type(route: &Route, rt_tpl: Option<&Template>) -> Option<RouteType> {
         route
             .route_type
             .or_else(|| rt_tpl.and_then(|t| t.route_type))
+    }
+
+    /// Normalize the transport-agnostic public type into the concrete runtime
+    /// data path. H3/H3-ECH exist only after this point; they are not TOML types.
+    pub fn runtime_route_type(
+        transport: ListenerTransport,
+        route_type: RouteType,
+    ) -> Option<RouteType> {
+        match (transport, route_type) {
+            (
+                ListenerTransport::Tcp,
+                RouteType::Raw | RouteType::Http | RouteType::Tls | RouteType::Ech,
+            ) => Some(route_type),
+            (ListenerTransport::Quic, RouteType::Raw) => Some(RouteType::Raw),
+            (ListenerTransport::Quic, RouteType::Tls) => Some(RouteType::H3),
+            (ListenerTransport::Quic, RouteType::Ech) => Some(RouteType::H3Ech),
+            _ => None,
+        }
     }
 
     /// Post-resolution ECH validation for one route: an ECH route must resolve to
@@ -2035,18 +2069,7 @@ impl Config {
         let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
             ConfigError::Invalid(format!("route {}: missing type", route.label()))
         })?;
-        let valid = match listener.transport {
-            ListenerTransport::Tcp => matches!(
-                route_type,
-                RouteType::Raw | RouteType::Http | RouteType::Tls | RouteType::Ech
-            ),
-            ListenerTransport::Quic => {
-                matches!(
-                    route_type,
-                    RouteType::Raw | RouteType::H3 | RouteType::H3Ech
-                )
-            }
-        };
+        let valid = Self::runtime_route_type(listener.transport, route_type).is_some();
         if valid {
             Ok(())
         } else {
