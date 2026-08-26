@@ -37,6 +37,8 @@ pub async fn serve_inbound(
         .get(handshake_route)
         .cloned()
         .ok_or_else(|| anyhow!("invalid H3 route index {handshake_route}"))?;
+    let reflects_dial_host = route.upstream_host.is_none();
+    let reflects_server_name = matches!(route.sni_policy, SniPolicy::Reflect | SniPolicy::Omit);
 
     let upstream = connect_upstream_h3(&route, &handshake_sni, peer, &state.cert_resolver).await?;
     proxy_inbound_h3(
@@ -46,6 +48,8 @@ pub async fn serve_inbound(
         handshake_route,
         handshake_sni,
         route.name.clone(),
+        reflects_dial_host,
+        reflects_server_name,
         upstream,
     )
     .await
@@ -62,6 +66,8 @@ async fn proxy_inbound_h3(
     handshake_route: usize,
     handshake_sni: String,
     route_name: String,
+    reflects_dial_host: bool,
+    reflects_server_name: bool,
     upstream: UpstreamH3,
 ) -> Result<()> {
     let quic = h3_quinn::Connection::new(connection);
@@ -87,14 +93,23 @@ async fn proxy_inbound_h3(
                     .map(|authority| authority.host())
                     .unwrap_or(sni.as_str());
                 let request_route = router.match_host(authority);
-                if request_route != Some(handshake_route) {
+                if !authority_reuses_upstream(
+                    request_route,
+                    handshake_route,
+                    authority,
+                    &sni,
+                    reflects_dial_host,
+                    reflects_server_name,
+                ) {
                     debug!(
                         %peer,
                         sni = %sni,
                         %authority,
                         handshake_route,
                         request_route = ?request_route,
-                        "rejecting coalesced H3 request that crosses route boundary"
+                        reflects_dial_host,
+                        reflects_server_name,
+                        "rejecting coalesced H3 request that would change upstream identity"
                     );
                     return empty_response(stream, StatusCode::MISDIRECTED_REQUEST).await;
                 }
@@ -125,6 +140,31 @@ async fn proxy_inbound_h3(
         });
     }
     Ok(())
+}
+
+/// Whether a request on an already-established inbound H3 connection can reuse
+/// the single upstream H3 connection created for the handshake SNI.
+///
+/// Crossing route IDs is always unsafe. Even within one route, a different
+/// authority cannot reuse the upstream connection when either the dial host or
+/// the upstream verification/SNI name reflects the inbound name; those values
+/// were fixed when the upstream QUIC handshake was established. Fixed dial host
+/// + fixed SNI routes may safely coalesce within the same route.
+fn authority_reuses_upstream(
+    request_route: Option<usize>,
+    handshake_route: usize,
+    authority: &str,
+    handshake_sni: &str,
+    reflects_dial_host: bool,
+    reflects_server_name: bool,
+) -> bool {
+    if request_route != Some(handshake_route) {
+        return false;
+    }
+    if authority.eq_ignore_ascii_case(handshake_sni) {
+        return true;
+    }
+    !(reflects_dial_host || reflects_server_name)
 }
 
 struct UpstreamH3 {

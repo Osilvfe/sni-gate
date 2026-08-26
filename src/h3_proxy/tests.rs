@@ -10,16 +10,61 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::time::timeout;
 
-use super::{proxy_inbound_h3, Router, UpstreamH3};
+use super::{authority_reuses_upstream, proxy_inbound_h3, Router, UpstreamH3};
 
 const FRONT_SNI: &str = "front.h3.test";
+const SIBLING_SNI: &str = "sibling.h3.test";
 const UPSTREAM_SNI: &str = "upstream.h3.test";
 const OTHER_SNI: &str = "other.h3.test";
 const REQUEST_BODY: &[u8] = b"request-through-h3-proxy";
 const RESPONSE_BODY: &[u8] = b"response-through-h3-proxy";
 
+#[test]
+fn same_route_coalescing_requires_stable_upstream_identity() {
+    assert!(authority_reuses_upstream(
+        Some(0),
+        0,
+        FRONT_SNI,
+        FRONT_SNI,
+        true,
+        true
+    ));
+    assert!(!authority_reuses_upstream(
+        Some(0),
+        0,
+        SIBLING_SNI,
+        FRONT_SNI,
+        true,
+        false
+    ));
+    assert!(!authority_reuses_upstream(
+        Some(0),
+        0,
+        SIBLING_SNI,
+        FRONT_SNI,
+        false,
+        true
+    ));
+    assert!(authority_reuses_upstream(
+        Some(0),
+        0,
+        SIBLING_SNI,
+        FRONT_SNI,
+        false,
+        false
+    ));
+    assert!(!authority_reuses_upstream(
+        Some(1),
+        0,
+        OTHER_SNI,
+        FRONT_SNI,
+        false,
+        false
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() {
+async fn semantic_proxy_preserves_h3_message_and_blocks_unsafe_coalescing() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let rcgen::CertifiedKey { cert, signing_key } =
@@ -96,7 +141,7 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
             match timeout(Duration::from_millis(500), h3.accept()).await {
                 Err(_) | Ok(Ok(None)) | Ok(Err(_)) => {}
                 Ok(Ok(Some(_))) => {
-                    panic!("cross-route request must not reach the upstream H3 connection")
+                    panic!("unsafe coalesced request must not reach the upstream H3 connection")
                 }
             }
         }
@@ -133,7 +178,10 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
     let gateway_addr = gateway_endpoint.local_addr().unwrap();
     let router = Arc::new(
         Router::build(
-            &[vec![FRONT_SNI.to_string()], vec![OTHER_SNI.to_string()]],
+            &[
+                vec![FRONT_SNI.to_string(), SIBLING_SNI.to_string()],
+                vec![OTHER_SNI.to_string()],
+            ],
             None,
             &HashMap::new(),
         )
@@ -156,6 +204,8 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
                 0,
                 FRONT_SNI.to_string(),
                 "h3-test".to_string(),
+                true,
+                true,
                 upstream,
             )
             .await;
@@ -215,27 +265,29 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_cross_route_authority() 
         .expect("response trailers present");
     assert_eq!(response_trailers["x-response-trailer"], "preserved");
 
-    let blocked = Request::get(format!("https://{OTHER_SNI}/blocked"))
-        .body(())
-        .unwrap();
-    let mut blocked_stream = sender
-        .send_request(blocked)
-        .await
-        .expect("send cross-route H3 request");
-    blocked_stream
-        .finish()
-        .await
-        .expect("finish blocked request");
-    let blocked_response = blocked_stream
-        .recv_response()
-        .await
-        .expect("receive 421 response");
-    assert_eq!(blocked_response.status(), StatusCode::MISDIRECTED_REQUEST);
-    assert!(blocked_stream
-        .recv_data()
-        .await
-        .expect("read empty 421 body")
-        .is_none());
+    for blocked_host in [SIBLING_SNI, OTHER_SNI] {
+        let blocked = Request::get(format!("https://{blocked_host}/blocked"))
+            .body(())
+            .unwrap();
+        let mut blocked_stream = sender
+            .send_request(blocked)
+            .await
+            .expect("send unsafe coalesced H3 request");
+        blocked_stream
+            .finish()
+            .await
+            .expect("finish blocked request");
+        let blocked_response = blocked_stream
+            .recv_response()
+            .await
+            .expect("receive 421 response");
+        assert_eq!(blocked_response.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert!(blocked_stream
+            .recv_data()
+            .await
+            .expect("read empty 421 body")
+            .is_none());
+    }
 
     drop(sender);
     close_handle.close(0u32.into(), b"test complete");
