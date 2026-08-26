@@ -5,6 +5,9 @@
 //! HTTP/3 request semantics. Request authority is re-routed per stream so H3
 //! connection coalescing can never bypass the listener's route boundaries.
 
+#[path = "upstream_certs.rs"]
+mod upstream_certs;
+
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use tracing::{debug, warn};
 
 use crate::config::{RouteType, SniPolicy};
 use crate::proxy::{ListenerState, RouteRuntime};
+use crate::resolver::DynamicResolver;
 
 pub async fn serve_inbound(
     connection: quinn::Connection,
@@ -32,7 +36,13 @@ pub async fn serve_inbound(
         .cloned()
         .ok_or_else(|| anyhow!("invalid H3 route index {handshake_route}"))?;
 
-    let upstream = connect_upstream_h3(&route, &handshake_sni, peer).await?;
+    let upstream = connect_upstream_h3(
+        &route,
+        &handshake_sni,
+        peer,
+        &state.cert_resolver,
+    )
+    .await?;
 
     let quic = h3_quinn::Connection::new(connection);
     let mut inbound = h3::server::Connection::new(quic)
@@ -112,6 +122,7 @@ async fn connect_upstream_h3(
     route: &RouteRuntime,
     handshake_sni: &str,
     peer: SocketAddr,
+    cert_resolver: &Arc<DynamicResolver>,
 ) -> Result<UpstreamH3> {
     let host = route
         .upstream_host
@@ -186,6 +197,19 @@ async fn connect_upstream_h3(
         .is_some_and(|protocol| protocol.as_slice() == b"h3");
     if !negotiated_h3 {
         return Err(anyhow!("upstream QUIC connection did not negotiate h3 ALPN"));
+    }
+
+    if let Some(chain) = connection
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
+    {
+        upstream_certs::observe_upstream_certificate(
+            cert_resolver,
+            &route.name,
+            &route.sni_policy,
+            Some(handshake_sni),
+            chain.as_slice(),
+        );
     }
 
     debug!(
