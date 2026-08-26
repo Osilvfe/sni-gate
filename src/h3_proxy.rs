@@ -22,6 +22,7 @@ use crate::resolver::DynamicResolver;
 use crate::router::Router;
 
 #[cfg(test)]
+#[path = "h3_proxy/tests.rs"]
 mod tests;
 
 pub async fn serve_inbound(
