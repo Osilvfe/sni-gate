@@ -92,7 +92,9 @@ transport = "tcp"
     runtime.block_on(async move {
         let mut roots = RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
-            roots.add(cert.expect("parse generated CA certificate")).unwrap();
+            roots
+                .add(cert.expect("parse generated CA certificate"))
+                .unwrap();
         }
 
         let mut tls = rustls::ClientConfig::builder()
