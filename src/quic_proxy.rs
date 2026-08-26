@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::config::RouteType;
+use crate::config::{FailPolicy, RouteType};
 use crate::proxy::{ListenerState, RouteRuntime};
 use crate::quic_initial::{InitialInspector, InitialSni};
 use quic_socket::{InboundDatagram, QuicIngress, SharedQuicSocket};
@@ -464,6 +464,26 @@ enum InspectResult {
     Routed { sni: String, packets: Vec<Vec<u8>> },
 }
 
+fn warn_unsupported_fail_policies(state: &ListenerState) {
+    if state.unmatched != FailPolicy::Close {
+        warn!(
+            addr = %state.addr,
+            policy = ?state.unmatched,
+            "QUIC unmatched/inherited fail policy is unsupported; QUIC failures are fail-closed"
+        );
+    }
+    for route in &state.routes {
+        if route.fail != FailPolicy::Close && route.fail != state.unmatched {
+            warn!(
+                addr = %state.addr,
+                route = %route.name,
+                policy = ?route.fail,
+                "QUIC route fail policy is unsupported; QUIC route failures are fail-closed"
+            );
+        }
+    }
+}
+
 /// Serve one UDP/QUIC listener.
 pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     let listener = Arc::new(
@@ -471,6 +491,7 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             .await
             .with_context(|| format!("binding QUIC listener {}", state.addr))?,
     );
+    warn_unsupported_fail_policies(&state);
     let flows: Flows = Arc::new(Mutex::new(FlowTable::default()));
     let h3 = start_h3_endpoint(listener.clone(), state.clone())?;
     let h3_ingress = h3.as_ref().map(|(_, ingress)| ingress.clone());

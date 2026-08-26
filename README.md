@@ -48,8 +48,10 @@ QUIC/TLS endpoint. `h3` and `h3-ech` instead terminate inbound QUIC and proxy
 HTTP/3 messages semantically.
 
 Routing precedence is `exact` > `wildcard *.x` > `suffix .x` > `regex @name` >
-the listener's `default_route`. No match and no default route applies the global
-`unmatched` policy.
+the listener's `default_route`. On TCP, no match and no default route applies the
+global `unmatched` policy. QUIC is deliberately fail-closed: unmatched datagrams
+are dropped and failed H3/raw routes are closed rather than transparently switched
+to another UDP destination.
 
 ## Listener address
 
@@ -99,9 +101,19 @@ packets to the selected upstream **without modifying the datagrams**. It does
 not terminate QUIC or issue a certificate for the raw flow.
 
 Raw-flow ownership tracks QUIC connection IDs in addition to the client's UDP
-address, so a known connection can follow source-address rebinding rather than
-being permanently tied to the first `(IP, port)` tuple. Idle flows are reaped and
-flow-count limits prevent the UDP NAT table from growing without bound.
+address. The dispatcher learns the client's Initial DCID and server SCIDs that are
+visible in upstream long headers, so a flow using a **known server CID** can follow
+ordinary NAT/source-port rebinding instead of being permanently tied to its first
+`(IP, port)` tuple. CID sets are bounded per flow, Initial inspection has separate
+flow/memory quotas, and idle flows are reaped.
+
+This is intentionally **not a claim of full QUIC migration or arbitrary CID
+rotation support**. A transparent raw proxy cannot decrypt 1-RTT
+`NEW_CONNECTION_ID` frames, so it cannot learn every future server CID. Zero-length
+CIDs also provide no CID token to route on. A raw-only listener may use the unique
+peer tuple as a limited fallback for short-header traffic; a mixed raw + H3 listener
+deliberately disables that fallback for unknown packets so H3 traffic cannot be
+captured by a raw flow.
 
 ### `h3` and `h3-ech`
 
@@ -116,10 +128,16 @@ ClientHello. The canonical config spelling is `type = "h3-ech"`; the earlier
 development spelling `h3ech` remains accepted as a compatibility alias.
 
 HTTP/3 connection coalescing cannot bypass routing: every inbound request's
-`:authority` is checked against the listener router again. If it belongs to a
-different route than the connection's handshake SNI, sni-gate answers **421
-Misdirected Request** and does not forward that request to the existing upstream
-connection.
+`:authority` is checked against the listener router again. Crossing to a different
+route always yields **421 Misdirected Request**. The same-route case is also rejected
+when the new authority would change the already-established upstream identity — for
+example when the route reflects its dial host or its upstream SNI/verification name.
+Same-route coalescing across authorities is allowed only when both the dial target
+and upstream TLS identity are fixed and therefore remain the same connection target.
+
+`idle_timeout` on `h3` / `h3-ech` is measured at the HTTP/3 application layer and is
+refreshed by request/response headers, DATA, and trailers. QUIC ACKs or transport
+keepalives alone do not keep an otherwise idle proxied request alive.
 
 A complete QUIC example is included in
 [`sni-gate.example.toml`](sni-gate.example.toml).
@@ -384,6 +402,12 @@ An unset value at a deeper scope inherits the next one out. This applies to
 `ech_refresh`, `require_ech`, `connect_timeout`, `idle_timeout`, and the fail
 policy. So you can set, say, a different `addr_resolver` or `nat64_prefix` on a
 single route while everything else inherits the global value.
+
+`system-outbound` and fixed-address `passthrough` failure fallback are currently
+**TCP-only**. QUIC listeners always fail closed on unmatched traffic or route
+failure. If a QUIC route inherits or explicitly resolves to a non-`close` fail
+policy, startup logs a warning so the unsupported policy is never silently ignored;
+mixed TCP+QUIC configurations remain valid and the TCP listener still honors it.
 
 The **`[http2]` block** inherits field-by-field along this same ladder, so
 `enabled` / `probe` / `probe_timeout` each resolve independently — see
