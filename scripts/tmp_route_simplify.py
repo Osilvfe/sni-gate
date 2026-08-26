@@ -40,6 +40,41 @@ readme.write_text(text)
 
 runpy.run_path("scripts/tmp_route_simplify_impl.py", run_name="__main__")
 
+# A template-backed route deliberately keeps route_type=None in the synthetic
+# companion: `use = "web"` must remain the source of type=tls. Validate the
+# effective public type and only then normalize it to the QUIC/H3 runtime path.
+test_path = Path("tests/quic_config.rs")
+test_text = test_path.read_text()
+wrong = '''    let expanded = cfg.expanded_listeners().unwrap();
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::Tls));
+}
+
+#[test]
+fn global_http3_maps_ech_and_raw() {
+'''
+right = '''    let expanded = cfg.expanded_listeners().unwrap();
+    assert_eq!(expanded.len(), 2);
+    let route = &expanded[1].routes[0];
+    assert_eq!(route.route_type, None);
+    let template_name = route.use_template.as_deref().unwrap();
+    let template = cfg.templates.get(template_name).unwrap();
+    let configured_type = Config::effective_route_type(route, Some(template)).unwrap();
+    assert_eq!(configured_type, RouteType::Tls);
+    assert_eq!(
+        Config::runtime_route_type(expanded[1].transport, configured_type),
+        Some(RouteType::H3)
+    );
+}
+
+#[test]
+fn global_http3_maps_ech_and_raw() {
+'''
+count = test_text.count(wrong)
+if count != 1:
+    raise SystemExit(f"template companion transformed assertion: expected 1 match, found {count}")
+test_path.write_text(test_text.replace(wrong, right, 1))
+
 # The implementation completed its own sanity checks. Remove all temporary
 # validation scaffolding before fmt/test and before the workflow commits the
 # validated source/docs diff.
