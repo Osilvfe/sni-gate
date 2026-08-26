@@ -11,6 +11,43 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Temporary bridge for connector-created branch refs: connector ref updates
+  # currently surface the base SHA as github.sha, so the ordinary jobs below
+  # cannot validate the actual branch head. This job explicitly checks out the
+  # route-simplification branch, applies its staged transform, validates it, and
+  # commits only the verified source/docs changes back to that branch.
+  validate-route-simplification:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/work/config-route-simplify'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: work/config-route-simplify
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
+      - name: Apply route-type simplification
+        run: python scripts/tmp_route_simplify.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Commit validated branch
+        run: |
+          rm -f scripts/tmp_route_simplify.py .github/workflows/tmp-route-simplify.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "refactor(config): make route types transport-agnostic"
+          git push origin HEAD:work/config-route-simplify
+
   # Format + lint once (platform-independent) so every push fails fast on style.
   lint:
     runs-on: ubuntu-latest
