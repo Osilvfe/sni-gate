@@ -193,6 +193,7 @@ pub enum RouteType {
     H3,
     /// Terminate inbound QUIC/HTTP/3 and re-originate HTTP/3 over QUIC with an
     /// ECH-protected TLS ClientHello.
+    #[serde(rename = "h3-ech", alias = "h3ech")]
     H3Ech,
 }
 
