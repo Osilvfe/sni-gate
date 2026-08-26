@@ -550,9 +550,19 @@ fn build_route(
 
     let eff = cfg.effective(listener, route, rt_tpl, ln_tpl);
 
-    // Concrete protocol type (route → template), guaranteed present by validation.
-    let route_type = Config::effective_route_type(route, rt_tpl)
+    // Public route type is transport-agnostic. Normalize it exactly once into
+    // the concrete runtime path: QUIC+tls => H3 and QUIC+ech => H3-ECH.
+    let configured_route_type = Config::effective_route_type(route, rt_tpl)
         .ok_or_else(|| anyhow::anyhow!("route {}: missing type", route.label()))?;
+    let route_type = Config::runtime_route_type(listener.transport, configured_route_type)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "route {}: type {:?} is incompatible with {:?}",
+                route.label(),
+                configured_route_type,
+                listener.transport
+            )
+        })?;
 
     // Upstream comes from the route or its template (route scope only). Defaulted
     // parts resolve against this listener's port; a `None` host reflects the

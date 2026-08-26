@@ -68,7 +68,8 @@ addr = "127.0.0.1:{listen}"
   match_sni = [".h2.auto.test"]
   upstream = "127.0.0.1:{h2_backend}"
 
-  # This TCP TLS route is mapped to h3 in the synthetic UDP companion.
+  # This TCP TLS route keeps type=tls in the synthetic UDP companion; the
+  # QUIC transport normalizes it to the H3 runtime path.
   [[listener.route]]
   name = "h3"
   type = "tls"

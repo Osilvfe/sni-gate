@@ -50,8 +50,9 @@ unmatched = "close"
 enabled = false
 
 # HTTP/3 companion generation is independent from HTTP/2. Set this true to
-# bind UDP automatically beside eligible TCP listeners. Mapping:
-# tls -> h3, ech -> h3-ech, raw -> raw; cleartext http is skipped.
+# bind UDP automatically beside eligible TCP listeners. Public route types are
+# preserved: tls/ech become terminating H3/H3+ECH on QUIC, raw stays transparent;
+# cleartext http is skipped because H3-to-H1/H2 translation is not implemented.
 [global.http3]
 enabled = false
 # The startup h2c check for `http` routes. It VALIDATES, it never DECIDES: no
@@ -296,18 +297,18 @@ idle_timeout = "5m"
   # that coalesces a different route onto this QUIC connection receives 421.
   [[listener.route]]
   name = "h3-direct"
-  type = "h3"
+  type = "tls"
   match_sni = [".h3.example"]
   upstream = "origin-h3.example:443"
   # override_sni = "origin-h3.example"   # optional upstream QUIC TLS SNI
 
   # Same HTTP/3 semantics, but the upstream QUIC TLS ClientHello uses ECH.
-  # Canonical route spelling is "h3-ech"; the old development spelling "h3ech"
-  # remains accepted for compatibility. This route inherits [global.ech] here;
-  # put a route-specific [listener.route.ech] block below if needed.
+  # The route type remains simply "ech"; transport = "quic" selects H3 semantics.
+  # This route inherits [global.ech] here; put a route-specific
+  # [listener.route.ech] block below if needed.
   [[listener.route]]
   name = "h3-private-sni"
-  type = "h3-ech"
+  type = "ech"
   match_sni = [".private-h3.example"]
   upstream = "edge-h3.example:443"
   override_sni = "origin.private-h3.example"
