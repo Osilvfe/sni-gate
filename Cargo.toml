@@ -18,6 +18,20 @@ anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
 
+# QUIC / HTTP/3. Quinn uses the same rustls + aws-lc-rs provider as the TCP
+# data path; h3-quinn adapts Quinn streams to the protocol-aware h3 layer.
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
+h3 = { version = "0.0.8", features = ["tracing"] }
+h3-quinn = { version = "0.0.10", features = ["tracing"] }
+bytes = "1"
+http = "1"
+futures-util = "0.3"
+
+# Stateless QUIC Initial inspection for raw SNI passthrough.
+aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+
 # TLS with native ECH client support. aws-lc-rs provides the HPKE suites ECH
 # needs; the whole binary standardizes on this one provider.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }

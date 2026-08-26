@@ -44,7 +44,7 @@ use tokio::time::timeout;
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
-use crate::config::{AddressFamily, FailPolicy, RouteType, SniPolicy};
+use crate::config::{AddressFamily, FailPolicy, ListenerTransport, RouteType, SniPolicy};
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::peek::{classify, Inbound};
@@ -104,11 +104,14 @@ pub struct ServerConfigs {
     /// `["h2", "http/1.1"]`, h2 preferred. Used by `http` routes, where there is
     /// no upstream ALPN to mirror and the client's preference decides.
     pub h2h1: Arc<ServerConfig>,
+    /// `["h3"]`, used by the QUIC/HTTP/3 data path.
+    pub h3: Arc<ServerConfig>,
 }
 
 /// Immutable per-listener state shared with every connection task.
 pub struct ListenerState {
     pub addr: SocketAddr,
+    pub transport: ListenerTransport,
     /// Shared with this listener's certificate resolver, which routes each
     /// ClientHello's SNI to decide what the certificate may cover.
     pub router: Arc<Router>,
@@ -415,7 +418,7 @@ async fn serve_mirrored(
             })?;
             dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
         }
-        RouteType::Http | RouteType::Raw => {
+        RouteType::Http | RouteType::Raw | RouteType::H3 | RouteType::H3Ech => {
             unreachable!("mirroring only applies to tls/ech routes")
         }
     };
@@ -522,6 +525,9 @@ where
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Raw => unreachable!("raw handled before termination"),
+        RouteType::H3 | RouteType::H3Ech => {
+            unreachable!("HTTP/3 routes are handled by the QUIC data path")
+        }
     }
 }
 
@@ -937,6 +943,7 @@ mod tests {
             h1: with(vec![b"http/1.1".to_vec()]),
             h2: with(vec![b"h2".to_vec()]),
             h2h1: with(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+            h3: with(vec![b"h3".to_vec()]),
         }
     }
 

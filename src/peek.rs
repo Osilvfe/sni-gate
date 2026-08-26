@@ -150,7 +150,7 @@ async fn peek_at_least(stream: &TcpStream, buf: &mut [u8], want: usize) -> Optio
 // TLS ClientHello SNI parser
 // ---------------------------------------------------------------------------
 
-enum TlsParse {
+pub(crate) enum TlsParse {
     Sni(String),
     NoSni,
     NeedMore,
@@ -160,7 +160,7 @@ enum TlsParse {
 /// Parse the SNI (host_name) out of a TLS ClientHello. All indexing is bounds-
 /// checked; malformed or truncated input yields `NeedMore`/`NotClientHello`
 /// rather than panicking.
-fn parse_tls_sni(b: &[u8]) -> TlsParse {
+pub(crate) fn parse_tls_sni(b: &[u8]) -> TlsParse {
     // TLS record header: type(1) version(2) length(2)
     if b.len() < 5 {
         return TlsParse::NeedMore;

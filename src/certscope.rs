@@ -246,6 +246,8 @@ fn route_type_str(t: RouteType) -> &'static str {
         RouteType::Tls => "tls",
         RouteType::Http => "http",
         RouteType::Raw => "raw",
+        RouteType::H3 => "h3",
+        RouteType::H3Ech => "h3-ech",
     }
 }
 

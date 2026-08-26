@@ -139,6 +139,12 @@ pub struct Listener {
     #[serde(deserialize_with = "de_listen_addr")]
     pub addr: SocketAddr,
 
+    /// Inbound transport. TCP is the historical/default data path; QUIC binds
+    /// the same numeric address as UDP and accepts `raw`, `h3`, and `h3-ech`
+    /// routes.
+    #[serde(default)]
+    pub transport: ListenerTransport,
+
     /// Name of a `[templates.<name>]` bundle whose settings apply to this
     /// listener's scope (below the listener's own explicit values, above global).
     #[serde(default, rename = "use")]
@@ -182,6 +188,21 @@ pub enum RouteType {
     /// Do not terminate: splice the raw TCP byte stream to the upstream.
     /// No certificate is issued.
     Raw,
+    /// Terminate inbound QUIC/HTTP/3 and re-originate HTTP/3 over ordinary
+    /// QUIC TLS.
+    H3,
+    /// Terminate inbound QUIC/HTTP/3 and re-originate HTTP/3 over QUIC with an
+    /// ECH-protected TLS ClientHello.
+    H3Ech,
+}
+
+/// Socket transport used by one listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerTransport {
+    #[default]
+    Tcp,
+    Quic,
 }
 
 /// What SNI to present on the upstream handshake (`tls` / `ech` routes).
@@ -1422,13 +1443,14 @@ impl Config {
                 "at least one [[listener]] is required".into(),
             ));
         }
-        // Reject duplicate listen addresses.
+        // TCP and UDP/QUIC may intentionally share one numeric address. Reject
+        // only duplicate addresses within the same transport.
         for (i, a) in self.listeners.iter().enumerate() {
             for b in &self.listeners[i + 1..] {
-                if a.addr == b.addr {
+                if a.addr == b.addr && a.transport == b.transport {
                     return Err(ConfigError::Invalid(format!(
-                        "duplicate listener address {}",
-                        a.addr
+                        "duplicate {:?} listener address {}",
+                        a.transport, a.addr
                     )));
                 }
             }
@@ -1437,12 +1459,14 @@ impl Config {
             for r in &a.routes {
                 let rt_tpl = self.template_for(&r.use_template)?;
                 r.validate(false, port, rt_tpl)?;
+                self.validate_transport_route(a, r, rt_tpl)?;
                 self.validate_ech(a, r, rt_tpl, ln_tpl)?;
                 self.validate_http2(r, rt_tpl)?;
             }
             if let Some(d) = &a.default_route {
                 let rt_tpl = self.template_for(&d.use_template)?;
                 d.validate(true, port, rt_tpl)?;
+                self.validate_transport_route(a, d, rt_tpl)?;
                 self.validate_ech(a, d, rt_tpl, ln_tpl)?;
                 self.validate_http2(d, rt_tpl)?;
             }
@@ -1733,9 +1757,12 @@ impl Config {
         ln_tpl: Option<&Template>,
     ) -> EffectiveHttp2 {
         let tiers = self.http2_tiers(listener, route, rt_tpl, ln_tpl);
-        let is_raw = Self::effective_route_type(route, rt_tpl) == Some(RouteType::Raw);
+        let supports_http2 = matches!(
+            Self::effective_route_type(route, rt_tpl),
+            Some(RouteType::Http | RouteType::Tls | RouteType::Ech)
+        );
         EffectiveHttp2 {
-            enabled: !is_raw && tiers.iter().find_map(|h| h.enabled).unwrap_or(false),
+            enabled: supports_http2 && tiers.iter().find_map(|h| h.enabled).unwrap_or(false),
             probe: tiers.iter().find_map(|h| h.probe).unwrap_or_default(),
             probe_timeout: tiers
                 .iter()
@@ -1750,7 +1777,11 @@ impl Config {
     /// `enabled = true` on the route itself (or on the template it `use`s) can
     /// only be a mistake.
     fn validate_http2(&self, route: &Route, rt_tpl: Option<&Template>) -> Result<(), ConfigError> {
-        if Self::effective_route_type(route, rt_tpl) != Some(RouteType::Raw) {
+        let route_type = Self::effective_route_type(route, rt_tpl);
+        if matches!(
+            route_type,
+            Some(RouteType::Http | RouteType::Tls | RouteType::Ech)
+        ) {
             return Ok(());
         }
         let explicit = [route.http2.as_ref(), rt_tpl.and_then(|t| t.http2.as_ref())]
@@ -1759,9 +1790,9 @@ impl Config {
             .any(|h| h.enabled == Some(true));
         if explicit {
             return Err(ConfigError::Invalid(format!(
-                "route {}: http2 cannot be enabled on a `raw` route (raw never \
-                 terminates TLS, so there is no ALPN to negotiate)",
-                route.label()
+                "route {}: http2 cannot be enabled on a `{}` route",
+                route.label(),
+                route_type.map(route_type_name).unwrap_or("unknown")
             )));
         }
         Ok(())
@@ -1785,7 +1816,10 @@ impl Config {
         rt_tpl: Option<&Template>,
         ln_tpl: Option<&Template>,
     ) -> Result<(), ConfigError> {
-        if Self::effective_route_type(route, rt_tpl) != Some(RouteType::Ech) {
+        if !matches!(
+            Self::effective_route_type(route, rt_tpl),
+            Some(RouteType::Ech | RouteType::H3Ech)
+        ) {
             return Ok(());
         }
         let eff = self.effective_ech(listener, route, rt_tpl, ln_tpl);
@@ -1798,6 +1832,50 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    fn validate_transport_route(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+    ) -> Result<(), ConfigError> {
+        let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
+            ConfigError::Invalid(format!("route {}: missing type", route.label()))
+        })?;
+        let valid = match listener.transport {
+            ListenerTransport::Tcp => matches!(
+                route_type,
+                RouteType::Raw | RouteType::Http | RouteType::Tls | RouteType::Ech
+            ),
+            ListenerTransport::Quic => {
+                matches!(
+                    route_type,
+                    RouteType::Raw | RouteType::H3 | RouteType::H3Ech
+                )
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ConfigError::Invalid(format!(
+                "route {}: type = {:?} is incompatible with a {:?} listener",
+                route.label(),
+                route_type,
+                listener.transport
+            )))
+        }
+    }
+}
+
+fn route_type_name(t: RouteType) -> &'static str {
+    match t {
+        RouteType::Ech => "ech",
+        RouteType::Tls => "tls",
+        RouteType::Http => "http",
+        RouteType::Raw => "raw",
+        RouteType::H3 => "h3",
+        RouteType::H3Ech => "h3-ech",
     }
 }
 

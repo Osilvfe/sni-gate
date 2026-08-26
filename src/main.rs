@@ -17,6 +17,8 @@ mod peek;
 mod probe;
 mod proxy;
 mod psl;
+mod quic_initial;
+mod quic_proxy;
 mod resolver;
 mod router;
 mod store;
@@ -37,7 +39,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::ca::{CaParams, CertificateAuthority};
 use crate::certscope::{CertScope, EchIdentity, Forwarding};
-use crate::config::{Config, Listener, Route, RouteType};
+use crate::config::{Config, Listener, ListenerTransport, Route, RouteType};
 use crate::dns::ResolverSpec;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
@@ -249,9 +251,11 @@ async fn run(cfg: Config) -> Result<()> {
     for st in listener_states {
         let addr = st.addr;
         set.spawn(async move {
-            proxy::serve(st)
-                .await
-                .with_context(|| format!("listener {addr}"))
+            match st.transport {
+                ListenerTransport::Tcp => proxy::serve(st).await,
+                ListenerTransport::Quic => quic_proxy::serve(st).await,
+            }
+            .with_context(|| format!("listener {addr}"))
         });
     }
 
@@ -359,10 +363,12 @@ fn build_listener(
         h1: with_alpn(vec![b"http/1.1".to_vec()]),
         h2: with_alpn(vec![b"h2".to_vec()]),
         h2h1: with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+        h3: with_alpn(vec![b"h3".to_vec()]),
     });
 
     Ok(ListenerState {
         addr: listener.addr,
+        transport: listener.transport,
         router,
         routes: runtimes,
         server_configs,
@@ -528,7 +534,7 @@ fn build_route(
     // ECH routes to one socket that draw their keys from different sources are not
     // interchangeable, so they must not share a certificate.
     let mut ech_identity: Option<EchIdentity> = None;
-    let ech = if route_type == RouteType::Ech {
+    let ech = if matches!(route_type, RouteType::Ech | RouteType::H3Ech) {
         let ech_spec = eff.ech_resolver.clone().unwrap_or_else(|| {
             // Default ECH resolver: use addr_resolver if present, else system resolver
             eff.addr_resolver
