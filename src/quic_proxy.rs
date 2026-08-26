@@ -26,6 +26,8 @@ use quic_socket::{InboundDatagram, QuicIngress, SharedQuicSocket};
 const MAX_INITIAL_DATAGRAMS: usize = 8;
 const MAX_INITIAL_BYTES: usize = 32 * 1024;
 const MAX_FLOWS: usize = 4096;
+const MAX_INSPECTING_FLOWS: usize = 256;
+const MAX_INSPECTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CID_LEN: usize = 20;
 const MAX_CIDS_PER_FLOW: usize = 32;
 const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -109,6 +111,16 @@ impl InspectingFlow {
         self.bytes += packet.len();
         self.packets.push(packet.to_vec());
         Ok(())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.bytes.saturating_add(self.inspector.buffered_bytes())
+    }
+
+    fn take_packets_and_release_inspector(&mut self) -> Vec<Vec<u8>> {
+        self.bytes = 0;
+        self.inspector = InitialInspector::default();
+        std::mem::take(&mut self.packets)
     }
 }
 
@@ -330,6 +342,54 @@ impl FlowTable {
         }
     }
 
+    fn inspecting_stats(&self) -> (usize, usize) {
+        self.entries.values().fold((0usize, 0usize), |stats, entry| {
+            match &entry.state {
+                FlowState::Inspecting(flow) => (
+                    stats.0 + 1,
+                    stats.1.saturating_add(flow.retained_bytes()),
+                ),
+                FlowState::Forwarding { .. } => stats,
+            }
+        })
+    }
+
+    fn evict_oldest_inspecting(&mut self) -> bool {
+        let oldest = self
+            .entries
+            .iter()
+            .filter_map(|(&id, entry)| match &entry.state {
+                FlowState::Inspecting(flow) => Some((id, flow.last_activity)),
+                FlowState::Forwarding { .. } => None,
+            })
+            .min_by_key(|(_, activity)| *activity)
+            .map(|(id, _)| id);
+        if let Some(id) = oldest {
+            self.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reserve one slot for a new unauthenticated Initial flow. Pressure only
+    /// evicts inspecting entries; already-routed forwarding flows are never
+    /// sacrificed to make room for attacker-controlled pre-routing state.
+    fn make_room_for_inspecting(&mut self) -> bool {
+        loop {
+            let (inspecting, bytes) = self.inspecting_stats();
+            if self.len() < MAX_FLOWS
+                && inspecting < MAX_INSPECTING_FLOWS
+                && bytes < MAX_INSPECTION_BYTES
+            {
+                return true;
+            }
+            if !self.evict_oldest_inspecting() {
+                return false;
+            }
+        }
+    }
+
     fn promote(
         &mut self,
         id: FlowId,
@@ -449,8 +509,14 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                         }
                         continue;
                     };
-                    if table.len() >= MAX_FLOWS {
-                        warn!(%peer, max_flows = MAX_FLOWS, "dropping new QUIC flow because listener flow limit is reached");
+                    if !table.make_room_for_inspecting() {
+                        warn!(
+                            %peer,
+                            max_flows = MAX_FLOWS,
+                            max_inspecting = MAX_INSPECTING_FLOWS,
+                            max_inspection_bytes = MAX_INSPECTION_BYTES,
+                            "dropping new QUIC Initial because inspection capacity is exhausted by forwarding flows"
+                        );
                         continue;
                     }
                     table.insert_inspecting(peer, now, Some(initial_dcid))
@@ -476,25 +542,38 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                             InitialSni::Invalid => InspectResult::Invalid,
                             InitialSni::Name(sni) => InspectResult::Routed {
                                 sni,
-                                packets: std::mem::take(&mut flow.packets),
+                                packets: flow.take_packets_and_release_inspector(),
                             },
                             InitialSni::NoSni => InspectResult::Routed {
                                 sni: String::new(),
-                                packets: std::mem::take(&mut flow.packets),
+                                packets: flow.take_packets_and_release_inspector(),
                             },
                         }
                     }
                 };
 
-                match inspection {
-                    InspectResult::NeedMore => None,
-                    InspectResult::Invalid => {
-                        table.remove(id);
-                        debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
-                        None
-                    }
-                    InspectResult::Routed { sni, packets } => {
-                        Some((id, None, Some((sni, packets))))
+                let (_, inspection_bytes) = table.inspecting_stats();
+                if inspection_bytes > MAX_INSPECTION_BYTES {
+                    table.remove(id);
+                    debug!(
+                        %peer,
+                        flow_id = id,
+                        inspection_bytes,
+                        max_inspection_bytes = MAX_INSPECTION_BYTES,
+                        "dropping QUIC Initial flow because global inspection memory budget was exceeded"
+                    );
+                    None
+                } else {
+                    match inspection {
+                        InspectResult::NeedMore => None,
+                        InspectResult::Invalid => {
+                            table.remove(id);
+                            debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            None
+                        }
+                        InspectResult::Routed { sni, packets } => {
+                            Some((id, None, Some((sni, packets))))
+                        }
                     }
                 }
             }
@@ -808,6 +887,46 @@ mod tests {
         assert!(!flows.entries.contains_key(&stale_id));
         assert!(flows.entries.contains_key(&live_id));
         assert!(flows.entries.contains_key(&forwarding_id));
+    }
+
+    #[test]
+    fn inspection_capacity_evicts_oldest_without_touching_forwarding() {
+        let now = Instant::now();
+        let mut flows = FlowTable::default();
+        let forwarding_id = flows.insert_inspecting(
+            "127.0.0.1:8000".parse().unwrap(),
+            now - Duration::from_secs(60),
+            None,
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let (peer_tx, _peer_rx) = watch::channel("127.0.0.1:8000".parse().unwrap());
+        assert!(flows.promote(forwarding_id, tx, peer_tx));
+
+        let mut oldest = None;
+        for index in 0..MAX_INSPECTING_FLOWS {
+            let peer: SocketAddr = format!("127.0.0.1:{}", 10_000 + index)
+                .parse()
+                .unwrap();
+            let id = flows.insert_inspecting(peer, now + Duration::from_millis(index as u64), None);
+            oldest.get_or_insert(id);
+        }
+        assert_eq!(flows.inspecting_stats().0, MAX_INSPECTING_FLOWS);
+
+        assert!(flows.make_room_for_inspecting());
+        assert!(!flows.entries.contains_key(&oldest.unwrap()));
+        assert!(flows.entries.contains_key(&forwarding_id));
+        assert_eq!(flows.inspecting_stats().0, MAX_INSPECTING_FLOWS - 1);
+    }
+
+    #[test]
+    fn inspection_byte_budget_evicts_oldest_inspecting() {
+        let now = Instant::now();
+        let mut flows = FlowTable::default();
+        let id = flows.insert_inspecting("127.0.0.1:9000".parse().unwrap(), now, None);
+        flows.inspecting_mut(id).unwrap().bytes = MAX_INSPECTION_BYTES;
+        assert!(flows.make_room_for_inspecting());
+        assert!(!flows.entries.contains_key(&id));
+        assert_eq!(flows.inspecting_stats(), (0, 0));
     }
 
     #[test]
