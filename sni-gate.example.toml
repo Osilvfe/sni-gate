@@ -261,6 +261,51 @@ connect_timeout = "5s"
   type = "raw"
   match_sni = [".mirror.example"]
 
+# ===========================================================================
+# Listener 3 — QUIC/UDP on 443
+# ===========================================================================
+# A TCP listener and a QUIC listener may intentionally share the same numeric
+# address: TCP owns 0.0.0.0:443/TCP while this listener owns 0.0.0.0:443/UDP.
+# Duplicate listeners on the SAME transport/address are rejected.
+[[listener]]
+addr = "0.0.0.0:443"
+transport = "quic"
+connect_timeout = "5s"
+idle_timeout = "5m"
+
+  # Raw QUIC passthrough: sni-gate decrypts only the QUIC v1/v2 Initial far
+  # enough to recover ClientHello SNI, then forwards the buffered and subsequent
+  # UDP datagrams unchanged. The upstream, not sni-gate, owns the QUIC/TLS
+  # connection and certificate.
+  [[listener.route]]
+  name = "quic-raw"
+  type = "raw"
+  match_sni = [".raw-quic.example"]
+  upstream = "127.0.0.1:9443"
+
+  # HTTP/3 termination and re-origination. This is a semantic H3 → H3 proxy:
+  # request/response headers, DATA and trailers are forwarded as HTTP/3 messages;
+  # it is not a byte splice and it does not translate to HTTP/1.1 or HTTP/2.
+  # Each request's :authority is checked against this listener's router. A client
+  # that coalesces a different route onto this QUIC connection receives 421.
+  [[listener.route]]
+  name = "h3-direct"
+  type = "h3"
+  match_sni = [".h3.example"]
+  upstream = "origin-h3.example:443"
+  # override_sni = "origin-h3.example"   # optional upstream QUIC TLS SNI
+
+  # Same HTTP/3 semantics, but the upstream QUIC TLS ClientHello uses ECH.
+  # Canonical route spelling is "h3-ech"; the old development spelling "h3ech"
+  # remains accepted for compatibility. This route inherits [global.ech] here;
+  # put a route-specific [listener.route.ech] block below if needed.
+  [[listener.route]]
+  name = "h3-private-sni"
+  type = "h3-ech"
+  match_sni = [".private-h3.example"]
+  upstream = "edge-h3.example:443"
+  override_sni = "origin.private-h3.example"
+
 # ---------------------------------------------------------------------------
 # Named resolvers (advanced DNS configuration with bootstrap chains and ECH)
 # ---------------------------------------------------------------------------
@@ -284,4 +329,3 @@ connect_timeout = "5s"
 #   mode = "doh"
 #   require_ech = true
 #   ech_resolver = "@cloudflare"     # Cloudflare fetches secure's ECH config
-
