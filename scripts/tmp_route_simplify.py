@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import runpy
 
 readme = Path("README.md")
@@ -74,6 +75,49 @@ count = test_text.count(wrong)
 if count != 1:
     raise SystemExit(f"template companion transformed assertion: expected 1 match, found {count}")
 test_path.write_text(test_text.replace(wrong, right, 1))
+
+# The temporary validator's final vocabulary check uses `rg`, while the hosted
+# image does not currently ship ripgrep. Put a tiny compatibility shim in
+# CARGO_HOME/bin (already on PATH for this job). It lives outside the repository
+# and supports exactly the recursive regex search shape used by the validator.
+cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
+rg = cargo_home / "bin" / "rg"
+rg.parent.mkdir(parents=True, exist_ok=True)
+rg.write_text(
+    '''#!/usr/bin/env python3
+import re
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+show_lines = False
+while args and args[0].startswith("-"):
+    if args[0] == "-n":
+        show_lines = True
+        args.pop(0)
+    else:
+        raise SystemExit(2)
+if len(args) < 2:
+    raise SystemExit(2)
+pattern = re.compile(args[0])
+roots = [Path(p) for p in args[1:]]
+matched = False
+for root in roots:
+    files = [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
+    for path in files:
+        try:
+            lines = path.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        for lineno, line in enumerate(lines, 1):
+            if pattern.search(line):
+                matched = True
+                prefix = f"{path}:{lineno}:" if show_lines else f"{path}:"
+                print(prefix + line)
+raise SystemExit(0 if matched else 1)
+'''
+)
+rg.chmod(0o755)
 
 # The implementation completed its own sanity checks. Remove all temporary
 # validation scaffolding before fmt/test and before the workflow commits the
