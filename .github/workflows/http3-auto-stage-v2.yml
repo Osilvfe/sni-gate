@@ -1,0 +1,726 @@
+name: Stage automatic HTTP3 companion v2
+
+on:
+  push:
+    branches:
+      - tmp/http3-auto-companion
+    paths:
+      - .github/workflows/http3-auto-stage-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Patch HTTP3 companion support
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def one(text, old, new, label):
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected 1 marker, found {n}")
+              return text.replace(old, new, 1)
+
+          def patch_struct_field(text, struct_name, field_marker, insertion):
+              start = text.index(f"pub struct {struct_name} {{")
+              end = text.index("\n}\n", start)
+              chunk = text[start:end]
+              if insertion.strip() in chunk:
+                  return text
+              n = chunk.count(field_marker)
+              if n != 1:
+                  raise SystemExit(f"{struct_name}: expected one field marker, found {n}")
+              chunk = chunk.replace(field_marker, field_marker + insertion, 1)
+              return text[:start] + chunk + text[end:]
+
+          # ---------------- src/config.rs ----------------
+          p = Path("src/config.rs")
+          text = p.read_text()
+          text = one(
+              text,
+              "use std::collections::HashMap;",
+              "use std::collections::{HashMap, HashSet};",
+              "collections import",
+          )
+
+          text = patch_struct_field(
+              text,
+              "Global",
+              "    pub http2: Option<Http2Config>,\n",
+              "\n    /// Outermost `[http3]` defaults for automatic QUIC companions.\n"
+              "    #[serde(default)]\n"
+              "    pub http3: Option<Http3Config>,\n",
+          )
+          text = patch_struct_field(
+              text,
+              "Listener",
+              "    pub http2: Option<Http2Config>,\n",
+              "\n    /// Listener-scope `[http3]` defaults.\n"
+              "    #[serde(default)]\n"
+              "    pub http3: Option<Http3Config>,\n",
+          )
+          text = patch_struct_field(
+              text,
+              "Route",
+              "    pub http2: Option<Http2Config>,\n",
+              "\n    /// Automatic HTTP/3/QUIC companion settings at route scope.\n"
+              "    #[serde(default)]\n"
+              "    pub http3: Option<Http3Config>,\n",
+          )
+          text = patch_struct_field(
+              text,
+              "Template",
+              "    pub http2: Option<Http2Config>,\n",
+              "\n    /// HTTP/3 companion settings supplied by this template.\n"
+              "    #[serde(default)]\n"
+              "    pub http3: Option<Http3Config>,\n",
+          )
+
+          h2_start = text.index("pub struct Http2Config {")
+          h2_end_marker = "\n}\n\n/// What a failed startup h2c probe should do."
+          h2_end = text.index(h2_end_marker, h2_start)
+          if "pub struct Http3Config" not in text:
+              h3 = '''
+          }
+
+          /// Per-scope automatic HTTP/3 companion settings.
+          ///
+          /// Enabling this on an eligible TCP route synthesizes the same numeric UDP
+          /// listener and maps `tls -> h3`, `ech -> h3-ech`, and `raw -> raw`.
+          /// Cleartext `http` is not protocol-translated and therefore has no mapping.
+          #[derive(Debug, Clone, Deserialize)]
+          #[serde(deny_unknown_fields)]
+          pub struct Http3Config {
+              /// Enable automatic QUIC companion generation. Inherits; default false.
+              #[serde(default)]
+              pub enabled: Option<bool>,
+          }
+
+          /// What a failed startup h2c probe should do.'''
+              text = text[:h2_end] + h3 + text[h2_end + len(h2_end_marker):]
+
+          eff_marker = '''pub struct EffectiveHttp2 {
+              pub enabled: bool,
+              pub probe: H2Probe,
+              pub probe_timeout: Duration,
+          }
+          '''
+          if "pub struct EffectiveHttp3" not in text:
+              text = one(
+                  text,
+                  eff_marker,
+                  eff_marker + '''
+          /// The fully-resolved `[http3]` switch for one route.
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub struct EffectiveHttp3 {
+              pub enabled: bool,
+          }
+          ''',
+                  "EffectiveHttp2",
+              )
+
+          text = one(
+              text,
+              "                self.validate_http2(r, rt_tpl)?;",
+              "                self.validate_http2(r, rt_tpl)?;\n                self.validate_http3(a, r, rt_tpl)?;",
+              "route validate_http3",
+          )
+          text = one(
+              text,
+              "                self.validate_http2(d, rt_tpl)?;",
+              "                self.validate_http2(d, rt_tpl)?;\n                self.validate_http3(a, d, rt_tpl)?;",
+              "default validate_http3",
+          )
+
+          methods_marker = "    /// Reject an *explicit* HTTP/2 opt-in on a `raw` route. Only the two\n"
+          if "fn http3_tiers<'a>" not in text:
+              methods = '''    /// The five HTTP/3 tiers in deepest-to-shallowest order.
+              fn http3_tiers<'a>(
+                  &'a self,
+                  listener: &'a Listener,
+                  route: &'a Route,
+                  rt_tpl: Option<&'a Template>,
+                  ln_tpl: Option<&'a Template>,
+              ) -> Vec<&'a Http3Config> {
+                  [
+                      route.http3.as_ref(),
+                      rt_tpl.and_then(|t| t.http3.as_ref()),
+                      listener.http3.as_ref(),
+                      ln_tpl.and_then(|t| t.http3.as_ref()),
+                      self.global.http3.as_ref(),
+                  ]
+                  .into_iter()
+                  .flatten()
+                  .collect()
+              }
+
+              /// Resolve whether automatic HTTP/3 is enabled for one configured route.
+              pub fn effective_http3(
+                  &self,
+                  listener: &Listener,
+                  route: &Route,
+                  rt_tpl: Option<&Template>,
+                  ln_tpl: Option<&Template>,
+              ) -> EffectiveHttp3 {
+                  let tiers = self.http3_tiers(listener, route, rt_tpl, ln_tpl);
+                  EffectiveHttp3 {
+                      enabled: tiers.iter().find_map(|h| h.enabled).unwrap_or(false),
+                  }
+              }
+
+              /// Map a TCP route type to the route type used by its QUIC companion.
+              pub fn http3_companion_route_type(route_type: RouteType) -> Option<RouteType> {
+                  match route_type {
+                      RouteType::Tls => Some(RouteType::H3),
+                      RouteType::Ech => Some(RouteType::H3Ech),
+                      RouteType::Raw => Some(RouteType::Raw),
+                      RouteType::Http | RouteType::H3 | RouteType::H3Ech => None,
+                  }
+              }
+
+              fn http3_companion_route(
+                  &self,
+                  listener: &Listener,
+                  route: &Route,
+                  ln_tpl: Option<&Template>,
+              ) -> Result<Option<Route>, ConfigError> {
+                  let rt_tpl = self.template_for(&route.use_template)?;
+                  if !self
+                      .effective_http3(listener, route, rt_tpl, ln_tpl)
+                      .enabled
+                  {
+                      return Ok(None);
+                  }
+                  let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
+                      ConfigError::Invalid(format!("route {}: missing type", route.label()))
+                  })?;
+                  let Some(companion_type) = Self::http3_companion_route_type(route_type) else {
+                      return Ok(None);
+                  };
+                  let mut companion = route.clone();
+                  // Explicitly mapped type wins over a route template carrying the TCP type.
+                  companion.route_type = Some(companion_type);
+                  companion.http3 = None;
+                  Ok(Some(companion))
+              }
+
+              /// Build the automatic QUIC companion for one configured TCP listener.
+              pub fn http3_companion_listener(
+                  &self,
+                  listener: &Listener,
+              ) -> Result<Option<Listener>, ConfigError> {
+                  if listener.transport != ListenerTransport::Tcp {
+                      return Ok(None);
+                  }
+                  let ln_tpl = self.template_for(&listener.use_template)?;
+                  let mut routes = Vec::new();
+                  for route in &listener.routes {
+                      if let Some(route) = self.http3_companion_route(listener, route, ln_tpl)? {
+                          routes.push(route);
+                      }
+                  }
+                  let default_route = match &listener.default_route {
+                      Some(route) => self.http3_companion_route(listener, route, ln_tpl)?,
+                      None => None,
+                  };
+                  if routes.is_empty() && default_route.is_none() {
+                      return Ok(None);
+                  }
+                  let mut companion = listener.clone();
+                  companion.transport = ListenerTransport::Quic;
+                  companion.routes = routes;
+                  companion.default_route = default_route;
+                  companion.http3 = None;
+                  Ok(Some(companion))
+              }
+
+              /// Return the listeners that should actually be bound at runtime.
+              /// Explicit QUIC on an address always owns UDP and suppresses synthesis there.
+              pub fn expanded_listeners(&self) -> Result<Vec<Listener>, ConfigError> {
+                  let explicit_quic: HashSet<SocketAddr> = self
+                      .listeners
+                      .iter()
+                      .filter(|l| l.transport == ListenerTransport::Quic)
+                      .map(|l| l.addr)
+                      .collect();
+                  let mut expanded = Vec::with_capacity(self.listeners.len().saturating_mul(2));
+                  for listener in &self.listeners {
+                      expanded.push(listener.clone());
+                      if listener.transport == ListenerTransport::Tcp
+                          && !explicit_quic.contains(&listener.addr)
+                      {
+                          if let Some(companion) = self.http3_companion_listener(listener)? {
+                              expanded.push(companion);
+                          }
+                      }
+                  }
+                  Ok(expanded)
+              }
+
+          '''
+              text = one(text, methods_marker, methods + methods_marker, "HTTP3 methods insertion")
+
+          validation_marker = "    /// Resolve the concrete protocol type for `route`, taking the route's own\n"
+          if "fn validate_http3(" not in text:
+              validation = '''    /// Reject an explicit HTTP/3 opt-in where automatic mapping is impossible.
+              /// Listener/global defaults remain broad defaults and unsupported route types skip them.
+              fn validate_http3(
+                  &self,
+                  listener: &Listener,
+                  route: &Route,
+                  rt_tpl: Option<&Template>,
+              ) -> Result<(), ConfigError> {
+                  let explicit = [route.http3.as_ref(), rt_tpl.and_then(|t| t.http3.as_ref())]
+                      .into_iter()
+                      .flatten()
+                      .any(|h| h.enabled == Some(true));
+                  if !explicit {
+                      return Ok(());
+                  }
+                  let route_type = Self::effective_route_type(route, rt_tpl).ok_or_else(|| {
+                      ConfigError::Invalid(format!("route {}: missing type", route.label()))
+                  })?;
+                  if listener.transport == ListenerTransport::Tcp
+                      && Self::http3_companion_route_type(route_type).is_some()
+                  {
+                      return Ok(());
+                  }
+                  Err(ConfigError::Invalid(format!(
+                      "route {}: http3 cannot be enabled explicitly for `{}` on a {:?} listener",
+                      route.label(),
+                      route_type_name(route_type),
+                      listener.transport
+                  )))
+              }
+
+          '''
+              text = one(text, validation_marker, validation + validation_marker, "HTTP3 validation insertion")
+
+          p.write_text(text, encoding="utf-8")
+
+          # ---------------- src/main.rs ----------------
+          p = Path("src/main.rs")
+          text = p.read_text()
+          text = one(
+              text,
+              "use tracing::{debug, error, info};",
+              "use tracing::{debug, error, info, warn};",
+              "tracing import",
+          )
+          old = '''async fn run(cfg: Config) -> Result<()> {
+              info!(
+                  version = env!("CARGO_PKG_VERSION"),
+                  listeners = cfg.listeners.len(),
+                  "starting sni-gate"
+              );
+          '''
+          new = '''async fn run(cfg: Config) -> Result<()> {
+              let runtime_listeners = cfg
+                  .expanded_listeners()
+                  .context("expanding automatic HTTP/3 companion listeners")?;
+              log_http3_expansion(&cfg)?;
+              info!(
+                  version = env!("CARGO_PKG_VERSION"),
+                  configured_listeners = cfg.listeners.len(),
+                  listeners = runtime_listeners.len(),
+                  "starting sni-gate"
+              );
+          '''
+          text = one(text, old, new, "run prelude")
+          text = one(
+              text,
+              "    // --- Build every listener ---\n    let mut listener_states: Vec<Arc<ListenerState>> = Vec::new();\n    for listener in &cfg.listeners {",
+              "    // --- Build configured listeners plus automatic HTTP/3 companions ---\n    let mut listener_states: Vec<Arc<ListenerState>> = Vec::new();\n    for listener in &runtime_listeners {",
+              "runtime listener build loop",
+          )
+          helper_marker = "/// Assemble one listener's router + route runtimes from config.\nfn build_listener("
+          if "fn log_http3_expansion(" not in text:
+              helper = '''/// Log automatic HTTP/3 expansion decisions that matter to operators.
+          fn log_http3_expansion(cfg: &Config) -> Result<()> {
+              for listener in cfg
+                  .listeners
+                  .iter()
+                  .filter(|l| l.transport == ListenerTransport::Tcp)
+              {
+                  let explicit_quic = cfg.listeners.iter().any(|q| {
+                      q.transport == ListenerTransport::Quic && q.addr == listener.addr
+                  });
+                  let companion = cfg.http3_companion_listener(listener)?;
+                  if explicit_quic {
+                      if companion.is_some() {
+                          info!(
+                              addr = %listener.addr,
+                              "explicit QUIC listener owns this address; automatic HTTP/3 companion suppressed"
+                          );
+                      }
+                      continue;
+                  }
+
+                  let ln_tpl = cfg.template_for(&listener.use_template)?;
+                  for route in listener.routes.iter().chain(listener.default_route.iter()) {
+                      let rt_tpl = cfg.template_for(&route.use_template)?;
+                      if !cfg
+                          .effective_http3(listener, route, rt_tpl, ln_tpl)
+                          .enabled
+                      {
+                          continue;
+                      }
+                      let Some(route_type) = Config::effective_route_type(route, rt_tpl) else {
+                          continue;
+                      };
+                      if Config::http3_companion_route_type(route_type).is_none() {
+                          warn!(
+                              addr = %listener.addr,
+                              route = %route.label(),
+                              route_type = ?route_type,
+                              "automatic HTTP/3 companion skipped: route type has no H3 mapping"
+                          );
+                      }
+                  }
+                  if let Some(companion) = companion {
+                      info!(
+                          addr = %companion.addr,
+                          routes = companion.routes.len(),
+                          has_default_route = companion.default_route.is_some(),
+                          "automatic HTTP/3 companion listener enabled"
+                      );
+                  }
+              }
+              Ok(())
+          }
+
+          '''
+              text = one(text, helper_marker, helper + helper_marker, "HTTP3 logging helper")
+          p.write_text(text, encoding="utf-8")
+
+          # ---------------- tests/quic_config.rs ----------------
+          p = Path("tests/quic_config.rs")
+          text = p.read_text().rstrip()
+          if "global_http2_and_http3_can_coexist_on_one_tcp_listener" not in text:
+              text += r'''
+
+          #[test]
+          fn global_http2_and_http3_can_coexist_on_one_tcp_listener() {
+              let cfg = load(r#"
+          [global.http2]
+          enabled = true
+          [global.http3]
+          enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            type = "tls"
+            match_sni = [".web.example"]
+          "#).unwrap();
+              let tcp = &cfg.listeners[0];
+              let route = &tcp.routes[0];
+              let rt_tpl = cfg.template_for(&route.use_template).unwrap();
+              let ln_tpl = cfg.template_for(&tcp.use_template).unwrap();
+              assert!(cfg.effective_http2(tcp, route, rt_tpl, ln_tpl).enabled);
+              assert!(cfg.effective_http3(tcp, route, rt_tpl, ln_tpl).enabled);
+              let expanded = cfg.expanded_listeners().unwrap();
+              assert_eq!(expanded.len(), 2);
+              assert_eq!(expanded[0].transport, ListenerTransport::Tcp);
+              assert_eq!(expanded[0].routes[0].route_type, Some(RouteType::Tls));
+              assert_eq!(expanded[1].transport, ListenerTransport::Quic);
+              assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3));
+          }
+
+          #[test]
+          fn route_http3_false_disables_global_default() {
+              let cfg = load(r#"
+          [global.http3]
+          enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            type = "tls"
+            match_sni = ["disabled.example"]
+              [listener.route.http3]
+              enabled = false
+          "#).unwrap();
+              assert_eq!(cfg.expanded_listeners().unwrap().len(), 1);
+          }
+
+          #[test]
+          fn listener_http3_false_disables_global_default() {
+              let cfg = load(r#"
+          [global.http3]
+          enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [listener.http3]
+            enabled = false
+            [[listener.route]]
+            type = "tls"
+            match_sni = ["disabled.example"]
+          "#).unwrap();
+              assert_eq!(cfg.expanded_listeners().unwrap().len(), 1);
+          }
+
+          #[test]
+          fn template_can_enable_http3_companion() {
+              let cfg = load(r#"
+          [templates.web]
+          type = "tls"
+            [templates.web.http3]
+            enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            use = "web"
+            match_sni = ["template.example"]
+          "#).unwrap();
+              let expanded = cfg.expanded_listeners().unwrap();
+              assert_eq!(expanded.len(), 2);
+              assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3));
+          }
+
+          #[test]
+          fn global_http3_maps_ech_and_raw() {
+              let cfg = load(r#"
+          [global.http3]
+          enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            type = "ech"
+            match_sni = ["private.example"]
+            [[listener.route]]
+            type = "raw"
+            match_sni = ["raw.example"]
+          "#).unwrap();
+              let expanded = cfg.expanded_listeners().unwrap();
+              assert_eq!(expanded[1].routes[0].route_type, Some(RouteType::H3Ech));
+              assert_eq!(expanded[1].routes[1].route_type, Some(RouteType::Raw));
+          }
+
+          #[test]
+          fn global_http3_skips_cleartext_http_without_translation() {
+              let cfg = load(r#"
+          [global.http3]
+          enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            type = "http"
+            match_sni = ["plain.example"]
+          "#).unwrap();
+              assert_eq!(cfg.expanded_listeners().unwrap().len(), 1);
+          }
+
+          #[test]
+          fn explicit_route_http3_on_cleartext_http_is_rejected() {
+              let error = load(r#"
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            type = "http"
+            match_sni = ["plain.example"]
+              [listener.route.http3]
+              enabled = true
+          "#).expect_err("explicit HTTP/3 on cleartext HTTP must be rejected");
+              assert!(error.to_string().contains("http3 cannot be enabled explicitly"));
+          }
+
+          #[test]
+          fn explicit_quic_listener_suppresses_automatic_companion() {
+              let cfg = load(r#"
+          [global.http3]
+          enabled = true
+          [[listener]]
+          addr = "127.0.0.1:443"
+            [[listener.route]]
+            type = "tls"
+            match_sni = ["auto.example"]
+          [[listener]]
+          addr = "127.0.0.1:443"
+          transport = "quic"
+            [[listener.route]]
+            type = "raw"
+            match_sni = ["manual.example"]
+          "#).unwrap();
+              let expanded = cfg.expanded_listeners().unwrap();
+              assert_eq!(expanded.len(), 2);
+              let quic: Vec<_> = expanded.iter()
+                  .filter(|l| l.transport == ListenerTransport::Quic)
+                  .collect();
+              assert_eq!(quic.len(), 1);
+              assert_eq!(quic[0].routes[0].route_type, Some(RouteType::Raw));
+          }
+          '''
+          p.write_text(text + "\n", encoding="utf-8")
+
+          # ---------------- tests/quic_h3_resilience.rs ----------------
+          p = Path("tests/quic_h3_resilience.rs")
+          text = p.read_text()
+          text = one(
+              text,
+              "    let quic_port = free_udp_port();\n    let ready_port = free_tcp_port();",
+              "    let quic_port = free_dual_port();",
+              "resilience ports",
+          )
+          text = one(
+              text,
+              'unmatched = "close"\n\n[ca]',
+              'unmatched = "close"\n\n[global.http3]\nenabled = true\n\n[ca]',
+              "resilience global http3",
+          )
+          old = '''# Put QUIC first so it is spawned before the TCP readiness listener below.
+          [[listener]]
+          addr = "127.0.0.1:{quic_port}"
+          transport = "quic"
+            [[listener.route]]
+            name = "h3-alive"
+            type = "h3"
+            match_sni = ["{TEST_SNI}"]
+            upstream = "127.0.0.1:{upstream_port}"
+            override_sni = "{TEST_SNI}"
+            connect_timeout = "5s"
+
+          # A TCP listener gives us an observable startup barrier. No route is required:
+          # the readiness connection is simply closed by the global unmatched policy.
+          [[listener]]
+          addr = "127.0.0.1:{ready_port}"
+          transport = "tcp"
+          "#
+              );
+              let _gateway = spawn_sni_gate(&config, dir.path());
+              wait_tcp_port(ready_port);'''
+          new = '''# One configured TCP listener; [global.http3] synthesizes UDP on this port.
+          [[listener]]
+          addr = "127.0.0.1:{quic_port}"
+            [[listener.route]]
+            name = "h3-alive"
+            type = "tls"
+            match_sni = ["{TEST_SNI}"]
+            upstream = "127.0.0.1:{upstream_port}"
+            override_sni = "{TEST_SNI}"
+            connect_timeout = "5s"
+          "#
+              );
+              let _gateway = spawn_sni_gate(&config, dir.path());
+              wait_tcp_port(quic_port);'''
+          text = one(text, old, new, "resilience listener conversion")
+          funcs_start = text.index("fn free_tcp_port() -> u16 {")
+          funcs_end = text.index("\nfn wait_tcp_port", funcs_start)
+          replacement = '''fn free_dual_port() -> u16 {
+              for _ in 0..100 {
+                  let tcp = TcpListener::bind("127.0.0.1:0").expect("reserve candidate TCP port");
+                  let port = tcp.local_addr().unwrap().port();
+                  if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+                      drop(udp);
+                      drop(tcp);
+                      return port;
+                  }
+              }
+              panic!("could not find a port free for both TCP and UDP");
+          }
+          '''
+          text = text[:funcs_start] + replacement + text[funcs_end:]
+          p.write_text(text, encoding="utf-8")
+
+          # ---------------- README.md ----------------
+          p = Path("README.md")
+          text = p.read_text()
+          old = '''Listeners default to `transport = "tcp"`. Set `transport = "quic"` to bind UDP
+          and enable QUIC routes. TCP and QUIC may deliberately share the same numeric
+          address because they are different transport namespaces:
+
+          ```toml
+          [[listener]]
+          addr = "0.0.0.0:443"
+          transport = "tcp"
+          # ... TCP routes ...
+
+          [[listener]]
+          addr = "0.0.0.0:443"
+          transport = "quic"
+          # ... raw / h3 / h3-ech routes ...
+          ```
+
+          A duplicate address on the **same** transport is rejected at startup. Thus two
+          TCP listeners on `0.0.0.0:443` are invalid, as are two QUIC listeners there, but
+          one of each is valid.'''
+          new = '''Listeners default to `transport = "tcp"`. TCP and QUIC use different transport
+          namespaces, so both may own the same numeric address. For the common case, enable
+          HTTP/3 without duplicating listeners or routes:
+
+          ```toml
+          [global.http2]
+          enabled = true
+
+          [global.http3]
+          enabled = true
+
+          [[listener]]
+          addr = "0.0.0.0:443"
+            [[listener.route]]
+            type = "tls"
+            match_sni = [".example.com"]
+          ```
+
+          sni-gate keeps the configured TCP listener and synthesizes a QUIC companion on
+          `0.0.0.0:443/UDP`. Eligible route types map as `tls -> h3`, `ech -> h3-ech`,
+          and `raw -> raw`. Cleartext `http` is skipped because H3-to-HTTP/1.1/h2c
+          translation is not implemented. `[http3]` inherits through route, template,
+          listener, listener-template, then global, so narrower scopes may set
+          `enabled = false` under a global opt-in.
+
+          Advanced deployments may still declare `transport = "quic"` explicitly. An
+          explicit QUIC listener on the same address owns UDP and suppresses automatic
+          companion generation there, allowing TCP and QUIC routing tables to differ.'''
+          text = one(text, old, new, "README listener HTTP3 section")
+          text = one(
+              text,
+              "A QUIC listener accepts only `raw`, `h3`, and `h3-ech` routes.",
+              "HTTP/3 can use an automatic `[http3]` companion or an explicit `transport = \"quic\"` listener. The resulting QUIC listener accepts only `raw`, `h3`, and `h3-ech` routes; both paths use the same dispatcher and H3 implementation.",
+              "README QUIC intro",
+          )
+          p.write_text(text, encoding="utf-8")
+
+          # ---------------- sni-gate.example.toml ----------------
+          p = Path("sni-gate.example.toml")
+          text = p.read_text()
+          marker = '''[global.http2]
+          enabled = false
+          '''
+          insertion = '''[global.http2]
+          enabled = false
+
+          # HTTP/3 companion generation is independent from HTTP/2. Set this true to
+          # bind UDP automatically beside eligible TCP listeners. Mapping:
+          # tls -> h3, ech -> h3-ech, raw -> raw; cleartext http is skipped.
+          [global.http3]
+          enabled = false
+          '''
+          text = one(text, marker, insertion, "example global http3")
+          text = one(
+              text,
+              "# Listener 3 — QUIC/UDP on 443",
+              "# Listener 3 — explicit QUIC/UDP on 443 (advanced override)",
+              "example explicit QUIC heading",
+          )
+          p.write_text(text, encoding="utf-8")
+      - name: Format Rust
+        run: cargo fmt --all
+      - name: Focused tests
+        run: cargo test --locked --test quic_config --test quic_h3_resilience
+      - name: Commit staged implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/config.rs src/main.rs tests/quic_config.rs tests/quic_h3_resilience.rs README.md sni-gate.example.toml
+          git diff --cached --quiet && exit 0
+          git commit -m "feat(http3): add automatic QUIC companions"
+          git push
