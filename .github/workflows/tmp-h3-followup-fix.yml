@@ -1,0 +1,94 @@
+name: tmp-h3-followup-fix
+on:
+  push:
+    branches: [tmp/quic-ngtcp2-interoperability]
+permissions:
+  contents: write
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: tmp/quic-ngtcp2-interoperability
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
+      - name: Patch follow-up Initial routing and diagnostics
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('src/quic_proxy.rs')
+          s = p.read_text()
+          old = '''                        InspectResult::Invalid => {
+                            table.remove(id);
+                            debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            None
+                        }
+'''
+          new = '''                        InspectResult::Invalid => {
+                            table.remove(id);
+                            if let Some(ingress) = &h3_ingress {
+                                // Once a QUIC connection has received a server Initial, later
+                                // client Initial packets can use a server-selected DCID while
+                                // retaining the connection's original Initial key context. A
+                                // stateless inspector that only sees this packet therefore
+                                // cannot always decrypt it. Let Quinn, which owns the live
+                                // connection state, make the authoritative validity decision.
+                                dispatch_to_h3(ingress, peer, datagram);
+                                debug!(
+                                    %peer,
+                                    flow_id = id,
+                                    "forwarding statelessly-uninspectable QUIC Initial to H3 endpoint"
+                                );
+                            } else {
+                                debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                            }
+                            None
+                        }
+'''
+          if old not in s:
+              raise SystemExit('invalid Initial arm anchor missing')
+          s = s.replace(old, new, 1)
+          old = '''                        if let Err(error) =
+                            h3_proxy::serve_inbound(connection, peer, state, route_id, sni).await
+                        {
+                            debug!(%peer, error = %format!("{error:#}"), "H3 connection failed");
+                        }
+'''
+          new = '''                        let diagnostics = connection.clone();
+                        if let Err(error) =
+                            h3_proxy::serve_inbound(connection, peer, state, route_id, sni).await
+                        {
+                            debug!(
+                                %peer,
+                                error = %format!("{error:#}"),
+                                close_reason = ?diagnostics.close_reason(),
+                                stats = ?diagnostics.stats(),
+                                "H3 connection failed"
+                            );
+                        }
+'''
+          if old not in s:
+              raise SystemExit('H3 error diagnostics anchor missing')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('tests/quic_h3_resilience.rs')
+          s = p.read_text().replace(
+              '    let oversized = vec![0u8; 60_000];\n',
+              '    // 8 KiB is well above the historical 1,472-byte cap while still\n'
+              '    // below macOS\' conservative default UDP max-datagram limit.\n'
+              '    let oversized = vec![0u8; 8 * 1024];\n',
+              1,
+          )
+          p.write_text(s)
+      - run: cargo fmt --all
+      - run: cargo test --locked --test quic_h3_resilience --test http23_auto_e2e
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Commit generated patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/quic_proxy.rs tests/quic_h3_resilience.rs
+          git commit -m 'fix(quic): preserve H3 follow-up Initial traffic'
+          git push origin HEAD:tmp/quic-ngtcp2-interoperability
