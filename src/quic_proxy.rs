@@ -2,6 +2,8 @@
 
 #[path = "quic_socket.rs"]
 mod quic_socket;
+#[path = "h3_proxy.rs"]
+mod h3_proxy;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -583,22 +585,39 @@ fn start_h3_endpoint(
                         let sni = handshake
                             .as_ref()
                             .and_then(|data| data.server_name.as_deref())
-                            .unwrap_or("");
-                        let route = state
-                            .router
-                            .match_host(sni)
-                            .and_then(|id| state.routes.get(id));
+                            .unwrap_or("")
+                            .to_string();
+                        let route_id = state.router.match_host(&sni);
+                        let route = route_id.and_then(|id| state.routes.get(id));
                         debug!(
                             %peer,
-                            sni = %display_sni(sni),
+                            sni = %display_sni(&sni),
                             route = route.map(|route| route.name.as_str()).unwrap_or("<unmatched>"),
                             "H3 QUIC handshake established"
                         );
-                        // The shared dispatcher and TLS termination are now live.
-                        // Step 3 replaces this explicit close with the h3 request
-                        // loop, so no connection is accidentally treated as a
-                        // working HTTP/3 proxy before semantic forwarding exists.
-                        connection.close(0u32.into(), b"H3 handler not installed");
+                        let Some(route_id) = route_id else {
+                            connection.close(0u32.into(), b"unmatched H3 SNI");
+                            return;
+                        };
+                        let Some(route) = state.routes.get(route_id) else {
+                            connection.close(0u32.into(), b"invalid H3 route");
+                            return;
+                        };
+                        if !matches!(route.route_type, RouteType::H3 | RouteType::H3Ech) {
+                            connection.close(0u32.into(), b"route is not HTTP/3");
+                            return;
+                        }
+                        if let Err(error) = h3_proxy::serve_inbound(
+                            connection,
+                            peer,
+                            state,
+                            route_id,
+                            sni,
+                        )
+                        .await
+                        {
+                            debug!(%peer, error = %format!("{error:#}"), "H3 connection failed");
+                        }
                     }
                     Err(error) => {
                         debug!(%peer, error = %error, "H3 QUIC handshake failed");
