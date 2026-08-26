@@ -31,63 +31,74 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           h3 = Path("src/h3_proxy.rs")
           text = h3.read_text()
-          old = '''    let serve = async {
-              while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {
-          '''
-          new = '''    let serve = async {
-              loop {
-                  let resolver = match inbound.accept().await {
-                      Ok(Some(resolver)) => resolver,
-                      Ok(None) => return Ok::<(), anyhow::Error>(()),
-                      Err(error) if error.is_h3_no_error() => {
-                          debug!(
-                              %peer,
-                              route = %context.route_name,
-                              "H3 connection closed normally"
-                          );
-                          return Ok::<(), anyhow::Error>(());
-                      }
-                      Err(error) => {
-                          return Err(error).context("accepting HTTP/3 request");
-                      }
-                  };
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f"H3 accept loop prefix mismatch: {text.count(old)}")
-          text = text.replace(old, new, 1)
-          old = '''              });
-              }
-              Ok::<(), anyhow::Error>(())
-          };
-          '''
-          new = '''              });
-              }
-          };
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f"H3 accept loop suffix mismatch: {text.count(old)}")
-          text = text.replace(old, new, 1)
 
-          old = '''        let error = poll_fn(|cx| driver.poll_close(cx)).await;
-                  debug!(route = %route_name, error = %error, "upstream H3 driver closed");
-          '''
-          new = '''        let close = poll_fn(|cx| driver.poll_close(cx)).await;
-                  if close.is_h3_no_error() {
-                      debug!(route = %route_name, "upstream H3 driver closed normally");
-                  } else {
-                      debug!(
-                          route = %route_name,
-                          error = %close,
-                          "upstream H3 driver closed with error"
-                      );
-                  }
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f"H3 upstream close log mismatch: {text.count(old)}")
-          h3.write_text(text.replace(old, new, 1))
+          needle = 'while let Some(resolver) = inbound.accept().await.context("accepting HTTP/3 request")? {'
+          if text.count(needle) != 1:
+              raise SystemExit(f"H3 accept loop marker mismatch: {text.count(needle)}")
+          pos = text.index(needle)
+          line_start = text.rfind("\n", 0, pos) + 1
+          indent = text[line_start:pos]
+          replacement = "\n".join([
+              "loop {",
+              indent + "    let resolver = match inbound.accept().await {",
+              indent + "        Ok(Some(resolver)) => resolver,",
+              indent + "        Ok(None) => return Ok::<(), anyhow::Error>(()),",
+              indent + "        Err(error) if error.is_h3_no_error() => {",
+              indent + "            debug!(",
+              indent + "                %peer,",
+              indent + "                route = %context.route_name,",
+              indent + '                "H3 connection closed normally"',
+              indent + "            );",
+              indent + "            return Ok::<(), anyhow::Error>(());",
+              indent + "        }",
+              indent + "        Err(error) => {",
+              indent + '            return Err(error).context("accepting HTTP/3 request");',
+              indent + "        }",
+              indent + "    };",
+          ])
+          text = text.replace(needle, replacement, 1)
+
+          ok_line = "Ok::<(), anyhow::Error>(())"
+          if text.count(ok_line) != 2:
+              # one is the new normal-close arm; the other is the old loop-tail
+              raise SystemExit(f"unexpected H3 Ok marker count: {text.count(ok_line)}")
+          tail_pattern = re.compile(r'(?m)^\s*Ok::<\(\), anyhow::Error>\(\(\)\)\s*$')
+          matches = list(tail_pattern.finditer(text))
+          if len(matches) != 1:
+              # The normal-close arm has a trailing semicolon and does not match.
+              raise SystemExit(f"H3 loop tail mismatch: {len(matches)}")
+          start, end = matches[0].span()
+          if end < len(text) and text[end:end+1] == "\n":
+              end += 1
+          text = text[:start] + text[end:]
+
+          upstream_pattern = re.compile(
+              r'(?m)^(\s*)let error = poll_fn\(\|cx\| driver\.poll_close\(cx\)\)\.await;\n'
+              r'\1debug!\(route = %route_name, error = %error, "upstream H3 driver closed"\);$'
+          )
+          matches = list(upstream_pattern.finditer(text))
+          if len(matches) != 1:
+              raise SystemExit(f"H3 upstream close marker mismatch: {len(matches)}")
+          def replace_upstream(match):
+              i = match.group(1)
+              return "\n".join([
+                  i + "let close = poll_fn(|cx| driver.poll_close(cx)).await;",
+                  i + "if close.is_h3_no_error() {",
+                  i + '    debug!(route = %route_name, "upstream H3 driver closed normally");',
+                  i + "} else {",
+                  i + "    debug!(",
+                  i + "        route = %route_name,",
+                  i + "        error = %close,",
+                  i + '        "upstream H3 driver closed with error"',
+                  i + "    );",
+                  i + "}",
+              ])
+          text = upstream_pattern.sub(replace_upstream, text, count=1)
+          h3.write_text(text)
 
           psl = Path("src/psl.rs")
           text = psl.read_text()
@@ -111,9 +122,10 @@ jobs:
           from pathlib import Path
           h3 = Path("src/h3_proxy.rs").read_text()
           psl = Path("src/psl.rs").read_text()
-          assert '"H3 connection failed"' not in h3
+          assert 'error.is_h3_no_error()' in h3
           assert 'H3 connection closed normally' in h3
           assert 'upstream H3 driver closed normally' in h3
+          assert 'upstream H3 driver closed with error' in h3
           assert 'tracing::error!' not in psl
 
       - name: Restore CI and commit validated source
