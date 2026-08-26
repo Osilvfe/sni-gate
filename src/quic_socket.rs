@@ -18,6 +18,20 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 pub const DISPATCH_QUEUE: usize = 1024;
+/// Receive contract shared by the dispatcher and Quinn endpoint.
+/// RFC 9000 allows max_udp_payload_size up to 65,527 bytes. Quinn's
+/// 1,472-byte default is a conservative Ethernet-MTU choice, not a
+/// protocol validity limit; loopback/jumbo paths can legitimately
+/// deliver larger datagrams before transport parameters are known.
+pub const H3_MAX_UDP_PAYLOAD_SIZE: u16 = 65_527;
+
+pub fn h3_endpoint_config() -> io::Result<quinn::EndpointConfig> {
+    let mut config = quinn::EndpointConfig::default();
+    config
+        .max_udp_payload_size(H3_MAX_UDP_PAYLOAD_SIZE)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    Ok(config)
+}
 
 #[derive(Debug)]
 pub struct InboundDatagram {
@@ -33,6 +47,10 @@ pub struct QuicIngress {
 }
 
 impl QuicIngress {
+    pub fn max_datagram_size(&self) -> usize {
+        self.max_datagram_size
+    }
+
     pub fn try_send(
         &self,
         peer: SocketAddr,
@@ -64,14 +82,12 @@ pub struct SharedQuicSocket {
 }
 
 impl SharedQuicSocket {
-    pub fn new(socket: Arc<UdpSocket>) -> io::Result<(Arc<Self>, QuicIngress)> {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        max_datagram_size: usize,
+    ) -> io::Result<(Arc<Self>, QuicIngress)> {
         let state = UdpSocketState::new((&*socket).into())?;
         let (tx, rx) = mpsc::channel(DISPATCH_QUEUE);
-        // start_h3_endpoint currently uses EndpointConfig::default() as well.
-        // Derive the ingress cap from that config instead of baking in Quinn's
-        // current default value so a dependency upgrade cannot silently drift.
-        let max_datagram_size =
-            quinn::EndpointConfig::default().get_max_udp_payload_size() as usize;
         Ok((
             Arc::new(Self {
                 socket,
@@ -197,7 +213,8 @@ mod tests {
     #[tokio::test]
     async fn ingress_is_exposed_as_one_quinn_receive() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (socket, ingress) = SharedQuicSocket::new(udp).unwrap();
+        let (socket, ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         ingress.try_send(peer, b"quic-packet").unwrap();
 
@@ -217,7 +234,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_ingress_is_rejected_before_allocation() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (_socket, ingress) = SharedQuicSocket::new(udp).unwrap();
+        let (_socket, ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let oversized = vec![0u8; ingress.max_datagram_size + 1];
 
@@ -234,7 +252,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_queued_datagram_does_not_kill_receive_path() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (socket, ingress) = SharedQuicSocket::new(udp).unwrap();
+        let (socket, ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         ingress
             .tx
@@ -261,7 +280,8 @@ mod tests {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = receiver.local_addr().unwrap();
-        let (socket, _ingress) = SharedQuicSocket::new(udp).unwrap();
+        let (socket, _ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
         let transmit = Transmit {
             destination,
             ecn: None,

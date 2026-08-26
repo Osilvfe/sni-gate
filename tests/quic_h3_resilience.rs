@@ -61,16 +61,11 @@ addr = "127.0.0.1:{quic_port}"
     let _gateway = spawn_sni_gate(&config, dir.path());
     wait_tcp_port(quic_port);
 
-    // Quinn's endpoint config determines the receive-buffer contract used by
-    // SharedQuicSocket. Send a packet exactly one byte above that contract. The
-    // IPv4 UDP payload ceiling is 65,507 bytes, so fail loudly if a future Quinn
-    // default grows beyond what an on-wire regression test can exercise.
-    let quinn_cap = quinn::EndpointConfig::default().get_max_udp_payload_size() as usize;
-    assert!(
-        quinn_cap < 65_507,
-        "Quinn max UDP payload {quinn_cap} leaves no valid oversized IPv4 datagram"
-    );
-    let oversized = vec![0u8; quinn_cap + 1];
+    // Exercise a very large but valid IPv4 UDP payload. It is deliberately far
+    // above Quinn's 1,472-byte default: the shared endpoint must accept it into
+    // Quinn's receive contract and let QUIC discard the garbage packet without
+    // turning it into a fatal socket error.
+    let oversized = vec![0u8; 60_000];
     let attacker = UdpSocket::bind("127.0.0.1:0").expect("bind attacker UDP socket");
     for _ in 0..5 {
         attacker
@@ -97,7 +92,13 @@ addr = "127.0.0.1:{quic_port}"
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         let crypto = QuicClientConfig::try_from(tls).expect("build Quinn client crypto");
-        let client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        // Force a jumbo-safe loopback path so this handshake exercises datagrams
+        // above the historical 1,472-byte ingress cap that broke ngtcp2/curl.
+        let mut transport = quinn::TransportConfig::default();
+        transport.initial_mtu(4096);
+        transport.min_mtu(4096);
+        client_config.transport_config(Arc::new(transport));
         let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
             .expect("bind Quinn test client");
 

@@ -676,10 +676,13 @@ fn start_h3_endpoint(
     let quic_crypto = QuicServerConfig::try_from(server_crypto)
         .context("converting H3 rustls config to Quinn server crypto")?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let (socket, ingress) =
-        SharedQuicSocket::new(listener).context("initializing shared Quinn UDP socket")?;
+    let endpoint_config = quic_socket::h3_endpoint_config()
+        .context("configuring shared Quinn endpoint receive limit")?;
+    let max_datagram_size = endpoint_config.get_max_udp_payload_size() as usize;
+    let (socket, ingress) = SharedQuicSocket::new(listener, max_datagram_size)
+        .context("initializing shared Quinn UDP socket")?;
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+        endpoint_config,
         Some(server_config),
         socket,
         Arc::new(quinn::TokioRuntime),
@@ -740,10 +743,19 @@ fn start_h3_endpoint(
 }
 
 fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
+    if datagram.len() > ingress.max_datagram_size() {
+        debug!(
+            %peer,
+            bytes = datagram.len(),
+            max_bytes = ingress.max_datagram_size(),
+            "dropping oversized QUIC datagram before H3 ingress"
+        );
+        return;
+    }
     match ingress.try_send(peer, datagram) {
         Ok(()) => {}
         Err(TrySendError::Full(InboundDatagram { .. })) => {
-            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full or packet is oversized");
+            debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full");
         }
         Err(TrySendError::Closed(InboundDatagram { .. })) => {
             debug!(%peer, "dropping QUIC datagram because H3 endpoint is closed");
