@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use quinn::udp::{RecvMeta, Transmit};
+use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -48,19 +48,22 @@ impl QuicIngress {
 /// channel; send readiness comes from the shared Tokio UDP socket.
 pub struct SharedQuicSocket {
     socket: Arc<UdpSocket>,
+    state: UdpSocketState,
     rx: Mutex<mpsc::Receiver<InboundDatagram>>,
 }
 
 impl SharedQuicSocket {
-    pub fn new(socket: Arc<UdpSocket>) -> (Arc<Self>, QuicIngress) {
+    pub fn new(socket: Arc<UdpSocket>) -> io::Result<(Arc<Self>, QuicIngress)> {
+        let state = UdpSocketState::new((&*socket).into())?;
         let (tx, rx) = mpsc::channel(DISPATCH_QUEUE);
-        (
+        Ok((
             Arc::new(Self {
                 socket,
+                state,
                 rx: Mutex::new(rx),
             }),
             QuicIngress { tx },
-        )
+        ))
     }
 }
 
@@ -80,18 +83,7 @@ impl AsyncUdpSocket for SharedQuicSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // We advertise no segmentation support, so Quinn should never hand us
-        // a multi-datagram GSO transmit. Refuse one defensively rather than
-        // accidentally emit a coalesced payload as one UDP datagram.
-        if transmit.segment_size.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "shared QUIC socket does not support segmented transmits",
-            ));
-        }
-        self.socket
-            .try_send_to(transmit.contents, transmit.destination)
-            .map(|_| ())
+        self.state.send((&*self.socket).into(), transmit)
     }
 
     fn poll_recv(
@@ -149,7 +141,7 @@ impl AsyncUdpSocket for SharedQuicSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        1
+        self.state.max_gso_segments()
     }
 
     fn max_receive_segments(&self) -> usize {
@@ -157,7 +149,7 @@ impl AsyncUdpSocket for SharedQuicSocket {
     }
 
     fn may_fragment(&self) -> bool {
-        true
+        self.state.may_fragment()
     }
 }
 
@@ -185,7 +177,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_is_exposed_as_one_quinn_receive() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let (socket, ingress) = SharedQuicSocket::new(udp);
+        let (socket, ingress) = SharedQuicSocket::new(udp).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         ingress.try_send(peer, b"quic-packet").unwrap();
 
@@ -207,7 +199,7 @@ mod tests {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = receiver.local_addr().unwrap();
-        let (socket, _ingress) = SharedQuicSocket::new(udp);
+        let (socket, _ingress) = SharedQuicSocket::new(udp).unwrap();
         let transmit = Transmit {
             destination,
             ecn: None,
