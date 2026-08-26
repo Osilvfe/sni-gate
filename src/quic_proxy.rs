@@ -1,6 +1,6 @@
 //! QUIC listener, including raw SNI-routed UDP forwarding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -19,15 +19,51 @@ use crate::quic_initial::{InitialInspector, InitialSni};
 const MAX_INITIAL_DATAGRAMS: usize = 8;
 const MAX_INITIAL_BYTES: usize = 32 * 1024;
 const MAX_FLOWS: usize = 4096;
+const MAX_CID_LEN: usize = 20;
 const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOW_QUEUE: usize = 128;
 const UDP_BUF: usize = 65_535;
+const QUIC_V1: u32 = 0x0000_0001;
+const QUIC_V2: u32 = 0x6b33_43cf;
 
-enum Flow {
+type FlowId = u64;
+type Flows = Arc<Mutex<FlowTable>>;
+
+struct FlowTable {
+    next_id: FlowId,
+    entries: HashMap<FlowId, FlowEntry>,
+    peers: HashMap<SocketAddr, HashSet<FlowId>>,
+    cids: HashMap<Vec<u8>, HashSet<FlowId>>,
+}
+
+impl Default for FlowTable {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            entries: HashMap::new(),
+            peers: HashMap::new(),
+            cids: HashMap::new(),
+        }
+    }
+}
+
+struct FlowEntry {
+    peer: SocketAddr,
+    cids: HashSet<Vec<u8>>,
+    state: FlowState,
+}
+
+enum FlowState {
     Inspecting(InspectingFlow),
     /// The queue exists before upstream setup finishes, so packets arriving
     /// during DNS/socket setup are retained without blocking the listener.
-    Forwarding(mpsc::Sender<Vec<u8>>),
+    Forwarding {
+        tx: mpsc::Sender<Vec<u8>>,
+        /// Raw upstream replies are sent to the latest observed client address.
+        /// Updating this when a known DCID arrives from a new address is what
+        /// makes NAT rebinding/path migration work without changing payloads.
+        peer_tx: watch::Sender<SocketAddr>,
+    },
 }
 
 struct InspectingFlow {
@@ -60,22 +96,287 @@ impl InspectingFlow {
     }
 }
 
-type Flows = Arc<Mutex<HashMap<SocketAddr, Flow>>>;
+#[derive(Debug)]
+struct LongHeader<'a> {
+    first: u8,
+    version: u32,
+    dcid: &'a [u8],
+    scid: &'a [u8],
+}
+
+impl<'a> LongHeader<'a> {
+    fn parse(packet: &'a [u8]) -> Option<Self> {
+        if packet.len() < 7 || packet[0] & 0x80 == 0 {
+            return None;
+        }
+        let version = u32::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
+        let mut at = 5usize;
+        let dcid_len = usize::from(*packet.get(at)?);
+        if dcid_len > MAX_CID_LEN {
+            return None;
+        }
+        at += 1;
+        let dcid = packet.get(at..at.checked_add(dcid_len)?)?;
+        at += dcid_len;
+        let scid_len = usize::from(*packet.get(at)?);
+        if scid_len > MAX_CID_LEN {
+            return None;
+        }
+        at += 1;
+        let scid = packet.get(at..at.checked_add(scid_len)?)?;
+        Some(Self {
+            first: packet[0],
+            version,
+            dcid,
+            scid,
+        })
+    }
+
+    fn is_initial(&self) -> bool {
+        let ty = self.first & 0x30;
+        match self.version {
+            QUIC_V1 => ty == 0x00,
+            QUIC_V2 => ty == 0x10,
+            _ => false,
+        }
+    }
+}
+
+impl FlowTable {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Resolve a client datagram to an existing flow.
+    ///
+    /// CID lookup wins over the source UDP address. That is required both for
+    /// NAT rebinding and for multiple QUIC connections sharing one client UDP
+    /// socket. An unknown Initial is deliberately *not* address-fallback routed:
+    /// it starts a new connection even when the same peer already has another.
+    fn flow_id_for(&self, peer: SocketAddr, datagram: &[u8]) -> Option<FlowId> {
+        if let Some(header) = LongHeader::parse(datagram) {
+            if let Some(id) = self.unique_cid_owner(header.dcid) {
+                return Some(id);
+            }
+            if header.is_initial() {
+                return None;
+            }
+        } else if let Some(id) = self.short_header_owner(datagram) {
+            return Some(id);
+        }
+        self.unique_peer_owner(peer)
+    }
+
+    fn unique_cid_owner(&self, cid: &[u8]) -> Option<FlowId> {
+        if cid.is_empty() {
+            return None;
+        }
+        let owners = self.cids.get(cid)?;
+        (owners.len() == 1).then(|| *owners.iter().next().expect("one CID owner"))
+    }
+
+    fn unique_peer_owner(&self, peer: SocketAddr) -> Option<FlowId> {
+        let owners = self.peers.get(&peer)?;
+        (owners.len() == 1).then(|| *owners.iter().next().expect("one peer owner"))
+    }
+
+    /// Short headers do not carry a CID length. Try every legal length against
+    /// the CIDs we have learned and accept only one unambiguous owning flow.
+    fn short_header_owner(&self, datagram: &[u8]) -> Option<FlowId> {
+        if datagram.first().map_or(true, |first| first & 0x80 != 0) || datagram.len() <= 1 {
+            return None;
+        }
+        let mut candidate = None;
+        let max = MAX_CID_LEN.min(datagram.len() - 1);
+        for len in 1..=max {
+            let Some(owners) = self.cids.get(&datagram[1..1 + len]) else {
+                continue;
+            };
+            if owners.len() != 1 {
+                return None;
+            }
+            let id = *owners.iter().next().expect("one CID owner");
+            match candidate {
+                None => candidate = Some(id),
+                Some(previous) if previous == id => {}
+                Some(_) => return None,
+            }
+        }
+        candidate
+    }
+
+    fn insert_inspecting(
+        &mut self,
+        peer: SocketAddr,
+        now: Instant,
+        initial_dcid: Option<&[u8]>,
+    ) -> FlowId {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.entries.insert(
+            id,
+            FlowEntry {
+                peer,
+                cids: HashSet::new(),
+                state: FlowState::Inspecting(InspectingFlow::new(now)),
+            },
+        );
+        self.peers.entry(peer).or_default().insert(id);
+        if let Some(cid) = initial_dcid {
+            self.add_cid(id, cid);
+        }
+        id
+    }
+
+    fn peer(&self, id: FlowId) -> Option<SocketAddr> {
+        self.entries.get(&id).map(|entry| entry.peer)
+    }
+
+    fn migrate_peer(&mut self, id: FlowId, new_peer: SocketAddr) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        let old_peer = entry.peer;
+        if old_peer == new_peer {
+            return false;
+        }
+        entry.peer = new_peer;
+        let peer_tx = match &entry.state {
+            FlowState::Forwarding { peer_tx, .. } => Some(peer_tx.clone()),
+            FlowState::Inspecting(_) => None,
+        };
+
+        let remove_old_peer = if let Some(ids) = self.peers.get_mut(&old_peer) {
+            ids.remove(&id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if remove_old_peer {
+            self.peers.remove(&old_peer);
+        }
+        self.peers.entry(new_peer).or_default().insert(id);
+        if let Some(peer_tx) = peer_tx {
+            let _ = peer_tx.send(new_peer);
+        }
+        true
+    }
+
+    fn add_cid(&mut self, id: FlowId, cid: &[u8]) {
+        if cid.is_empty() || cid.len() > MAX_CID_LEN {
+            return;
+        }
+        let inserted = self
+            .entries
+            .get_mut(&id)
+            .is_some_and(|entry| entry.cids.insert(cid.to_vec()));
+        if inserted {
+            self.cids.entry(cid.to_vec()).or_default().insert(id);
+        }
+    }
+
+    /// A client long-header DCID is a server-side routing CID. Record it while
+    /// the source address is still known so a later address change can use it.
+    fn observe_client_datagram(&mut self, id: FlowId, datagram: &[u8]) {
+        if let Some(header) = LongHeader::parse(datagram) {
+            self.add_cid(id, header.dcid);
+        }
+    }
+
+    /// A server long-header SCID is a CID the client can use as its future DCID.
+    /// This is the most important CID learned during the handshake.
+    fn observe_upstream_datagram(&mut self, id: FlowId, datagram: &[u8]) {
+        if let Some(header) = LongHeader::parse(datagram) {
+            self.add_cid(id, header.scid);
+        }
+    }
+
+    fn forwarding_sender(&self, id: FlowId) -> Option<mpsc::Sender<Vec<u8>>> {
+        match &self.entries.get(&id)?.state {
+            FlowState::Forwarding { tx, .. } => Some(tx.clone()),
+            FlowState::Inspecting(_) => None,
+        }
+    }
+
+    fn inspecting_mut(&mut self, id: FlowId) -> Option<&mut InspectingFlow> {
+        match &mut self.entries.get_mut(&id)?.state {
+            FlowState::Inspecting(flow) => Some(flow),
+            FlowState::Forwarding { .. } => None,
+        }
+    }
+
+    fn promote(
+        &mut self,
+        id: FlowId,
+        tx: mpsc::Sender<Vec<u8>>,
+        peer_tx: watch::Sender<SocketAddr>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        entry.state = FlowState::Forwarding { tx, peer_tx };
+        true
+    }
+
+    fn remove(&mut self, id: FlowId) {
+        let Some(entry) = self.entries.remove(&id) else {
+            return;
+        };
+        let remove_peer = if let Some(ids) = self.peers.get_mut(&entry.peer) {
+            ids.remove(&id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if remove_peer {
+            self.peers.remove(&entry.peer);
+        }
+        for cid in entry.cids {
+            let remove_cid = if let Some(ids) = self.cids.get_mut(&cid) {
+                ids.remove(&id);
+                ids.is_empty()
+            } else {
+                false
+            };
+            if remove_cid {
+                self.cids.remove(&cid);
+            }
+        }
+    }
+
+    fn prune_stale_inspecting(&mut self, now: Instant) {
+        let stale: Vec<FlowId> = self
+            .entries
+            .iter()
+            .filter_map(|(&id, entry)| match &entry.state {
+                FlowState::Inspecting(flow)
+                    if now.duration_since(flow.last_activity) >= INITIAL_INSPECTION_TIMEOUT =>
+                {
+                    Some(id)
+                }
+                FlowState::Inspecting(_) | FlowState::Forwarding { .. } => None,
+            })
+            .collect();
+        for id in stale {
+            self.remove(id);
+        }
+    }
+}
+
+enum InspectResult {
+    NeedMore,
+    Invalid,
+    Routed { sni: String, packets: Vec<Vec<u8>> },
+}
 
 /// Serve one UDP/QUIC listener.
-///
-/// Raw routes are completely transparent after the Initial flight has yielded
-/// an SNI: a dedicated connected UDP socket carries each client's QUIC flow so
-/// upstream replies can be mapped safely without interpreting short-header
-/// connection IDs. This intentionally does not support client migration yet;
-/// its mapping key is the source UDP socket address.
 pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     let listener = Arc::new(
         UdpSocket::bind(state.addr)
             .await
             .with_context(|| format!("binding QUIC listener {}", state.addr))?,
     );
-    let flows: Flows = Arc::new(Mutex::new(HashMap::new()));
+    let flows: Flows = Arc::new(Mutex::new(FlowTable::default()));
     info!(addr = %state.addr, routes = state.routes.len(), "QUIC listening");
 
     let mut buf = vec![0u8; UDP_BUF];
@@ -83,123 +384,173 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
         let (n, peer) = listener.recv_from(&mut buf).await?;
         let datagram = &buf[..n];
 
-        let forwarding = {
-            let map = flows.lock().await;
-            match map.get(&peer) {
-                Some(Flow::Forwarding(tx)) => Some(tx.clone()),
-                Some(Flow::Inspecting(_)) | None => None,
+        let action = {
+            let now = Instant::now();
+            let mut table = flows.lock().await;
+            table.prune_stale_inspecting(now);
+
+            let id = match table.flow_id_for(peer, datagram) {
+                Some(id) => id,
+                None => {
+                    let initial_dcid = LongHeader::parse(datagram)
+                        .filter(LongHeader::is_initial)
+                        .map(|header| header.dcid);
+                    let Some(initial_dcid) = initial_dcid else {
+                        debug!(%peer, "dropping QUIC datagram with no known flow/CID");
+                        continue;
+                    };
+                    if table.len() >= MAX_FLOWS {
+                        warn!(%peer, max_flows = MAX_FLOWS, "dropping new QUIC flow because listener flow limit is reached");
+                        continue;
+                    }
+                    table.insert_inspecting(peer, now, Some(initial_dcid))
+                }
+            };
+
+            if table.migrate_peer(id, peer) {
+                debug!(%peer, flow_id = id, "QUIC flow client address changed");
             }
+            table.observe_client_datagram(id, datagram);
+
+            if let Some(tx) = table.forwarding_sender(id) {
+                Some((id, Some(tx), None))
+            } else {
+                let inspection = {
+                    let Some(flow) = table.inspecting_mut(id) else {
+                        continue;
+                    };
+                    if flow.push(datagram, now).is_err() {
+                        InspectResult::Invalid
+                    } else {
+                        match flow.inspector.ingest(datagram) {
+                            InitialSni::NeedMore => InspectResult::NeedMore,
+                            InitialSni::Invalid => InspectResult::Invalid,
+                            InitialSni::Name(sni) => InspectResult::Routed {
+                                sni,
+                                packets: std::mem::take(&mut flow.packets),
+                            },
+                            InitialSni::NoSni => InspectResult::Routed {
+                                sni: String::new(),
+                                packets: std::mem::take(&mut flow.packets),
+                            },
+                        }
+                    }
+                };
+
+                match inspection {
+                    InspectResult::NeedMore => None,
+                    InspectResult::Invalid => {
+                        table.remove(id);
+                        debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                        None
+                    }
+                    InspectResult::Routed { sni, packets } => {
+                        Some((id, None, Some((sni, packets))))
+                    }
+                }
+            }
+        };
+
+        let Some((flow_id, forwarding, decision)) = action else {
+            continue;
         };
         if let Some(tx) = forwarding {
             match tx.try_send(datagram.to_vec()) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
-                    debug!(%peer, "dropping QUIC datagram because raw flow queue is full");
+                    debug!(%peer, flow_id, "dropping QUIC datagram because raw flow queue is full");
                 }
                 Err(TrySendError::Closed(_)) => {
-                    flows.lock().await.remove(&peer);
+                    flows.lock().await.remove(flow_id);
                 }
             }
             continue;
         }
 
-        let decision = {
-            let now = Instant::now();
-            let mut map = flows.lock().await;
-            prune_stale_inspecting(&mut map, now);
-            if !map.contains_key(&peer) && map.len() >= MAX_FLOWS {
-                warn!(%peer, max_flows = MAX_FLOWS, "dropping new QUIC flow because listener flow limit is reached");
-                continue;
-            }
-            let flow = map
-                .entry(peer)
-                .or_insert_with(|| Flow::Inspecting(InspectingFlow::new(now)));
-            let Flow::Inspecting(flow) = flow else {
-                continue;
-            };
-            if flow.push(datagram, now).is_err() {
-                map.remove(&peer);
-                warn!(%peer, "dropping QUIC Initial flight that exceeds inspection limits");
-                continue;
-            }
-            match flow.inspector.ingest(datagram) {
-                InitialSni::NeedMore => continue,
-                InitialSni::Invalid => {
-                    map.remove(&peer);
-                    debug!(%peer, "dropping malformed or unsupported QUIC Initial");
-                    continue;
-                }
-                InitialSni::Name(name) => {
-                    let route = state.router.match_host(&name);
-                    Some((name, route, take_packets(&mut map, peer)))
-                }
-                InitialSni::NoSni => {
-                    let route = state.router.match_host("");
-                    Some((String::new(), route, take_packets(&mut map, peer)))
-                }
-            }
-        };
-
-        let Some((sni, route_id, packets)) = decision else {
+        let Some((sni, packets)) = decision else {
             continue;
         };
+        let route_id = if sni.is_empty() {
+            state.router.match_host("")
+        } else {
+            state.router.match_host(&sni)
+        };
         let Some(route_id) = route_id else {
-            debug!(%peer, sni = %display_sni(&sni), "unmatched QUIC Initial");
+            flows.lock().await.remove(flow_id);
+            debug!(%peer, flow_id, sni = %display_sni(&sni), "unmatched QUIC Initial");
             continue;
         };
         let route = state.routes[route_id].clone();
         if route.route_type != RouteType::Raw {
+            flows.lock().await.remove(flow_id);
             // H3/H3-ECH termination is installed in the next stage. Refusing
             // rather than forwarding avoids accidentally treating it as raw.
-            debug!(%peer, route = %route.name, "QUIC terminating route not available yet");
+            debug!(%peer, flow_id, route = %route.name, "QUIC terminating route not available yet");
             continue;
         }
 
-        spawn_raw_flow(listener.clone(), flows.clone(), peer, route, sni, packets).await;
-    }
-}
-
-fn prune_stale_inspecting(map: &mut HashMap<SocketAddr, Flow>, now: Instant) {
-    map.retain(|_, flow| match flow {
-        Flow::Inspecting(flow) => now.duration_since(flow.last_activity) < INITIAL_INSPECTION_TIMEOUT,
-        Flow::Forwarding(_) => true,
-    });
-}
-
-fn take_packets(map: &mut HashMap<SocketAddr, Flow>, peer: SocketAddr) -> Vec<Vec<u8>> {
-    match map.remove(&peer) {
-        Some(Flow::Inspecting(flow)) => flow.packets,
-        Some(Flow::Forwarding(_)) | None => Vec::new(),
+        spawn_raw_flow(
+            listener.clone(),
+            flows.clone(),
+            flow_id,
+            route,
+            sni,
+            packets,
+        )
+        .await;
     }
 }
 
 async fn spawn_raw_flow(
     listener: Arc<UdpSocket>,
     flows: Flows,
-    peer: SocketAddr,
+    flow_id: FlowId,
     route: Arc<RouteRuntime>,
     sni: String,
     packets: Vec<Vec<u8>>,
 ) {
+    let peer = {
+        let table = flows.lock().await;
+        table.peer(flow_id)
+    };
+    let Some(peer) = peer else {
+        return;
+    };
     let (tx, rx) = mpsc::channel(FLOW_QUEUE);
-    flows.lock().await.insert(peer, Flow::Forwarding(tx));
+    let (peer_tx, peer_rx) = watch::channel(peer);
+    if !flows.lock().await.promote(flow_id, tx, peer_tx) {
+        return;
+    }
 
     tokio::spawn(async move {
-        if let Err(error) = run_raw_flow(listener, peer, route, sni, packets, rx).await {
-            debug!(%peer, error = %format!("{error:#}"), "QUIC raw flow failed");
+        if let Err(error) = run_raw_flow(
+            listener,
+            flows.clone(),
+            flow_id,
+            route,
+            sni,
+            packets,
+            rx,
+            peer_rx,
+        )
+        .await
+        {
+            debug!(flow_id, error = %format!("{error:#}"), "QUIC raw flow failed");
         }
-        flows.lock().await.remove(&peer);
-        debug!(%peer, "QUIC raw flow closed");
+        flows.lock().await.remove(flow_id);
+        debug!(flow_id, "QUIC raw flow closed");
     });
 }
 
 async fn run_raw_flow(
     listener: Arc<UdpSocket>,
-    peer: SocketAddr,
+    flows: Flows,
+    flow_id: FlowId,
     route: Arc<RouteRuntime>,
     sni: String,
     packets: Vec<Vec<u8>>,
     mut rx: mpsc::Receiver<Vec<u8>>,
+    peer_rx: watch::Receiver<SocketAddr>,
 ) -> Result<()> {
     let host = route
         .upstream_host
@@ -232,7 +583,7 @@ async fn run_raw_flow(
         upstream.send(packet).await?;
     }
 
-    info!(%peer, route = %route.name, upstream = %upstream_addr, "QUIC raw flow established");
+    info!(flow_id, %peer, route = %route.name, upstream = %upstream_addr, "QUIC raw flow established");
     let idle = route.idle_timeout;
     let mut buf = vec![0u8; UDP_BUF];
     loop {
@@ -243,10 +594,12 @@ async fn run_raw_flow(
             },
             received = upstream.recv(&mut buf) => {
                 let n = received?;
-                listener.send_to(&buf[..n], peer).await?;
+                flows.lock().await.observe_upstream_datagram(flow_id, &buf[..n]);
+                let current_peer = *peer_rx.borrow();
+                listener.send_to(&buf[..n], current_peer).await?;
             },
             _ = tokio::time::sleep(idle), if !idle.is_zero() => {
-                debug!(%peer, route = %route.name, "QUIC raw flow idle timeout");
+                debug!(flow_id, route = %route.name, "QUIC raw flow idle timeout");
                 break;
             }
         }
@@ -266,27 +619,92 @@ fn display_sni(sni: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn long_header(version: u32, first: u8, dcid: &[u8], scid: &[u8]) -> Vec<u8> {
+        let mut packet = vec![first];
+        packet.extend_from_slice(&version.to_be_bytes());
+        packet.push(dcid.len() as u8);
+        packet.extend_from_slice(dcid);
+        packet.push(scid.len() as u8);
+        packet.extend_from_slice(scid);
+        packet
+    }
+
     #[test]
     fn stale_initial_flows_are_pruned_but_forwarding_flows_remain() {
         let now = Instant::now();
         let stale = now - INITIAL_INSPECTION_TIMEOUT - Duration::from_millis(1);
+        let mut flows = FlowTable::default();
+        let stale_id = flows.insert_inspecting("127.0.0.1:1000".parse().unwrap(), stale, None);
+        let live_id = flows.insert_inspecting("127.0.0.1:1001".parse().unwrap(), now, None);
+        let forwarding_id =
+            flows.insert_inspecting("127.0.0.1:1002".parse().unwrap(), now, None);
         let (tx, _rx) = mpsc::channel(1);
-        let mut flows = HashMap::from([
-            (
-                "127.0.0.1:1000".parse().unwrap(),
-                Flow::Inspecting(InspectingFlow::new(stale)),
-            ),
-            (
-                "127.0.0.1:1001".parse().unwrap(),
-                Flow::Inspecting(InspectingFlow::new(now)),
-            ),
-            ("127.0.0.1:1002".parse().unwrap(), Flow::Forwarding(tx)),
-        ]);
+        let (peer_tx, _peer_rx) = watch::channel("127.0.0.1:1002".parse().unwrap());
+        assert!(flows.promote(forwarding_id, tx, peer_tx));
 
-        prune_stale_inspecting(&mut flows, now);
+        flows.prune_stale_inspecting(now);
 
-        assert!(!flows.contains_key(&"127.0.0.1:1000".parse().unwrap()));
-        assert!(flows.contains_key(&"127.0.0.1:1001".parse().unwrap()));
-        assert!(flows.contains_key(&"127.0.0.1:1002".parse().unwrap()));
+        assert!(!flows.entries.contains_key(&stale_id));
+        assert!(flows.entries.contains_key(&live_id));
+        assert!(flows.entries.contains_key(&forwarding_id));
+    }
+
+    #[test]
+    fn known_cid_rebinds_forwarding_flow_to_new_peer() {
+        let now = Instant::now();
+        let old_peer: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let new_peer: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let dcid = b"server01";
+        let mut flows = FlowTable::default();
+        let id = flows.insert_inspecting(old_peer, now, Some(dcid));
+        let (tx, _rx) = mpsc::channel(1);
+        let (peer_tx, peer_rx) = watch::channel(old_peer);
+        assert!(flows.promote(id, tx, peer_tx));
+
+        let packet = long_header(QUIC_V1, 0xc0, dcid, b"client01");
+        assert_eq!(flows.flow_id_for(new_peer, &packet), Some(id));
+        assert!(flows.migrate_peer(id, new_peer));
+        assert_eq!(*peer_rx.borrow(), new_peer);
+        assert_eq!(flows.unique_peer_owner(old_peer), None);
+        assert_eq!(flows.unique_peer_owner(new_peer), Some(id));
+    }
+
+    #[test]
+    fn unknown_initial_on_same_peer_is_not_misrouted_to_existing_flow() {
+        let now = Instant::now();
+        let peer: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let _ = flows.insert_inspecting(peer, now, Some(b"firstcid"));
+
+        let second = long_header(QUIC_V1, 0xc0, b"secondid", b"client02");
+        assert_eq!(flows.flow_id_for(peer, &second), None);
+    }
+
+    #[test]
+    fn upstream_scid_routes_short_header_after_rebinding() {
+        let now = Instant::now();
+        let old_peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let new_peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let id = flows.insert_inspecting(old_peer, now, Some(b"initial1"));
+        let server_cid = b"srv-short";
+        let response = long_header(QUIC_V1, 0xc0, b"client03", server_cid);
+        flows.observe_upstream_datagram(id, &response);
+
+        let mut short = vec![0x40];
+        short.extend_from_slice(server_cid);
+        short.extend_from_slice(b"ciphertext");
+        assert_eq!(flows.flow_id_for(new_peer, &short), Some(id));
+    }
+
+    #[test]
+    fn quic_v2_initial_is_recognized_as_a_new_flow_boundary() {
+        let peer: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let _ = flows.insert_inspecting(peer, Instant::now(), Some(b"v2-first"));
+        let second = long_header(QUIC_V2, 0xd0, b"v2-second", b"client04");
+        let parsed = LongHeader::parse(&second).unwrap();
+        assert!(parsed.is_initial());
+        assert_eq!(flows.flow_id_for(peer, &second), None);
     }
 }
