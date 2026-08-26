@@ -17,7 +17,6 @@ jobs:
   # route-simplification branch, applies its staged transform, validates it, and
   # commits only the verified source/docs changes back to that branch.
   validate-route-simplification:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/work/config-route-simplify'
     runs-on: ubuntu-latest
     permissions:
       contents: write
