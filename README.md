@@ -1,44 +1,55 @@
 # sni-gate
 
-A multi-listener TLS gateway that routes each connection by **SNI (TLS) or Host
-(HTTP)** to an upstream, and — whenever it terminates TLS — **issues a
-certificate for that name and its wildcard on the fly** from a local CA.
+A multi-listener **TCP and QUIC** gateway that routes connections by **SNI
+(TLS/QUIC) or Host (HTTP)** to an upstream, and — whenever it terminates TLS —
+**issues a certificate for that name on the fly** from a local CA.
 
-Upstreams can be reached four ways: **ECH** (TLS 1.3 Encrypted Client Hello),
-plain **TLS**, cleartext **HTTP**, or **raw** TCP passthrough. Configuration is
-hierarchical (route → listener → global) for maximum flexibility: almost every
-setting can be pinned per route and otherwise inherits outward.
+TCP routes support **ECH**, plain **TLS**, cleartext **HTTP**, and **raw** byte
+passthrough. QUIC/UDP routes support **raw** datagram passthrough, **HTTP/3**, and
+**HTTP/3 + ECH** (`h3-ech`). Configuration is hierarchical (route → listener →
+global) for maximum flexibility: almost every setting can be pinned per route and
+otherwise inherits outward.
 
-It merges two capabilities:
+It combines three capabilities:
 - **Dynamic per-SNI certificate issuance** — no per-site cert maintenance; any
-  name gets a valid cert the first time it is requested, from a local CA you trust
-  once. Coverage is not guessed: the first handshake is answered exactly, and
-  wider coverage is mirrored from the upstream's own certificate. Certs are
-  cached and persisted.
-- **ECH re-origination** — hide the true SNI from the path to a CDN edge, giving
-  ECH to clients/environments that can't do it themselves.
+  terminating name gets a valid cert the first time it is requested, from a local
+  CA you trust once. Coverage is not guessed: the first handshake is answered
+  exactly, and wider coverage is mirrored from the upstream's own certificate.
+  Certs are cached and persisted.
+- **ECH re-origination** — hide the true SNI from the path to a CDN edge, for both
+  TCP TLS (`ech`) and QUIC HTTP/3 (`h3-ech`) upstreams.
+- **Shared QUIC dispatch** — one UDP listener can inspect QUIC Initial packets to
+  route transparent `raw` flows while also terminating `h3` / `h3-ech` flows on
+  that same UDP socket.
 
 ## How it works
 
-```
-                    issue per-SNI cert (exact, then mirrored from upstream)
-                         ┌────────────────────────────────────────┐
-                         │                                        ▼
- client ──TLS(SNI)/HTTP──▶ sni-gate :443 ── route by SNI/Host ──▶ upstream
-                              peek (no consume)                    · ech  → TLS1.3 + ECH
-                              exact>wildcard>suffix>regex          · tls  → plain TLS
-                                                                   · http → cleartext
-                                                                   · raw  → bare TCP (no termination)
+```text
+TCP client ── TLS(SNI)/HTTP ──▶ sni-gate :443/TCP
+                                  │
+                                  ├─ raw  ─────────────▶ untouched TCP stream
+                                  ├─ http ─────────────▶ cleartext HTTP
+                                  ├─ tls  ─────────────▶ upstream TLS
+                                  └─ ech  ─────────────▶ upstream TLS + ECH
+
+QUIC client ── QUIC Initial ───▶ sni-gate :443/UDP
+                                  │ inspect Initial SNI (v1/v2)
+                                  ├─ raw ──────────────▶ untouched UDP datagrams
+                                  ├─ h3 ───────────────▶ H3 → H3 semantic proxy
+                                  └─ h3-ech ───────────▶ H3 → H3 + upstream ECH
 ```
 
-1. **Peek** the connection without consuming bytes to learn the routing key
-   (TLS SNI, or the HTTP `Host` header).
-2. **Route** it: `exact` > `wildcard *.x` > `suffix .x` > `regex @name` > the
-   listener's `default_route`.
-3. For any type except `raw`, **terminate inbound TLS**, issuing a certificate
-   for the SNI (and its wildcard) from the local CA, then **re-originate** to the
-   upstream per the route type. `raw` splices the untouched TCP stream through.
-4. No route and no `default_route` → apply the global `unmatched` policy.
+For TCP, sni-gate peeks without consuming bytes, routes by TLS SNI or HTTP Host,
+and either splices the raw stream or terminates/re-originates TLS. For QUIC, the
+shared UDP dispatcher decrypts only enough of a QUIC v1/v2 **Initial** to recover
+the ClientHello SNI and choose the route. A `raw` QUIC flow then forwards the
+buffered and subsequent UDP datagrams unchanged; the upstream remains the actual
+QUIC/TLS endpoint. `h3` and `h3-ech` instead terminate inbound QUIC and proxy
+HTTP/3 messages semantically.
+
+Routing precedence is `exact` > `wildcard *.x` > `suffix .x` > `regex @name` >
+the listener's `default_route`. No match and no default route applies the global
+`unmatched` policy.
 
 ## Listener address
 
@@ -52,23 +63,82 @@ Each `[[listener]]` must have an `addr` field. Three accepted forms:
 
 The bare-port shorthand binds the **IPv4 wildcard only**, matching nginx's
 `listen 443` semantics. On a dual-stack host, add a second listener on
-`"[::]:443"` to also accept IPv6 connections. Hostnames are not accepted;
-use a literal IP address.
+`"[::]:443"` to also accept IPv6 connections. Hostnames are not accepted; use a
+literal IP address.
 
-`"443"` and `"0.0.0.0:443"` normalize to the same address, so writing both
-in the same config is caught as a duplicate-listener error at startup.
+Listeners default to `transport = "tcp"`. Set `transport = "quic"` to bind UDP
+and enable QUIC routes. TCP and QUIC may deliberately share the same numeric
+address because they are different transport namespaces:
+
+```toml
+[[listener]]
+addr = "0.0.0.0:443"
+transport = "tcp"
+# ... TCP routes ...
+
+[[listener]]
+addr = "0.0.0.0:443"
+transport = "quic"
+# ... raw / h3 / h3-ech routes ...
+```
+
+A duplicate address on the **same** transport is rejected at startup. Thus two
+TCP listeners on `0.0.0.0:443` are invalid, as are two QUIC listeners there, but
+one of each is valid.
+
+## QUIC / HTTP/3
+
+A QUIC listener accepts only `raw`, `h3`, and `h3-ech` routes.
+
+### Raw QUIC
+
+`type = "raw"` on a QUIC listener is transparent UDP forwarding. sni-gate
+inspects the client QUIC v1/v2 Initial to recover SNI, buffers the Initial
+packets until the route is known, then sends those packets and subsequent
+packets to the selected upstream **without modifying the datagrams**. It does
+not terminate QUIC or issue a certificate for the raw flow.
+
+Raw-flow ownership tracks QUIC connection IDs in addition to the client's UDP
+address, so a known connection can follow source-address rebinding rather than
+being permanently tied to the first `(IP, port)` tuple. Idle flows are reaped and
+flow-count limits prevent the UDP NAT table from growing without bound.
+
+### `h3` and `h3-ech`
+
+These are terminating HTTP/3 routes. sni-gate accepts the inbound QUIC
+connection with `h3` ALPN, opens a separate upstream QUIC/H3 connection, and
+forwards HTTP/3 **headers, body DATA, trailers, and response semantics**. This is
+not a UDP byte splice and currently does not translate H3 into HTTP/1.1 or
+HTTP/2.
+
+`h3` uses ordinary upstream QUIC TLS. `h3-ech` uses ECH on the upstream QUIC TLS
+ClientHello. The canonical config spelling is `type = "h3-ech"`; the earlier
+development spelling `h3ech` remains accepted as a compatibility alias.
+
+HTTP/3 connection coalescing cannot bypass routing: every inbound request's
+`:authority` is checked against the listener router again. If it belongs to a
+different route than the connection's handshake SNI, sni-gate answers **421
+Misdirected Request** and does not forward that request to the existing upstream
+connection.
+
+A complete QUIC example is included in
+[`sni-gate.example.toml`](sni-gate.example.toml).
 
 ## Route types
 
-| Type   | Terminates inbound TLS? | Issues cert? | Upstream                         | HTTP/2                    |
-|--------|-------------------------|--------------|----------------------------------|---------------------------|
-| `ech`  | yes                     | yes          | TLS 1.3 + Encrypted Client Hello | mirrors upstream ALPN     |
-| `tls`  | yes                     | yes          | plain TLS (optional override SNI)| mirrors upstream ALPN     |
-| `http` | (cleartext in)          | yes (if TLS) | cleartext HTTP                   | h2 in → h2c out           |
-| `raw`  | no                      | no           | bare TCP byte-pump               | n/a (never terminates)    |
+| Type | Listener transport | Terminates inbound TLS/QUIC? | Issues cert? | Upstream |
+|---|---|---:|---:|---|
+| `ech` | TCP | yes | yes | TLS 1.3 + Encrypted Client Hello |
+| `tls` | TCP | yes | yes | plain TLS (optional override SNI) |
+| `http` | TCP | TLS when present | yes when TLS | cleartext HTTP; optional h2 → h2c |
+| `raw` | TCP | no | no | untouched TCP byte stream |
+| `raw` | QUIC/UDP | no | no | untouched UDP datagrams after Initial-SNI routing |
+| `h3` | QUIC/UDP | yes | yes | HTTP/3 over ordinary QUIC TLS |
+| `h3-ech` | QUIC/UDP | yes | yes | HTTP/3 over QUIC TLS + ECH |
 
-`override_sni` works for **all** terminating types. For `ech` it is the inner
-(protected) name; for `tls` it is the SNI presented to the upstream:
+`override_sni` works for terminating upstream TLS modes. For `ech` and `h3-ech`
+it is the protected inner name; for `tls` and `h3` it is the SNI presented to
+the upstream TLS handshake:
 
 | `override_sni`  | SNI sent upstream                        |
 |-----------------|------------------------------------------|
@@ -80,14 +150,14 @@ The empty string is deliberately distinct from omitting the field: it suppresses
 the extension entirely. That is useful for an upstream addressed by IP or one
 that keys only off the certificate it serves, and for ECH, where [RFC 9849 §5]
 explicitly allows a ClientHelloInner to carry no SNI. With ECH the ECHConfig's
-public name is still sent in the *outer* hello (the client-facing server needs
-it); only the protected inner hello omits its `server_name`.
+public name is still sent in the *outer* hello; only the protected inner hello
+omits its `server_name`.
 
 Suppressing SNI changes what is **transmitted**, not what is **trusted**: the
-upstream certificate is still verified against the name the route would otherwise
-have sent (the fixed name, or the reflected inbound one). An `ech` route with
-`override_sni = ""` on a connection that carries no SNI/Host therefore has no
-inner name to verify against and is closed.
+upstream certificate is still verified against the name the route would
+otherwise have sent. An ECH route with `override_sni = ""` on a connection that
+carries no usable reflected name therefore has no inner name to verify against
+and is closed.
 
 Because resolution keys on *presence*, a route can blank out a name inherited
 from its template with `override_sni = ""`.
@@ -157,9 +227,9 @@ key the connection matched on (the inbound SNI or Host, with any `:port`
 stripped), resolved per connection. This "reflects" each connection back to its
 own name, so a listener can forward every matched name to that same name
 upstream without a per-route host. `override_sni` does **not** change the dial
-target; it only sets the upstream TLS server name for `tls`/`ech`. A connection
-routed to a reflecting route that carries no SNI/Host is closed (there is
-nothing to reflect).
+target; it only sets the upstream TLS server name for terminating TLS/QUIC
+routes. A connection routed to a reflecting route that carries no SNI/Host is
+closed because there is nothing to reflect.
 
 ## Certificate coverage
 
@@ -176,7 +246,8 @@ for.
 **Then mirror what the upstream presented.** When a TLS-terminating route hands
 the connection to a TLS/ECH upstream, the upstream's leaf is read as part of the
 handshake that was happening anyway — no extra probe, no blocking — and its DNS
-SANs become this gateway's coverage for that host. If `cf.example.net` answers a
+SANs become this gateway's coverage for that host. The same observation mechanism
+is shared by TCP TLS and QUIC/H3 upstream TLS. If `cf.example.net` answers a
 handshake for `qy0.ru` with `{qy0.ru, mzz.qy0.ru}`, that is exactly what the
 client is served, so `t4.qy0.ru` cannot coalesce onto it. If the same upstream
 answers a handshake for `t4.qy0.ru` with `{qy0.ru, *.qy0.ru}`, that connection
@@ -214,14 +285,20 @@ origin when both of these hold ([RFC 9113 §9.1.1]):
 1. the second origin resolves to an address already in that connection's set, and
 2. the certificate on that connection is valid for the second origin.
 
-A coalesced request travels on the **existing** connection: no new TCP, no new TLS
-handshake, and therefore **no new SNI**. sni-gate routes per connection, at
-handshake time, from the SNI — so it never sees the second name and cannot
-re-route it. The request is delivered to whatever upstream that connection was
-already wired to.
+A coalesced HTTP/2 request travels on the **existing** TCP connection: no new TCP,
+no new TLS handshake, and therefore **no new SNI**. A byte-splicing TCP route
+cannot re-route it after the handshake, so certificate scope is the safety
+boundary there.
 
-Every name pointed at this gateway shares its address, so condition 1 always
-holds here and condition 2 is the only one sni-gate controls. Hence the invariant:
+HTTP/3 can coalesce origins too, but `h3`/`h3-ech` are semantic rather than byte
+splices. They therefore have an additional guard: every request's `:authority` is
+routed again and a request crossing the handshake route boundary gets **421
+Misdirected Request** before it reaches the existing upstream H3 connection.
+Certificate clipping still applies because it limits what coalescing the client
+may attempt in the first place.
+
+Every name pointed at this gateway shares its address, so the certificate remains
+a critical part of the boundary. The invariant is:
 
 > A certificate served on a connection routed to some destination is never valid
 > for a name this listener would route to a **different** destination.
@@ -281,12 +358,13 @@ table sends two names under one registrable domain to different upstreams. To
 widen coverage, give the conflicting hosts the same upstream or move them under a
 different registrable domain.
 
-**One case this cannot reach:** a `raw` route never terminates TLS, so the client
-sees the **upstream's own** certificate and sni-gate cannot narrow it. If that
-certificate covers a name routed elsewhere on the same listener, a client may
-coalesce onto the raw connection and escape routing. sni-gate detects the shape —
-a `raw` route sharing a registrable domain with terminating routes — and warns at
-startup; it cannot fix it. Give such a route its own registrable domain, or use a
+**One case this cannot reach:** a `raw` route never terminates TLS/QUIC, so the
+client sees the **upstream's own** certificate and sni-gate cannot narrow it. If
+that certificate covers a name routed elsewhere on the same listener, a client
+may coalesce onto the raw connection and escape routing. sni-gate detects this
+shape for TCP raw overlap and warns at startup; transparent raw traffic itself
+cannot be repaired by certificate issuance because no local certificate is
+served. Give such routes distinct certificate/routing boundaries, or use a
 terminating type.
 
 [RFC 9113 §9.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-9.1.1
@@ -546,11 +624,11 @@ Concurrent rebuilds are idempotent via generation counters.
 
 ## ECH
 
-For `type = "ech"` routes, the ECHConfigList is sourced by an `[ech]` block. Its
-fields inherit field-by-field from `[listener.ech]` and `[global.ech]` (and any
-template), so shared settings need to be written only once; a route's `[ech]`
-overrides only what differs, and may be omitted entirely when the enclosing
-scopes already provide a complete config:
+For `type = "ech"` and `type = "h3-ech"` routes, the ECHConfigList is sourced by
+an `[ech]` block. Its fields inherit field-by-field from `[listener.ech]` and
+`[global.ech]` (and any template), so shared settings need to be written only
+once; a route's `[ech]` overrides only what differs, and may be omitted entirely
+when the enclosing scopes already provide a complete config:
 - `mode = "static"` — a fixed inline base64 `config`.
 - `mode = "doh"` — looked up in the HTTPS record of `ech_domain` (or the inner
   name) via the ECH resolver; refreshed on `ech_refresh` / the record TTL.
@@ -558,10 +636,10 @@ scopes already provide a complete config:
 
 An omitted `mode` inherits (it is *not* silently `doh`); `static` and
 `doh-with-fallback` require a `config` to be resolvable from some scope, checked
-at load time. The upstream certificate is verified against the **inner (true) name** using the
-web-PKI roots. `require_ech` (default true) fails closed unless ECH is
-negotiated. **ECH retry**: if the server rejects ECH (its key rotated), the
-cached config is invalidated, a fresh one is fetched, and the handshake is
+at load time. The upstream certificate is verified against the **inner (true)
+name** using the web-PKI roots. `require_ech` (default true) fails closed unless
+ECH is negotiated. **ECH retry**: if the server rejects ECH (its key rotated),
+the cached config is invalidated, a fresh one is fetched, and the handshake is
 retried up to `max_retries` times before the fail policy applies.
 
 ## HTTP/2
@@ -583,11 +661,11 @@ upstream = "127.0.0.1:8080"
 ```
 
 **Inbound and upstream always speak the same protocol.** sni-gate splices bytes
-rather than parsing HTTP, so it cannot translate between framings: there is no
-"HTTP/2 in, HTTP/1.1 out" mode. `enabled` is a single coupled switch. (Doing
-otherwise would mean reassembling requests, remapping streams and handling
-trailers, upgrades and CONNECT — a different program.) In exchange, the data path
-stays a transparent byte pump, so WebSockets and other upgrades keep working.
+rather than parsing HTTP on these TCP routes, so it cannot translate between
+framings: there is no "HTTP/2 in, HTTP/1.1 out" mode. `enabled` is a single
+coupled switch. (HTTP/3 is handled separately by the semantic H3 proxy described
+above.) In exchange, the TCP data path stays a transparent byte pump, so
+WebSockets and other upgrades keep working.
 
 How the protocol is chosen depends on whether the upstream speaks ALPN:
 
@@ -604,7 +682,7 @@ How the protocol is chosen depends on whether the upstream speaks ALPN:
   picks h2, the decrypted bytes are spliced to the backend as **prior-knowledge
   h2c** (RFC 9113 §3.4), which is byte-identical to h2 over TLS. The backend must
   therefore be configured for h2c.
-- **`raw`** never terminates TLS, so there is no ALPN to negotiate. Enabling
+- **TCP `raw`** never terminates TLS, so there is no ALPN to negotiate. Enabling
   `http2` on a `raw` route is a load-time error; a value merely *inherited* from
   a broader scope is ignored, so a global `enabled = true` coexists fine with
   `raw` routes.
@@ -677,7 +755,8 @@ sni-gate.exe               # loads ./sni-gate.toml
 sni-gate.exe -c <path>     # or an explicit path
 ```
 
-See [`sni-gate.example.toml`](sni-gate.example.toml) for every option.
+See [`sni-gate.example.toml`](sni-gate.example.toml) for every option, including
+TCP and QUIC listeners that share port 443.
 
 ## Trusting the CA
 
@@ -711,7 +790,9 @@ their trusted-root store.
 ## Security notes
 
 - `ca/ca.key` is a trusted-root private key. Keep it local; it is gitignored.
-- Terminating TLS means sni-gate sees plaintext for terminating route types.
+- Terminating TLS/QUIC means sni-gate sees plaintext for terminating route types.
+- A QUIC `raw` route does not terminate the upstream QUIC/TLS connection; its
+  datagrams and upstream certificate remain end-to-end with the origin.
 - Binding to 443/80 requires elevated privileges: Administrator on Windows,
   root/sudo on macOS/Linux.
 
