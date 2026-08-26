@@ -107,7 +107,7 @@ transport = "tcp"
         let connecting = endpoint
             .connect_with(
                 client_config,
-                ("127.0.0.1", quic_port).into(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], quic_port)),
                 TEST_SNI,
             )
             .expect("start QUIC connection after oversized ingress");
