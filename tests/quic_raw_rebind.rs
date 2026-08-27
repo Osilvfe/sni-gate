@@ -40,7 +40,10 @@ fn raw_quic_connection_survives_client_udp_rebind() {
 
         let accept_endpoint = upstream.clone();
         let echo_task = tokio::spawn(async move {
-            let incoming = accept_endpoint.accept().await.expect("raw upstream connection");
+            let incoming = accept_endpoint
+                .accept()
+                .await
+                .expect("raw upstream connection");
             let connection = incoming.await.expect("raw upstream handshake");
             for _ in 0..2 {
                 let (mut send, mut recv) =
@@ -113,13 +116,16 @@ idle_timeout = "5s"
         exchange(&connection, BEFORE_REBIND).await;
 
         let old_addr = client.local_addr().expect("old QUIC client address");
-        let new_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind rebound UDP socket");
+        let new_socket =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind rebound UDP socket");
         new_socket
             .set_nonblocking(true)
             .expect("make rebound UDP socket nonblocking");
         let new_addr = new_socket.local_addr().expect("new QUIC client address");
         assert_ne!(old_addr, new_addr);
-        client.rebind(new_socket).expect("rebind QUIC client endpoint");
+        client
+            .rebind(new_socket)
+            .expect("rebind QUIC client endpoint");
         assert_eq!(client.local_addr().unwrap(), new_addr);
 
         tokio::time::timeout(Duration::from_secs(5), exchange(&connection, AFTER_REBIND))
