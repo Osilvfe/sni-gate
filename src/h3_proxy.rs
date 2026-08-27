@@ -49,9 +49,8 @@ const MAX_UPSTREAM_H3_POOL_ENTRIES: usize = 256;
 const UPSTREAM_H3_POOL_IDLE: Duration = Duration::from_secs(60);
 
 static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static UPSTREAM_H3_POOL: OnceLock<
-    Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>,
-> = OnceLock::new();
+static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>> =
+    OnceLock::new();
 
 fn h3_connection_limit() -> Arc<Semaphore> {
     H3_CONNECTION_LIMIT
