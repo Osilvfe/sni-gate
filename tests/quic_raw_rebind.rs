@@ -38,6 +38,7 @@ fn raw_quic_connection_survives_client_udp_rebind() {
         .expect("bind QUIC echo server");
         let upstream_port = upstream.local_addr().unwrap().port();
 
+        let (second_payload_tx, second_payload_rx) = tokio::sync::oneshot::channel();
         let accept_endpoint = upstream.clone();
         let echo_task = tokio::spawn(async move {
             let incoming = accept_endpoint
@@ -45,13 +46,20 @@ fn raw_quic_connection_survives_client_udp_rebind() {
                 .await
                 .expect("raw upstream connection");
             let connection = incoming.await.expect("raw upstream handshake");
-            for _ in 0..2 {
+            let mut second_payload_tx = Some(second_payload_tx);
+            for index in 0..2 {
                 let (mut send, mut recv) =
                     connection.accept_bi().await.expect("bidirectional stream");
                 let payload = recv
                     .read_to_end(64 * 1024)
                     .await
                     .expect("read test payload");
+                if index == 1 {
+                    let _ = second_payload_tx
+                        .take()
+                        .expect("second stream notification sender")
+                        .send(());
+                }
                 send.write_all(&payload).await.expect("echo test payload");
                 send.finish().expect("finish echo stream");
             }
@@ -128,9 +136,25 @@ idle_timeout = "5s"
             .expect("rebind QUIC client endpoint");
         assert_eq!(client.local_addr().unwrap(), new_addr);
 
-        tokio::time::timeout(Duration::from_secs(5), exchange(&connection, AFTER_REBIND))
+        let (mut send, mut recv) = connection
+            .open_bi()
             .await
-            .expect("raw QUIC traffic did not recover after client UDP rebind");
+            .expect("open post-rebind test stream");
+        send.write_all(AFTER_REBIND)
+            .await
+            .expect("send post-rebind test payload");
+        send.finish().expect("finish post-rebind request");
+
+        tokio::time::timeout(Duration::from_secs(3), second_payload_rx)
+            .await
+            .expect("rebound client data never reached the raw QUIC upstream")
+            .expect("raw upstream closed before observing rebound client data");
+
+        let echoed = tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(64 * 1024))
+            .await
+            .expect("raw upstream received rebound client data but its echo never reached the rebound client peer")
+            .expect("read post-rebind echoed payload");
+        assert_eq!(echoed, AFTER_REBIND);
 
         connection.close(0u32.into(), b"test complete");
         client.close(0u32.into(), b"test complete");
