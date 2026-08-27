@@ -55,6 +55,18 @@ A QUIC listener containing only terminating `tls` / `ech` routes uses an H3-only
 
 The fast path is **disabled whenever any `raw` route is present**. Mixed raw + H3 listeners continue to use conservative CID/flow ownership logic for every datagram, preserving transparent raw routing and avoiding accidental capture of raw traffic by the terminating endpoint.
 
+## Raw QUIC flow-table fast path
+
+Inspection flow count and retained bytes are maintained incrementally. Inspection expiry uses a bounded, generation-checked deadline heap, so ordinary forwarding packets do not scan every live flow to update admission state or find stale Initials. Stale heap entries are compacted under churn to keep the expiry index itself bounded.
+
+Short-header lookup probes only CID lengths currently learned from upstream server SCIDs. Upstream short-header responses bypass the flow-table lock entirely; only long-header responses take the lock to teach a newly observed server CID.
+
+A release-mode microbenchmark for the short-header lookup path can be run manually with:
+
+```sh
+cargo test --release benchmark_flow_table_short_header_lookup -- --ignored --nocapture
+```
+
 ## Defaults and compatibility
 
 Existing admission and pool defaults retain their previous values. The H3 ingress and raw forwarding byte budgets add new fail-closed memory ceilings; leaving their variables unset applies the defaults shown above and only changes behavior when queued traffic reaches those ceilings.

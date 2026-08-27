@@ -7,7 +7,8 @@ mod quic_runtime;
 #[path = "quic_socket.rs"]
 mod quic_socket;
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ const MAX_INSPECTING_FLOWS: usize = 256;
 const MAX_INSPECTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CID_LEN: usize = 20;
 const MAX_CIDS_PER_FLOW: usize = 32;
+const MAX_INSPECTION_DEADLINE_ENTRIES: usize = MAX_INSPECTING_FLOWS * 4;
 const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOW_QUEUE: usize = 128;
 const UDP_BUF: usize = 65_535;
@@ -64,6 +66,9 @@ impl QueuedDatagram {
 struct FlowTable {
     next_id: FlowId,
     entries: HashMap<FlowId, FlowEntry>,
+    inspecting_count: usize,
+    inspection_bytes: usize,
+    inspection_deadlines: BinaryHeap<Reverse<(Instant, FlowId, u64)>>,
     peers: HashMap<SocketAddr, HashSet<FlowId>>,
     /// CIDs accepted for long-header lookup. This contains the client's one
     /// initial DCID plus server-issued SCIDs observed from the configured
@@ -72,6 +77,9 @@ struct FlowTable {
     /// Only server-issued CIDs are eligible for short-header matching. A
     /// client-chosen Initial DCID must never become a short-header prefix token.
     short_cids: HashMap<Vec<u8>, HashSet<FlowId>>,
+    /// Number of active short-header CID keys at each legal length. This avoids
+    /// probing lengths that cannot possibly match on every 1-RTT datagram.
+    short_cid_lengths: [usize; MAX_CID_LEN + 1],
 }
 
 impl Default for FlowTable {
@@ -79,9 +87,13 @@ impl Default for FlowTable {
         Self {
             next_id: 1,
             entries: HashMap::new(),
+            inspecting_count: 0,
+            inspection_bytes: 0,
+            inspection_deadlines: BinaryHeap::new(),
             peers: HashMap::new(),
             routing_cids: HashMap::new(),
             short_cids: HashMap::new(),
+            short_cid_lengths: [0; MAX_CID_LEN + 1],
         }
     }
 }
@@ -111,6 +123,7 @@ struct InspectingFlow {
     packets: Vec<Vec<u8>>,
     bytes: usize,
     last_activity: Instant,
+    deadline_generation: u64,
 }
 
 impl InspectingFlow {
@@ -120,6 +133,7 @@ impl InspectingFlow {
             packets: Vec::new(),
             bytes: 0,
             last_activity: now,
+            deadline_generation: 0,
         }
     }
 
@@ -130,6 +144,7 @@ impl InspectingFlow {
             return Err(());
         }
         self.last_activity = now;
+        self.deadline_generation = self.deadline_generation.wrapping_add(1);
         self.bytes += packet.len();
         self.packets.push(packet.to_vec());
         Ok(())
@@ -248,6 +263,9 @@ impl FlowTable {
         let mut candidate = None;
         let max = MAX_CID_LEN.min(datagram.len() - 1);
         for len in 1..=max {
+            if self.short_cid_lengths[len] == 0 {
+                continue;
+            }
             let Some(owners) = self.short_cids.get(&datagram[1..1 + len]) else {
                 continue;
             };
@@ -281,6 +299,8 @@ impl FlowTable {
                 state: FlowState::Inspecting(InspectingFlow::new(now)),
             },
         );
+        self.inspecting_count += 1;
+        self.schedule_inspection_deadline(id, now, 0);
         self.peers.entry(peer).or_default().insert(id);
         if let Some(cid) = initial_dcid {
             self.add_routing_cid(id, cid, false);
@@ -341,17 +361,19 @@ impl FlowTable {
                 .insert(id);
         }
         if short_header && entry.short_cids.insert(cid.to_vec()) {
-            self.short_cids.entry(cid.to_vec()).or_default().insert(id);
+            let owners = self.short_cids.entry(cid.to_vec()).or_default();
+            if owners.is_empty() {
+                self.short_cid_lengths[cid.len()] += 1;
+            }
+            owners.insert(id);
         }
     }
 
     /// A server long-header SCID is a CID the client can use as its future DCID.
     /// Upstream packets arrive through a connected UDP socket, so this is the
     /// only dynamic CID-learning direction trusted by the raw flow table.
-    fn observe_upstream_datagram(&mut self, id: FlowId, datagram: &[u8]) {
-        if let Some(header) = LongHeader::parse(datagram) {
-            self.add_routing_cid(id, header.scid, true);
-        }
+    fn observe_upstream_scid(&mut self, id: FlowId, scid: &[u8]) {
+        self.add_routing_cid(id, scid, true);
     }
 
     fn forwarding_sender(&self, id: FlowId) -> Option<mpsc::Sender<QueuedDatagram>> {
@@ -361,40 +383,86 @@ impl FlowTable {
         }
     }
 
-    fn inspecting_mut(&mut self, id: FlowId) -> Option<&mut InspectingFlow> {
-        match &mut self.entries.get_mut(&id)?.state {
-            FlowState::Inspecting(flow) => Some(flow),
-            FlowState::Forwarding { .. } => None,
-        }
+    fn inspecting_stats(&self) -> (usize, usize) {
+        (self.inspecting_count, self.inspection_bytes)
     }
 
-    fn inspecting_stats(&self) -> (usize, usize) {
-        self.entries
-            .values()
-            .fold((0usize, 0usize), |stats, entry| match &entry.state {
-                FlowState::Inspecting(flow) => {
-                    (stats.0 + 1, stats.1.saturating_add(flow.retained_bytes()))
-                }
-                FlowState::Forwarding { .. } => stats,
-            })
+    fn schedule_inspection_deadline(&mut self, id: FlowId, activity: Instant, generation: u64) {
+        self.inspection_deadlines.push(Reverse((
+            activity + INITIAL_INSPECTION_TIMEOUT,
+            id,
+            generation,
+        )));
+        if self.inspection_deadlines.len() <= MAX_INSPECTION_DEADLINE_ENTRIES {
+            return;
+        }
+        let entries = &self.entries;
+        self.inspection_deadlines
+            .retain(|Reverse((deadline, id, generation))| {
+                entries.get(id).is_some_and(|entry| {
+                    matches!(
+                        &entry.state,
+                        FlowState::Inspecting(flow)
+                            if flow.deadline_generation == *generation
+                                && flow.last_activity + INITIAL_INSPECTION_TIMEOUT == *deadline
+                    )
+                })
+            });
+    }
+
+    fn inspect_datagram(&mut self, id: FlowId, datagram: &[u8], now: Instant) -> InspectResult {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return InspectResult::Invalid;
+        };
+        let FlowState::Inspecting(flow) = &mut entry.state else {
+            return InspectResult::Invalid;
+        };
+        let before = flow.retained_bytes();
+        let pushed = flow.push(datagram, now).is_ok();
+        let inspection = if !pushed {
+            InspectResult::Invalid
+        } else {
+            match flow.inspector.ingest(datagram) {
+                InitialSni::NeedMore => InspectResult::NeedMore,
+                InitialSni::Invalid => InspectResult::Invalid,
+                InitialSni::Name(sni) => InspectResult::Routed {
+                    sni,
+                    packets: flow.take_packets_and_release_inspector(),
+                },
+                InitialSni::NoSni => InspectResult::Routed {
+                    sni: String::new(),
+                    packets: flow.take_packets_and_release_inspector(),
+                },
+            }
+        };
+        let after = flow.retained_bytes();
+        let generation = flow.deadline_generation;
+        self.inspection_bytes = self
+            .inspection_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        if pushed {
+            self.schedule_inspection_deadline(id, now, generation);
+        }
+        inspection
     }
 
     fn evict_oldest_inspecting(&mut self) -> bool {
-        let oldest = self
-            .entries
-            .iter()
-            .filter_map(|(&id, entry)| match &entry.state {
-                FlowState::Inspecting(flow) => Some((id, flow.last_activity)),
-                FlowState::Forwarding { .. } => None,
-            })
-            .min_by_key(|(_, activity)| *activity)
-            .map(|(id, _)| id);
-        if let Some(id) = oldest {
-            self.remove(id);
-            true
-        } else {
-            false
+        while let Some(Reverse((deadline, id, generation))) = self.inspection_deadlines.pop() {
+            let is_current = self.entries.get(&id).is_some_and(|entry| {
+                matches!(
+                    &entry.state,
+                    FlowState::Inspecting(flow)
+                        if flow.deadline_generation == generation
+                            && flow.last_activity + INITIAL_INSPECTION_TIMEOUT == deadline
+                )
+            });
+            if is_current {
+                self.remove(id);
+                return true;
+            }
         }
+        false
     }
 
     /// Reserve one slot for a new unauthenticated Initial flow. Pressure only
@@ -424,6 +492,10 @@ impl FlowTable {
         let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
+        if let FlowState::Inspecting(flow) = &entry.state {
+            self.inspecting_count = self.inspecting_count.saturating_sub(1);
+            self.inspection_bytes = self.inspection_bytes.saturating_sub(flow.retained_bytes());
+        }
         entry.state = FlowState::Forwarding { tx, peer_tx };
         true
     }
@@ -432,6 +504,10 @@ impl FlowTable {
         let Some(entry) = self.entries.remove(&id) else {
             return;
         };
+        if let FlowState::Inspecting(flow) = &entry.state {
+            self.inspecting_count = self.inspecting_count.saturating_sub(1);
+            self.inspection_bytes = self.inspection_bytes.saturating_sub(flow.retained_bytes());
+        }
         let remove_peer = if let Some(ids) = self.peers.get_mut(&entry.peer) {
             ids.remove(&id);
             ids.is_empty()
@@ -461,25 +537,31 @@ impl FlowTable {
             };
             if remove_cid {
                 self.short_cids.remove(&cid);
+                self.short_cid_lengths[cid.len()] =
+                    self.short_cid_lengths[cid.len()].saturating_sub(1);
             }
         }
     }
 
     fn prune_stale_inspecting(&mut self, now: Instant) {
-        let stale: Vec<FlowId> = self
-            .entries
-            .iter()
-            .filter_map(|(&id, entry)| match &entry.state {
-                FlowState::Inspecting(flow)
-                    if now.duration_since(flow.last_activity) >= INITIAL_INSPECTION_TIMEOUT =>
-                {
-                    Some(id)
-                }
-                FlowState::Inspecting(_) | FlowState::Forwarding { .. } => None,
-            })
-            .collect();
-        for id in stale {
-            self.remove(id);
+        while let Some(Reverse((deadline, id, generation))) =
+            self.inspection_deadlines.peek().copied()
+        {
+            if deadline > now {
+                break;
+            }
+            self.inspection_deadlines.pop();
+            let is_current = self.entries.get(&id).is_some_and(|entry| {
+                matches!(
+                    &entry.state,
+                    FlowState::Inspecting(flow)
+                        if flow.deadline_generation == generation
+                            && flow.last_activity + INITIAL_INSPECTION_TIMEOUT == deadline
+                )
+            });
+            if is_current {
+                self.remove(id);
+            }
         }
     }
 }
@@ -599,27 +681,7 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             if let Some(tx) = table.forwarding_sender(id) {
                 Some((id, Some(tx), None))
             } else {
-                let inspection = {
-                    let Some(flow) = table.inspecting_mut(id) else {
-                        continue;
-                    };
-                    if flow.push(datagram, now).is_err() {
-                        InspectResult::Invalid
-                    } else {
-                        match flow.inspector.ingest(datagram) {
-                            InitialSni::NeedMore => InspectResult::NeedMore,
-                            InitialSni::Invalid => InspectResult::Invalid,
-                            InitialSni::Name(sni) => InspectResult::Routed {
-                                sni,
-                                packets: flow.take_packets_and_release_inspector(),
-                            },
-                            InitialSni::NoSni => InspectResult::Routed {
-                                sni: String::new(),
-                                packets: flow.take_packets_and_release_inspector(),
-                            },
-                        }
-                    }
-                };
+                let inspection = table.inspect_datagram(id, datagram, now);
 
                 let (_, inspection_bytes) = table.inspecting_stats();
                 if inspection_bytes > MAX_INSPECTION_BYTES {
@@ -1018,7 +1080,9 @@ async fn run_raw_flow(
             },
             received = upstream.recv(&mut buf) => {
                 let n = received?;
-                flows.lock().await.observe_upstream_datagram(flow_id, &buf[..n]);
+                if let Some(header) = LongHeader::parse(&buf[..n]) {
+                    flows.lock().await.observe_upstream_scid(flow_id, header.scid);
+                }
                 let current_peer = *peer_rx.borrow();
                 listener.send_to(&buf[..n], current_peer).await?;
             },
@@ -1130,6 +1194,57 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_inspection_deadline_ignores_stale_heap_entry() {
+        let now = Instant::now();
+        let initial = now - INITIAL_INSPECTION_TIMEOUT - Duration::from_millis(1);
+        let mut flows = FlowTable::default();
+        let id = flows.insert_inspecting("127.0.0.1:1500".parse().unwrap(), initial, None);
+
+        let _ = flows.inspect_datagram(id, b"partial", now);
+        flows.prune_stale_inspecting(now);
+        assert!(flows.entries.contains_key(&id));
+        assert_eq!(flows.inspecting_stats().0, 1);
+
+        flows.prune_stale_inspecting(now + INITIAL_INSPECTION_TIMEOUT);
+        assert!(!flows.entries.contains_key(&id));
+        assert_eq!(flows.inspecting_stats(), (0, 0));
+    }
+
+    #[test]
+    fn inspection_counters_update_on_buffer_promote_and_remove() {
+        let now = Instant::now();
+        let mut flows = FlowTable::default();
+        let first = flows.insert_inspecting("127.0.0.1:1600".parse().unwrap(), now, None);
+        let second = flows.insert_inspecting("127.0.0.1:1601".parse().unwrap(), now, None);
+        assert_eq!(flows.inspecting_stats(), (2, 0));
+
+        let _ = flows.inspect_datagram(first, b"partial", now + Duration::from_millis(1));
+        assert_eq!(flows.inspecting_stats(), (2, b"partial".len()));
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (peer_tx, _peer_rx) = watch::channel("127.0.0.1:1600".parse().unwrap());
+        assert!(flows.promote(first, tx, peer_tx));
+        assert_eq!(flows.inspecting_stats(), (1, 0));
+
+        flows.remove(second);
+        assert_eq!(flows.inspecting_stats(), (0, 0));
+    }
+
+    #[test]
+    fn stale_deadline_entries_are_compacted_under_flow_churn() {
+        let now = Instant::now();
+        let mut flows = FlowTable::default();
+        for index in 0..=MAX_INSPECTION_DEADLINE_ENTRIES {
+            let peer: SocketAddr = format!("127.0.0.1:{}", 20_000 + index).parse().unwrap();
+            let id = flows.insert_inspecting(peer, now, None);
+            flows.remove(id);
+        }
+
+        assert!(flows.inspection_deadlines.len() <= MAX_INSPECTION_DEADLINE_ENTRIES);
+        assert_eq!(flows.inspecting_stats(), (0, 0));
+    }
+
+    #[test]
     fn inspection_capacity_evicts_oldest_without_touching_forwarding() {
         let now = Instant::now();
         let mut flows = FlowTable::default();
@@ -1161,7 +1276,11 @@ mod tests {
         let now = Instant::now();
         let mut flows = FlowTable::default();
         let id = flows.insert_inspecting("127.0.0.1:9000".parse().unwrap(), now, None);
-        flows.inspecting_mut(id).unwrap().bytes = MAX_INSPECTION_BYTES;
+        let FlowState::Inspecting(flow) = &mut flows.entries.get_mut(&id).unwrap().state else {
+            unreachable!();
+        };
+        flow.bytes = MAX_INSPECTION_BYTES;
+        flows.inspection_bytes = MAX_INSPECTION_BYTES;
         assert!(flows.make_room_for_inspecting());
         assert!(!flows.entries.contains_key(&id));
         assert_eq!(flows.inspecting_stats(), (0, 0));
@@ -1176,7 +1295,7 @@ mod tests {
         let id = flows.insert_inspecting(old_peer, now, Some(b"initial1"));
         let server_cid = b"server01";
         let response = long_header(QUIC_V1, 0xc0, b"client01", server_cid);
-        flows.observe_upstream_datagram(id, &response);
+        flows.observe_upstream_scid(id, LongHeader::parse(&response).unwrap().scid);
         let (tx, _rx) = mpsc::channel(1);
         let (peer_tx, peer_rx) = watch::channel(old_peer);
         assert!(flows.promote(id, tx, peer_tx));
@@ -1231,12 +1350,15 @@ mod tests {
         let id = flows.insert_inspecting(old_peer, now, Some(b"initial1"));
         let server_cid = b"srv-short";
         let response = long_header(QUIC_V1, 0xc0, b"client03", server_cid);
-        flows.observe_upstream_datagram(id, &response);
+        flows.observe_upstream_scid(id, LongHeader::parse(&response).unwrap().scid);
 
         let mut short = vec![0x40];
         short.extend_from_slice(server_cid);
         short.extend_from_slice(b"ciphertext");
         assert_eq!(flows.flow_id_for(new_peer, &short, true), Some(id));
+        assert_eq!(flows.short_cid_lengths[server_cid.len()], 1);
+        flows.remove(id);
+        assert_eq!(flows.short_cid_lengths[server_cid.len()], 0);
     }
 
     #[test]
@@ -1248,7 +1370,7 @@ mod tests {
         for value in 0u8..100 {
             let scid = [value; 8];
             let response = long_header(QUIC_V1, 0xc0, b"client04", &scid);
-            flows.observe_upstream_datagram(id, &response);
+            flows.observe_upstream_scid(id, LongHeader::parse(&response).unwrap().scid);
         }
 
         let entry = flows.entries.get(&id).unwrap();
@@ -1256,6 +1378,60 @@ mod tests {
         assert_eq!(entry.short_cids.len(), MAX_CIDS_PER_FLOW - 1);
         assert_eq!(flows.routing_cids.len(), MAX_CIDS_PER_FLOW);
         assert_eq!(flows.short_cids.len(), MAX_CIDS_PER_FLOW - 1);
+    }
+
+    #[test]
+    fn shared_short_cid_length_stays_active_until_last_key_is_removed() {
+        let now = Instant::now();
+        let mut flows = FlowTable::default();
+        let first = flows.insert_inspecting("127.0.0.1:6300".parse().unwrap(), now, None);
+        let second = flows.insert_inspecting("127.0.0.1:6301".parse().unwrap(), now, None);
+        flows.observe_upstream_scid(first, b"same-cid");
+        flows.observe_upstream_scid(second, b"same-cid");
+        assert_eq!(flows.short_cid_lengths[8], 1);
+
+        flows.remove(first);
+        assert_eq!(flows.short_cid_lengths[8], 1);
+        flows.remove(second);
+        assert_eq!(flows.short_cid_lengths[8], 0);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode FlowTable microbenchmark"]
+    fn benchmark_flow_table_short_header_lookup() {
+        const FLOWS: usize = 4096;
+        const LOOKUPS: usize = 1_000_000;
+
+        let now = Instant::now();
+        let mut flows = FlowTable::default();
+        let mut target = Vec::new();
+        for index in 0..FLOWS {
+            let peer = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                u16::try_from(10_000 + index).unwrap(),
+            );
+            let id = flows.insert_inspecting(peer, now, None);
+            let cid = (index as u64).to_be_bytes();
+            flows.observe_upstream_scid(id, &cid);
+            let (tx, _rx) = mpsc::channel(1);
+            let (peer_tx, _peer_rx) = watch::channel(peer);
+            assert!(flows.promote(id, tx, peer_tx));
+            if index + 1 == FLOWS {
+                target.push(0x40);
+                target.extend_from_slice(&cid);
+                target.extend_from_slice(b"ciphertext");
+            }
+        }
+
+        let started = std::time::Instant::now();
+        for _ in 0..LOOKUPS {
+            std::hint::black_box(flows.short_header_owner(std::hint::black_box(&target)));
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "FlowTable short-header lookup: {LOOKUPS} operations over {FLOWS} flows in {elapsed:?} ({:.1} ns/op)",
+            elapsed.as_nanos() as f64 / LOOKUPS as f64
+        );
     }
 
     #[test]
