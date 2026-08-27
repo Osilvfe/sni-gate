@@ -48,9 +48,9 @@ const MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION: usize = 256;
 const MAX_H3_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
 /// Pooling avoids paying a fresh UDP socket + QUIC/TLS/H3 handshake for every
-/// inbound H3 connection. The key includes the listener route, resolved socket
-/// address, and TLS identity so reflecting routes never accidentally share an
-/// upstream connection across identities.
+/// inbound H3 connection. Keys use logical upstream identity rather than the
+/// resolved address, so healthy pool hits do not perform DNS. DNS is refreshed
+/// naturally when a connection is evicted or ages out and must be rebuilt.
 const MAX_UPSTREAM_H3_POOL_ENTRIES: usize = 256;
 const UPSTREAM_H3_POOL_IDLE: Duration = Duration::from_secs(60);
 
@@ -85,15 +85,22 @@ struct H3ProxyContext {
 struct UpstreamPoolKey {
     listener: SocketAddr,
     route_id: usize,
-    upstream: SocketAddr,
+    host: String,
+    port: u16,
     server_name: String,
     ech: bool,
 }
 
 struct UpstreamPoolEntry {
     upstream: UpstreamH3,
+    upstream_addr: SocketAddr,
     closed: Arc<AtomicBool>,
     last_used: Instant,
+}
+
+struct UpstreamIdentity {
+    host: String,
+    server_name: String,
 }
 
 struct UpstreamTarget {
@@ -460,12 +467,13 @@ async fn pooled_upstream_h3(
     peer: SocketAddr,
     cert_resolver: &Arc<DynamicResolver>,
 ) -> Result<(UpstreamPoolKey, UpstreamH3)> {
-    let target = resolve_upstream_target(route, handshake_sni).await?;
+    let identity = upstream_identity(route, handshake_sni)?;
     let key = UpstreamPoolKey {
         listener,
         route_id,
-        upstream: target.upstream_addr,
-        server_name: target.server_name.clone(),
+        host: identity.host.clone(),
+        port: route.upstream_port,
+        server_name: identity.server_name.clone(),
         ech: route.route_type == RouteType::H3Ech,
     };
     let pool = upstream_h3_pool();
@@ -482,20 +490,23 @@ async fn pooled_upstream_h3(
             debug!(
                 %peer,
                 route = %route.name,
-                upstream = %target.upstream_addr,
-                sni = %target.server_name,
+                host = %identity.host,
+                upstream = %entry.upstream_addr,
+                sni = %identity.server_name,
                 "reusing pooled upstream H3 connection"
             );
             return Ok((key, entry.upstream.clone()));
         }
     }
 
+    let target = resolve_upstream_target(route, &identity).await?;
     let created =
         connect_upstream_h3_target(route, handshake_sni, peer, cert_resolver, &target).await?;
 
     let mut entries = pool.lock().await;
-    // Another task may have connected the same key while we were handshaking.
-    // Prefer its healthy connection and let our duplicate drop naturally.
+    // Another task may have connected the same logical key while we were
+    // resolving/handshaking. Prefer its healthy connection and let our
+    // duplicate drop naturally.
     if let Some(entry) = entries.get_mut(&key) {
         if !entry.closed.load(Ordering::Acquire) {
             entry.last_used = Instant::now();
@@ -518,6 +529,7 @@ async fn pooled_upstream_h3(
         key.clone(),
         UpstreamPoolEntry {
             upstream: created.upstream,
+            upstream_addr: target.upstream_addr,
             closed: created.closed,
             last_used: Instant::now(),
         },
@@ -525,10 +537,7 @@ async fn pooled_upstream_h3(
     Ok((key, upstream))
 }
 
-async fn resolve_upstream_target(
-    route: &RouteRuntime,
-    handshake_sni: &str,
-) -> Result<UpstreamTarget> {
+fn upstream_identity(route: &RouteRuntime, handshake_sni: &str) -> Result<UpstreamIdentity> {
     let host = route
         .upstream_host
         .clone()
@@ -546,20 +555,27 @@ async fn resolve_upstream_target(
         }
         SniPolicy::Reflect | SniPolicy::Omit => host.clone(),
     };
+    Ok(UpstreamIdentity { host, server_name })
+}
+
+async fn resolve_upstream_target(
+    route: &RouteRuntime,
+    identity: &UpstreamIdentity,
+) -> Result<UpstreamTarget> {
     let upstream_addr = route
         .addr_resolver
         .lookup_addr(
-            &host,
+            &identity.host,
             route.upstream_port,
             route.address_family,
             route.nat64.as_ref(),
         )
         .await
-        .with_context(|| format!("resolving H3 upstream {host}"))?;
+        .with_context(|| format!("resolving H3 upstream {}", identity.host))?;
 
     Ok(UpstreamTarget {
-        host,
-        server_name,
+        host: identity.host.clone(),
+        server_name: identity.server_name.clone(),
         upstream_addr,
     })
 }
