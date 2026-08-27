@@ -15,7 +15,9 @@ use std::task::{Context, Poll};
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
+
+use super::quic_runtime::ByteBudget;
 
 pub const DISPATCH_QUEUE: usize = 1024;
 /// Receive contract shared by the dispatcher and Quinn endpoint.
@@ -37,6 +39,15 @@ pub fn h3_endpoint_config() -> io::Result<quinn::EndpointConfig> {
 pub struct InboundDatagram {
     pub peer: SocketAddr,
     pub bytes: Vec<u8>,
+    _queued_bytes: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressSendError {
+    Oversized,
+    ByteBudgetExhausted,
+    QueueFull,
+    Closed,
 }
 
 /// The dispatcher-owned injection handle for Quinn-bound datagrams.
@@ -44,6 +55,7 @@ pub struct InboundDatagram {
 pub struct QuicIngress {
     tx: mpsc::Sender<InboundDatagram>,
     max_datagram_size: usize,
+    byte_budget: Arc<ByteBudget>,
 }
 
 impl QuicIngress {
@@ -51,25 +63,28 @@ impl QuicIngress {
         self.max_datagram_size
     }
 
-    pub fn try_send(
-        &self,
-        peer: SocketAddr,
-        bytes: &[u8],
-    ) -> Result<(), mpsc::error::TrySendError<InboundDatagram>> {
+    pub fn try_send(&self, peer: SocketAddr, bytes: &[u8]) -> Result<(), IngressSendError> {
         // Quinn sizes its receive buffers from EndpointConfig's maximum UDP
         // payload. Reject larger datagrams before copying them into the bounded
         // channel; otherwise an attacker-controlled packet can surface as a
         // fatal AsyncUdpSocket receive error and tear down the whole endpoint.
         if bytes.len() > self.max_datagram_size {
-            return Err(mpsc::error::TrySendError::Full(InboundDatagram {
-                peer,
-                bytes: Vec::new(),
-            }));
+            return Err(IngressSendError::Oversized);
         }
-        self.tx.try_send(InboundDatagram {
-            peer,
-            bytes: bytes.to_vec(),
-        })
+        let queued_bytes = self
+            .byte_budget
+            .try_acquire(bytes.len())
+            .map_err(|_| IngressSendError::ByteBudgetExhausted)?;
+        self.tx
+            .try_send(InboundDatagram {
+                peer,
+                bytes: bytes.to_vec(),
+                _queued_bytes: Some(queued_bytes),
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => IngressSendError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => IngressSendError::Closed,
+            })
     }
 }
 
@@ -85,6 +100,7 @@ impl SharedQuicSocket {
     pub fn new(
         socket: Arc<UdpSocket>,
         max_datagram_size: usize,
+        byte_budget: Arc<ByteBudget>,
     ) -> io::Result<(Arc<Self>, QuicIngress)> {
         let state = UdpSocketState::new((&*socket).into())?;
         let (tx, rx) = mpsc::channel(DISPATCH_QUEUE);
@@ -97,6 +113,7 @@ impl SharedQuicSocket {
             QuicIngress {
                 tx,
                 max_datagram_size,
+                byte_budget,
             },
         ))
     }
@@ -210,11 +227,15 @@ mod tests {
     use super::*;
     use std::future::poll_fn;
 
+    fn ingress_budget() -> Arc<ByteBudget> {
+        Arc::new(ByteBudget::new(1024 * 1024))
+    }
+
     #[tokio::test]
     async fn ingress_is_exposed_as_one_quinn_receive() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (socket, ingress) =
-            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, ingress_budget()).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         ingress.try_send(peer, b"quic-packet").unwrap();
 
@@ -234,32 +255,34 @@ mod tests {
     #[tokio::test]
     async fn oversized_ingress_is_rejected_before_allocation() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let budget = ingress_budget();
+        let before = budget.available();
         let (_socket, ingress) =
-            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone()).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let oversized = vec![0u8; ingress.max_datagram_size + 1];
 
-        let error = ingress.try_send(peer, &oversized).unwrap_err();
-        match error {
-            mpsc::error::TrySendError::Full(datagram) => {
-                assert_eq!(datagram.peer, peer);
-                assert!(datagram.bytes.is_empty());
-            }
-            mpsc::error::TrySendError::Closed(_) => panic!("ingress unexpectedly closed"),
-        }
+        assert_eq!(
+            ingress.try_send(peer, &oversized),
+            Err(IngressSendError::Oversized)
+        );
+        assert_eq!(budget.available(), before);
     }
 
     #[tokio::test]
     async fn oversized_queued_datagram_does_not_kill_receive_path() {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let budget = ingress_budget();
         let (socket, ingress) =
-            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone()).unwrap();
         let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let queued_bytes = budget.try_acquire(65).unwrap();
         ingress
             .tx
             .try_send(InboundDatagram {
                 peer,
                 bytes: vec![0u8; 65],
+                _queued_bytes: Some(queued_bytes),
             })
             .unwrap();
         ingress.try_send(peer, b"good").unwrap();
@@ -281,7 +304,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = receiver.local_addr().unwrap();
         let (socket, _ingress) =
-            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize).unwrap();
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, ingress_budget()).unwrap();
         let transmit = Transmit {
             destination,
             ecn: None,
@@ -294,5 +317,91 @@ mod tests {
         let mut buf = [0u8; 16];
         let (n, _) = receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"reply");
+    }
+
+    #[tokio::test]
+    async fn ingress_byte_budget_is_released_after_receive() {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let budget = Arc::new(ByteBudget::new(4));
+        let (socket, ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone()).unwrap();
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        ingress.try_send(peer, b"four").unwrap();
+        assert_eq!(budget.available(), 0);
+        assert_eq!(
+            ingress.try_send(peer, b"x"),
+            Err(IngressSendError::ByteBudgetExhausted)
+        );
+
+        let mut storage = [0u8; 8];
+        let mut bufs = [IoSliceMut::new(&mut storage)];
+        let mut meta = [RecvMeta::default()];
+        poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap();
+        assert_eq!(budget.available(), 4);
+        ingress.try_send(peer, b"x").unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_ingress_releases_reserved_bytes() {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let budget = Arc::new(ByteBudget::new(4));
+        let (socket, ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone()).unwrap();
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        drop(socket);
+
+        assert_eq!(
+            ingress.try_send(peer, b"four"),
+            Err(IngressSendError::Closed)
+        );
+        assert_eq!(budget.available(), 4);
+    }
+
+    #[tokio::test]
+    async fn full_ingress_queue_releases_rejected_datagram_bytes() {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let budget = Arc::new(ByteBudget::new(DISPATCH_QUEUE + 1));
+        let (socket, ingress) =
+            SharedQuicSocket::new(udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone()).unwrap();
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        for _ in 0..DISPATCH_QUEUE {
+            ingress.try_send(peer, b"x").unwrap();
+        }
+        assert_eq!(budget.available(), 1);
+        assert_eq!(
+            ingress.try_send(peer, b"x"),
+            Err(IngressSendError::QueueFull)
+        );
+        assert_eq!(budget.available(), 1);
+
+        drop(socket);
+        assert_eq!(budget.available(), DISPATCH_QUEUE + 1);
+    }
+
+    #[tokio::test]
+    async fn ingress_budget_is_shared_across_virtual_sockets() {
+        let first_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let second_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let budget = Arc::new(ByteBudget::new(4));
+        let (first_socket, first) =
+            SharedQuicSocket::new(first_udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone())
+                .unwrap();
+        let (_second_socket, second) =
+            SharedQuicSocket::new(second_udp, H3_MAX_UDP_PAYLOAD_SIZE as usize, budget.clone())
+                .unwrap();
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        first.try_send(peer, b"four").unwrap();
+        assert_eq!(
+            second.try_send(peer, b"x"),
+            Err(IngressSendError::ByteBudgetExhausted)
+        );
+        drop(first_socket);
+        assert_eq!(budget.available(), 4);
+        second.try_send(peer, b"x").unwrap();
     }
 }

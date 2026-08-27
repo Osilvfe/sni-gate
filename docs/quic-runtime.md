@@ -17,18 +17,24 @@ All values are parsed once when the first QUIC listener starts. Invalid or zero 
 | `SNI_GATE_QUIC_MAX_UPSTREAM_POOL_ENTRIES` | `256` | Maximum number of reusable upstream HTTP/3 connections retained by the process. |
 | `SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS` | `60` | Idle age in seconds after which a reusable upstream H3 pool entry is discarded. Active request streams keep their endpoint alive even if the reusable pool entry is evicted. |
 | `SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS` | `64` | Maximum simultaneous upstream DNS + UDP bind + QUIC/TLS/ECH/H3 establishment operations. Waiting for this capacity is bounded by the route's existing `connect_timeout`. |
+| `SNI_GATE_QUIC_MAX_H3_INGRESS_BYTES` | `8388608` | Maximum bytes queued between all shared UDP dispatchers and terminating Quinn endpoints across the process. |
+| `SNI_GATE_QUIC_MAX_RAW_FORWARDING_BYTES` | `67108864` | Maximum bytes retained by all routed raw QUIC flows while upstream setup or forwarding is pending. |
 
 Example:
 
 ```sh
 SNI_GATE_QUIC_MAX_H3_CONNECTIONS=4096 \
 SNI_GATE_QUIC_MAX_PENDING_HANDSHAKES=512 \
+SNI_GATE_QUIC_MAX_H3_INGRESS_BYTES=16777216 \
+SNI_GATE_QUIC_MAX_RAW_FORWARDING_BYTES=134217728 \
 SNI_GATE_QUIC_MAX_UPSTREAM_POOL_ENTRIES=512 \
 SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS=120 \
 ./sni-gate --config sni-gate.toml
 ```
 
 These are capacity controls rather than performance targets. Raising them increases the maximum amount of live QUIC/H3 state the process may retain; tune them together with OS UDP socket buffers, memory limits, and expected concurrency.
+
+The inbound handshake semaphore and both byte budgets are shared by every listener. H3 and raw queues still retain their packet-count bounds as a second limit. Each queued allocation owns its byte permit, so consuming or dropping a datagram, closing a queue, or tearing down a raw flow returns capacity automatically.
 
 ## Upstream HTTP/3 pooling
 
@@ -51,6 +57,6 @@ The fast path is **disabled whenever any `raw` route is present**. Mixed raw + H
 
 ## Defaults and compatibility
 
-The defaults above are the same hardening values used before runtime configurability was added. Leaving every `SNI_GATE_QUIC_*` variable unset therefore preserves existing behavior.
+Existing admission and pool defaults retain their previous values. The H3 ingress and raw forwarding byte budgets add new fail-closed memory ceilings; leaving their variables unset applies the defaults shown above and only changes behavior when queued traffic reaches those ceilings.
 
 The runtime policy is intentionally separate from `[http3] enabled = true`: the latter decides whether automatic QUIC companion listeners exist; the former controls process resource budgets once QUIC/H3 traffic is running.

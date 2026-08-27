@@ -16,14 +16,15 @@ use anyhow::{anyhow, Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::config::{FailPolicy, RouteType};
 use crate::proxy::{ListenerState, RouteRuntime};
 use crate::quic_initial::{InitialInspector, InitialSni};
-use quic_socket::{InboundDatagram, QuicIngress, SharedQuicSocket};
+use quic_runtime::ByteBudget;
+use quic_socket::{IngressSendError, QuicIngress, SharedQuicSocket};
 
 const MAX_INITIAL_DATAGRAMS: usize = 8;
 const MAX_INITIAL_BYTES: usize = 32 * 1024;
@@ -40,6 +41,25 @@ const QUIC_V2: u32 = 0x6b33_43cf;
 
 type FlowId = u64;
 type Flows = Arc<Mutex<FlowTable>>;
+
+#[derive(Debug)]
+struct QueuedDatagram {
+    bytes: Vec<u8>,
+    _queued_bytes: OwnedSemaphorePermit,
+}
+
+impl QueuedDatagram {
+    fn reserve(bytes: Vec<u8>, budget: &ByteBudget) -> std::result::Result<Self, Vec<u8>> {
+        let queued_bytes = match budget.try_acquire(bytes.len()) {
+            Ok(permit) => permit,
+            Err(_) => return Err(bytes),
+        };
+        Ok(Self {
+            bytes,
+            _queued_bytes: queued_bytes,
+        })
+    }
+}
 
 struct FlowTable {
     next_id: FlowId,
@@ -78,7 +98,7 @@ enum FlowState {
     /// The queue exists before upstream setup finishes, so packets arriving
     /// during DNS/socket setup are retained without blocking the listener.
     Forwarding {
-        tx: mpsc::Sender<Vec<u8>>,
+        tx: mpsc::Sender<QueuedDatagram>,
         /// Raw upstream replies are sent to the latest observed client address.
         /// Updating this when a known DCID arrives from a new address is what
         /// makes NAT rebinding/path migration work without changing payloads.
@@ -334,7 +354,7 @@ impl FlowTable {
         }
     }
 
-    fn forwarding_sender(&self, id: FlowId) -> Option<mpsc::Sender<Vec<u8>>> {
+    fn forwarding_sender(&self, id: FlowId) -> Option<mpsc::Sender<QueuedDatagram>> {
         match &self.entries.get(&id)?.state {
             FlowState::Forwarding { tx, .. } => Some(tx.clone()),
             FlowState::Inspecting(_) => None,
@@ -398,7 +418,7 @@ impl FlowTable {
     fn promote(
         &mut self,
         id: FlowId,
-        tx: mpsc::Sender<Vec<u8>>,
+        tx: mpsc::Sender<QueuedDatagram>,
         peer_tx: watch::Sender<SocketAddr>,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(&id) else {
@@ -493,6 +513,7 @@ fn warn_unsupported_fail_policies(state: &ListenerState) {
 /// Serve one UDP/QUIC listener.
 pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     let limits = quic_runtime::init_from_env().context("loading QUIC runtime limits")?;
+    let raw_forwarding_budget = quic_runtime::raw_forwarding_byte_budget();
     let listener = Arc::new(
         UdpSocket::bind(state.addr)
             .await
@@ -517,6 +538,8 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
         h3_fast_path = h3_only,
         max_pending_h3_handshakes = limits.max_pending_handshakes,
         max_h3_connections = limits.max_h3_connections,
+        max_h3_ingress_bytes = limits.max_h3_ingress_bytes,
+        max_raw_forwarding_bytes = limits.max_raw_forwarding_bytes,
         "QUIC listening"
     );
 
@@ -642,7 +665,20 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             continue;
         };
         if let Some(tx) = forwarding {
-            match tx.try_send(datagram.to_vec()) {
+            let queued = match QueuedDatagram::reserve(datagram.to_vec(), &raw_forwarding_budget) {
+                Ok(queued) => queued,
+                Err(_) => {
+                    debug!(
+                        %peer,
+                        flow_id,
+                        bytes = datagram.len(),
+                        max_bytes = raw_forwarding_budget.capacity(),
+                        "dropping QUIC datagram because raw forwarding byte budget is exhausted"
+                    );
+                    continue;
+                }
+            };
+            match tx.try_send(queued) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     debug!(%peer, flow_id, "dropping QUIC datagram because raw flow queue is full");
@@ -677,6 +713,7 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                     route,
                     sni,
                     packets,
+                    raw_forwarding_budget.clone(),
                 )
                 .await;
             }
@@ -718,8 +755,12 @@ fn start_h3_endpoint(
     let endpoint_config = quic_socket::h3_endpoint_config()
         .context("configuring shared Quinn endpoint receive limit")?;
     let max_datagram_size = endpoint_config.get_max_udp_payload_size() as usize;
-    let (socket, ingress) = SharedQuicSocket::new(listener, max_datagram_size)
-        .context("initializing shared Quinn UDP socket")?;
+    let (socket, ingress) = SharedQuicSocket::new(
+        listener,
+        max_datagram_size,
+        quic_runtime::h3_ingress_byte_budget(),
+    )
+    .context("initializing shared Quinn UDP socket")?;
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
         endpoint_config,
         Some(server_config),
@@ -730,7 +771,7 @@ fn start_h3_endpoint(
 
     let accept_endpoint = endpoint.clone();
     let max_pending_handshakes = quic_runtime::limits().max_pending_handshakes;
-    let handshake_limit = Arc::new(Semaphore::new(max_pending_handshakes));
+    let handshake_limit = quic_runtime::inbound_handshake_limit();
     tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
             let handshake_permit = match handshake_limit.clone().try_acquire_owned() {
@@ -837,10 +878,20 @@ fn dispatch_to_h3(ingress: &QuicIngress, peer: SocketAddr, datagram: &[u8]) {
     }
     match ingress.try_send(peer, datagram) {
         Ok(()) => {}
-        Err(TrySendError::Full(InboundDatagram { .. })) => {
+        Err(IngressSendError::Oversized) => {
+            debug!(%peer, "dropping oversized QUIC datagram before H3 ingress");
+        }
+        Err(IngressSendError::ByteBudgetExhausted) => {
+            debug!(
+                %peer,
+                bytes = datagram.len(),
+                "dropping QUIC datagram because process-wide H3 ingress byte budget is exhausted"
+            );
+        }
+        Err(IngressSendError::QueueFull) => {
             debug!(%peer, "dropping QUIC datagram because H3 dispatcher queue is full");
         }
-        Err(TrySendError::Closed(InboundDatagram { .. })) => {
+        Err(IngressSendError::Closed) => {
             debug!(%peer, "dropping QUIC datagram because H3 endpoint is closed");
         }
     }
@@ -852,7 +903,7 @@ struct RawFlowContext {
     flow_id: FlowId,
     route: Arc<RouteRuntime>,
     sni: String,
-    packets: Vec<Vec<u8>>,
+    packets: Vec<QueuedDatagram>,
 }
 
 async fn spawn_raw_flow(
@@ -862,7 +913,24 @@ async fn spawn_raw_flow(
     route: Arc<RouteRuntime>,
     sni: String,
     packets: Vec<Vec<u8>>,
+    byte_budget: Arc<ByteBudget>,
 ) {
+    let mut reserved_packets = Vec::with_capacity(packets.len());
+    for packet in packets {
+        match QueuedDatagram::reserve(packet, &byte_budget) {
+            Ok(packet) => reserved_packets.push(packet),
+            Err(packet) => {
+                flows.lock().await.remove(flow_id);
+                debug!(
+                    flow_id,
+                    bytes = packet.len(),
+                    max_bytes = byte_budget.capacity(),
+                    "dropping QUIC raw flow because forwarding byte budget is exhausted during upstream setup"
+                );
+                return;
+            }
+        }
+    }
     let peer = {
         let table = flows.lock().await;
         table.peer(flow_id)
@@ -883,7 +951,7 @@ async fn spawn_raw_flow(
         flow_id,
         route,
         sni,
-        packets,
+        packets: reserved_packets,
     };
     tokio::spawn(async move {
         if let Err(error) = run_raw_flow(context, rx, peer_rx).await {
@@ -896,7 +964,7 @@ async fn spawn_raw_flow(
 
 async fn run_raw_flow(
     context: RawFlowContext,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<QueuedDatagram>,
     peer_rx: watch::Receiver<SocketAddr>,
 ) -> Result<()> {
     let RawFlowContext {
@@ -934,8 +1002,8 @@ async fn run_raw_flow(
     };
     let upstream = UdpSocket::bind(bind).await?;
     upstream.connect(upstream_addr).await?;
-    for packet in &packets {
-        upstream.send(packet).await?;
+    for packet in packets {
+        upstream.send(&packet.bytes).await?;
     }
 
     let peer = *peer_rx.borrow();
@@ -945,7 +1013,7 @@ async fn run_raw_flow(
     loop {
         tokio::select! {
             packet = rx.recv() => match packet {
-                Some(packet) => upstream.send(&packet).await.map(|_| ())?,
+                Some(packet) => upstream.send(&packet.bytes).await.map(|_| ())?,
                 None => break,
             },
             received = upstream.recv(&mut buf) => {
@@ -996,6 +1064,50 @@ mod tests {
         assert!(is_quic_initial(&v2_initial));
         assert!(!is_quic_initial(&v1_handshake));
         assert!(!is_quic_initial(&short_header));
+    }
+
+    #[test]
+    fn raw_forwarding_budget_tracks_queued_datagram_lifetime() {
+        let budget = ByteBudget::new(4);
+        let queued = QueuedDatagram::reserve(b"four".to_vec(), &budget).unwrap();
+        assert_eq!(budget.available(), 0);
+        assert!(QueuedDatagram::reserve(b"x".to_vec(), &budget).is_err());
+
+        drop(queued);
+        assert_eq!(budget.available(), 4);
+        assert!(QueuedDatagram::reserve(b"x".to_vec(), &budget).is_ok());
+    }
+
+    #[test]
+    fn dropping_raw_flow_queue_releases_all_queued_bytes() {
+        let budget = ByteBudget::new(8);
+        let (tx, rx) = mpsc::channel(2);
+        tx.try_send(QueuedDatagram::reserve(b"four".to_vec(), &budget).unwrap())
+            .unwrap();
+        tx.try_send(QueuedDatagram::reserve(b"more".to_vec(), &budget).unwrap())
+            .unwrap();
+        assert_eq!(budget.available(), 0);
+
+        drop(rx);
+        assert_eq!(budget.available(), 8);
+    }
+
+    #[test]
+    fn full_raw_flow_queue_releases_rejected_datagram_bytes() {
+        let budget = ByteBudget::new(3);
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(QueuedDatagram::reserve(b"x".to_vec(), &budget).unwrap())
+            .unwrap();
+        assert_eq!(budget.available(), 2);
+
+        let error = tx
+            .try_send(QueuedDatagram::reserve(b"y".to_vec(), &budget).unwrap())
+            .unwrap_err();
+        drop(error);
+        assert_eq!(budget.available(), 2);
+
+        drop(rx);
+        assert_eq!(budget.available(), 3);
     }
 
     #[test]
