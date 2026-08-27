@@ -54,22 +54,24 @@ impl Default for QuicRuntimeLimits {
 
 static LIMITS: OnceLock<QuicRuntimeLimits> = OnceLock::new();
 
-/// Parse and install the process-wide limits. Calling this more than once is a
-/// programming error because semaphores and pools are sized from these values
-/// and cannot be resized safely while traffic is live.
+/// Parse and install the process-wide limits on the first QUIC listener. Later
+/// listeners share exactly the same immutable object. If two listeners start at
+/// the same time, either parsed value is equivalent because they read the same
+/// process environment before traffic begins.
 pub fn init_from_env() -> Result<&'static QuicRuntimeLimits> {
-    if LIMITS.get().is_some() {
-        return Err(anyhow!("QUIC runtime limits were initialized more than once"));
+    if let Some(limits) = LIMITS.get() {
+        return Ok(limits);
     }
-    let limits = QuicRuntimeLimits::from_env()?;
-    LIMITS
-        .set(limits)
-        .map_err(|_| anyhow!("QUIC runtime limits were initialized concurrently"))?;
-    Ok(LIMITS.get().expect("QUIC runtime limits just initialized"))
+    let parsed = QuicRuntimeLimits::from_env()?;
+    let _ = LIMITS.set(parsed);
+    Ok(LIMITS
+        .get()
+        .expect("QUIC runtime limits initialized by this or a concurrent listener"))
 }
 
-/// Data-path accessor. Tests and binaries that do not call `init_from_env`
-/// explicitly retain the exact production defaults rather than panicking.
+/// Data-path accessor. Tests that exercise H3 helpers without starting a full
+/// listener retain the exact production defaults rather than depending on the
+/// process environment.
 pub fn limits() -> &'static QuicRuntimeLimits {
     LIMITS.get_or_init(QuicRuntimeLimits::default)
 }
