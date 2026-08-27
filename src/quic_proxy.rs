@@ -1166,10 +1166,7 @@ async fn run_raw_flow(
     drop(connect_permit);
 
     if let Some(header) = LongHeader::parse(&first_response) {
-        flows
-            .lock()
-            .await
-            .observe_upstream_header(flow_id, &header);
+        flows.lock().await.observe_upstream_header(flow_id, &header);
     }
     // The client may have rebound while DNS/Happy Eyeballs was in progress.
     // Read the watch channel only after upstream setup so the first response is
