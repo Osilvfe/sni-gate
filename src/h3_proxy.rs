@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
-use http::{Request, Response, StatusCode};
+use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Instant};
@@ -113,6 +113,7 @@ struct PooledUpstreamContext {
 
 #[derive(Clone)]
 enum UpstreamProvider {
+    #[cfg(test)]
     Fixed(UpstreamH3),
     Pooled(PooledUpstreamContext),
 }
@@ -125,6 +126,7 @@ struct UpstreamLease {
 impl UpstreamProvider {
     async fn acquire(&self) -> Result<UpstreamLease> {
         match self {
+            #[cfg(test)]
             Self::Fixed(upstream) => Ok(UpstreamLease {
                 upstream: upstream.clone(),
                 pool_key: None,
