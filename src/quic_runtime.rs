@@ -24,7 +24,7 @@ const ENV_MAX_H3_CONNECTIONS: &str = "SNI_GATE_QUIC_MAX_H3_CONNECTIONS";
 const ENV_MAX_REQUESTS_PER_CONNECTION: &str = "SNI_GATE_QUIC_MAX_REQUESTS_PER_CONNECTION";
 const ENV_MAX_FIELD_SECTION_SIZE: &str = "SNI_GATE_QUIC_MAX_FIELD_SECTION_SIZE";
 const ENV_MAX_UPSTREAM_POOL_ENTRIES: &str = "SNI_GATE_QUIC_MAX_UPSTREAM_POOL_ENTRIES";
-const ENV_UPSTREAM_POOL_IDLE: &str = "SNI_GATE_QUIC_UPSTREAM_POOL_IDLE";
+const ENV_UPSTREAM_POOL_IDLE_SECS: &str = "SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS";
 const ENV_MAX_PENDING_UPSTREAM_CONNECTS: &str = "SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub fn limits() -> &'static QuicRuntimeLimits {
 impl QuicRuntimeLimits {
     fn from_env() -> Result<Self> {
         let defaults = Self::default();
-        let limits = Self {
+        Ok(Self {
             max_pending_handshakes: parse_positive_usize(
                 ENV_MAX_PENDING_HANDSHAKES,
                 defaults.max_pending_handshakes,
@@ -98,16 +98,15 @@ impl QuicRuntimeLimits {
                 ENV_MAX_UPSTREAM_POOL_ENTRIES,
                 defaults.max_upstream_pool_entries,
             )?,
-            upstream_pool_idle: parse_positive_duration(
-                ENV_UPSTREAM_POOL_IDLE,
-                defaults.upstream_pool_idle,
-            )?,
+            upstream_pool_idle: Duration::from_secs(parse_positive_u64(
+                ENV_UPSTREAM_POOL_IDLE_SECS,
+                defaults.upstream_pool_idle.as_secs(),
+            )?),
             max_pending_upstream_connects: parse_positive_usize(
                 ENV_MAX_PENDING_UPSTREAM_CONNECTS,
                 defaults.max_pending_upstream_connects,
             )?,
-        };
-        Ok(limits)
+        })
     }
 }
 
@@ -142,18 +141,6 @@ fn parse_positive_u64(name: &str, default: u64) -> Result<u64> {
         .parse::<u64>()
         .with_context(|| format!("{name} must be a positive integer"))?;
     if value == 0 {
-        return Err(anyhow!("{name} must be greater than zero"));
-    }
-    Ok(value)
-}
-
-fn parse_positive_duration(name: &str, default: Duration) -> Result<Duration> {
-    let Some(raw) = env_value(name)? else {
-        return Ok(default);
-    };
-    let value = humantime::parse_duration(raw.trim())
-        .with_context(|| format!("{name} must be a duration such as 30s or 2m"))?;
-    if value.is_zero() {
         return Err(anyhow!("{name} must be greater than zero"));
     }
     Ok(value)
