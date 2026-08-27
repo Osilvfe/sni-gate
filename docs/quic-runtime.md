@@ -52,6 +52,8 @@ The pool is split into 16 independently locked shards. Misses for the same logic
 
 Outbound Quinn endpoints are reused by listener, route, and address family. A route therefore normally owns one IPv4 and/or one IPv6 UDP client socket rather than one socket per upstream connection. Plain-H3 routes also reuse one Quinn/rustls client configuration per listener and route, preserving TLS session tickets across reconnects. ECH routes reuse the `EchProvider`'s cached `Arc<ClientConfig>` for the same inner name and ALPN.
 
+Both plain H3 and H3-ECH client configurations set the local Quinn transport idle timeout to `SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS`. This prevents Quinn's shorter 30-second default from locally closing an otherwise reusable pooled connection before the pool's own idle policy expires. QUIC still uses the minimum timeout advertised by both endpoints, so an upstream may close the connection earlier; the H3 driver marks that pool generation closed and a failed stale send is generation-safely evicted. Keepalive remains disabled rather than creating background traffic merely to extend idle pool residency.
+
 On a pool miss, DNS keeps all A/AAAA answers and H3 races complete QUIC
 handshakes with an IPv6-first, 250 ms Happy Eyeballs stagger. The retained pool
 entry records the address that actually won. Raw QUIC performs the equivalent
