@@ -23,11 +23,9 @@ fn raw_flow_limit_is_process_wide_and_releases() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     runtime.block_on(async {
-        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
-            SNI_ONE.to_string(),
-            SNI_TWO.to_string(),
-        ])
-        .expect("test certificate");
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![SNI_ONE.to_string(), SNI_TWO.to_string()])
+                .expect("test certificate");
         let cert_der = cert.der().clone();
         let key = PrivatePkcs8KeyDer::from(signing_key.serialize_der());
         let server_config =
