@@ -798,6 +798,23 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     }
 }
 
+fn h3_transport_idle_timeout<I>(routes: I) -> Option<Duration>
+where
+    I: IntoIterator<Item = (RouteType, Duration)>,
+{
+    let mut maximum = None;
+    for (route_type, idle) in routes {
+        if !matches!(route_type, RouteType::H3 | RouteType::H3Ech) {
+            continue;
+        }
+        if idle.is_zero() {
+            return None;
+        }
+        maximum = Some(maximum.map_or(idle, |current: Duration| current.max(idle)));
+    }
+    maximum
+}
+
 fn start_h3_endpoint(
     listener: Arc<UdpSocket>,
     state: Arc<ListenerState>,
@@ -813,7 +830,23 @@ fn start_h3_endpoint(
     let server_crypto = state.server_configs.h3.as_ref().clone();
     let quic_crypto = QuicServerConfig::try_from(server_crypto)
         .context("converting H3 rustls config to Quinn server crypto")?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let mut transport_config = quinn::TransportConfig::default();
+    let transport_idle = h3_transport_idle_timeout(
+        state
+            .routes
+            .iter()
+            .map(|route| (route.route_type, route.idle_timeout)),
+    );
+    if let Some(idle) = transport_idle {
+        transport_config.max_idle_timeout(Some(
+            idle.try_into()
+                .context("converting H3 listener idle timeout to QUIC transport units")?,
+        ));
+    } else {
+        transport_config.max_idle_timeout(None);
+    }
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(Arc::new(transport_config));
     let endpoint_config = quic_socket::h3_endpoint_config()
         .context("configuring shared Quinn endpoint receive limit")?;
     let max_datagram_size = endpoint_config.get_max_udp_payload_size() as usize;
@@ -1151,6 +1184,29 @@ mod tests {
         assert!(is_quic_initial(&v2_initial));
         assert!(!is_quic_initial(&v1_handshake));
         assert!(!is_quic_initial(&short_header));
+    }
+
+    #[test]
+    fn h3_transport_idle_uses_longest_terminating_route() {
+        assert_eq!(
+            h3_transport_idle_timeout([
+                (RouteType::Raw, Duration::from_secs(120)),
+                (RouteType::H3, Duration::from_secs(10)),
+                (RouteType::H3Ech, Duration::from_secs(45)),
+            ]),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn zero_h3_idle_disables_listener_transport_timeout() {
+        assert_eq!(
+            h3_transport_idle_timeout([
+                (RouteType::H3, Duration::from_secs(60)),
+                (RouteType::H3Ech, Duration::ZERO),
+            ]),
+            None
+        );
     }
 
     #[test]
