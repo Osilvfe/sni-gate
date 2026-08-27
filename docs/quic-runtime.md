@@ -36,6 +36,12 @@ These are capacity controls rather than performance targets. Raising them increa
 
 The inbound handshake semaphore and both byte budgets are shared by every listener. H3 and raw queues still retain their packet-count bounds as a second limit. Each queued allocation owns its byte permit, so consuming or dropping a datagram, closing a queue, or tearing down a raw flow returns capacity automatically.
 
+## H3 connection idle lifetime
+
+Inbound H3 keeps the route-level `idle_timeout` as the authoritative local application-idle policy. One Quinn server transport is shared by every terminating H3 route on a QUIC listener, so its transport idle timeout is set to the longest non-zero `idle_timeout` among those H3/H3-ECH routes. This prevents Quinn's shorter library default from closing a connection before the selected route's configured policy permits it.
+
+If any terminating H3 route on that listener sets `idle_timeout = 0`, the listener's local Quinn transport idle timeout is disabled. The existing per-route H3 activity guard still enforces finite timeouts for the other routes, so sharing one listener does not lengthen their application-idle lifetime. A peer can still advertise its own smaller QUIC idle timeout; QUIC uses the minimum of the two endpoints' transport values, which is outside the gateway's local policy control.
+
 ## Upstream HTTP/3 pooling
 
 Terminating H3 requests acquire upstream connections lazily. Healthy connections are pooled by listener, route, logical dial host/port, upstream TLS server name, and ECH mode. A pool hit happens before DNS resolution, so normal reuse avoids both DNS and a fresh QUIC/TLS/H3 handshake.
