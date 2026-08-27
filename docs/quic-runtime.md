@@ -82,7 +82,7 @@ The fast path is **disabled whenever any `raw` route is present**. Mixed raw + H
 
 A routed raw QUIC flow must acquire a process-wide active-flow permit before it is promoted to forwarding state. That permit is retained for the complete raw flow lifetime, so multiple listeners cannot multiply the previous per-listener `MAX_FLOWS` bound into an unbounded process-wide set of forwarding sockets/tasks.
 
-Upstream setup has a separate process-wide limit. A new raw flow acquires a pending-connect permit before it starts DNS resolution, UDP socket creation, and first-response Happy-Eyeballs racing. Admission is fail-fast rather than queued: raw forwarding has no application-layer response with which to report overload, and retaining thousands of setup waiters would defeat the purpose of the limit. The pending-connect permit is released immediately after one upstream path wins; the active-flow permit remains until forwarding ends.
+Upstream setup has a separate process-wide limit. A new raw flow acquires a pending-connect permit before it starts DNS resolution, UDP socket creation, and first-response Happy Eyeballs racing. Admission is fail-fast rather than queued: raw forwarding has no application-layer response with which to report overload, and retaining thousands of setup waiters would defeat the purpose of the limit. The pending-connect permit is released immediately after one upstream path wins; the active-flow permit remains until forwarding ends.
 
 The raw limits are deliberately separate from H3's upstream-connect limiter. A raw Initial flood therefore cannot consume the terminating-H3 upstream establishment budget, and an H3 outage cannot prevent unrelated raw flows from reaching their own admission ceiling.
 
