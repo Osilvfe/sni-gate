@@ -88,6 +88,20 @@ The raw limits are deliberately separate from H3's upstream-connect limiter. A r
 
 Client peer migration remains live while upstream setup is in progress. The first upstream response reads the current peer from the same watch channel used by later responses, so a NAT rebinding observed during DNS/Happy-Eyeballs setup does not send the winning response to a stale source address.
 
+## Raw QUIC CID visibility and migration boundary
+
+Raw QUIC is a transparent encrypted datagram forwarder; it is not a QUIC endpoint and does not possess the connection's 1-RTT keys. The flow table can therefore learn only connection IDs that are visible in QUIC headers. It records the client's Initial DCID for long-header ownership and learns server SCIDs observed in upstream long-header packets so later client packets using those already-observed server CIDs can be associated with the same raw flow.
+
+This supports source-address or source-port migration when the first packet from the new peer still carries a server CID that the proxy has already learned. Once that packet resolves to the existing flow, the stored peer and the response watch channel move to the new address, so subsequent upstream datagrams are returned to the migrated client.
+
+The boundary is CID rotation performed through encrypted 1-RTT frames. Additional server connection IDs are carried by QUIC `NEW_CONNECTION_ID` frames, whose contents are encrypted from a transparent raw proxy. If a client changes path and simultaneously starts using a CID that was supplied only through such an encrypted frame, sni-gate has no authenticated, observable token that links the new UDP peer to the existing raw flow. Arbitrary CID rotation across an otherwise unknown new peer is therefore **not guaranteed to survive transparent raw forwarding**.
+
+Raw-only listeners retain a conservative peer fallback for unknown short-header packets only when the packet's current source `SocketAddr` already has one unambiguous raw-flow owner. That fallback helps packets whose CID length/value is not otherwise recognizable without letting one peer claim another peer's flow. It does not make an unknown new source port plus an unseen CID safe to infer.
+
+Mixed raw + H3 listeners are stricter: peer fallback is disabled because one client UDP socket can multiplex multiple QUIC connections, including terminating H3 connections that are not represented as raw forwarding entries. Sending an unknown short-header packet to a raw flow based only on its UDP peer could therefore steal H3 traffic or another connection's traffic. Mixed listeners intentionally fail closed when CID ownership cannot be established.
+
+These constraints are deliberate safety properties, not retry policy. Do not relax them by guessing ownership from source IP, by assuming a listener has only one relevant connection, or by enabling peer-only fallback on mixed raw + H3 listeners. A deployment that requires full QUIC CID lifecycle visibility needs a component that participates in the QUIC connection (or another routing mechanism with an authenticated CID ownership signal), rather than a purely transparent SNI-inspecting forwarder.
+
 ## Raw QUIC flow-table fast path
 
 Inspection flow count and retained bytes are maintained incrementally. Inspection expiry uses a bounded, generation-checked deadline heap, so ordinary forwarding packets do not scan every live flow to update admission state or find stale Initials. Stale heap entries are compacted under churn to keep the expiry index itself bounded.
