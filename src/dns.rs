@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::TokioResolver;
@@ -85,7 +85,7 @@ impl ResolverSpec {
     /// Build a shared Tokio resolver honoring `family` for A/AAAA strategy.
     pub fn build(&self, family: AddressFamily) -> Result<Arc<TokioResolver>> {
         let config = match self {
-            ResolverSpec::System => system_resolver_config()?,
+            ResolverSpec::System => system_resolver_config()?.0,
             ResolverSpec::Doh {
                 ip,
                 server_name,
@@ -261,15 +261,18 @@ pub fn strategy_for(family: AddressFamily) -> LookupIpStrategy {
     }
 }
 
-/// Build the system resolver config.
+/// Build the resolver config used by the legacy `system` setting.
 ///
-/// hickory's `read_system_conf` is feature/platform-gated and not always
-/// available; to keep `system` dependable everywhere we resolve through a
-/// well-known public resolver (Cloudflare) over UDP+TCP. Deployments that need
-/// the exact OS resolver can point `resolver` at a specific server instead.
-pub fn system_resolver_config() -> Result<ResolverConfig> {
+/// Keep the pre-Happy-Eyeballs behavior here: the QUIC connection-racing work
+/// should not also redefine where DNS queries are sent. The second tuple item
+/// preserves the current caller API without enabling Hickory's `system-config`
+/// feature or reading OS resolver state.
+pub fn system_resolver_config() -> Result<(ResolverConfig, ResolverOpts)> {
     let ns = NameServerConfig::udp_and_tcp(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-    Ok(ResolverConfig::from_parts(None, vec![], vec![ns]))
+    Ok((
+        ResolverConfig::from_parts(None, vec![], vec![ns]),
+        ResolverOpts::default(),
+    ))
 }
 
 /// Split `host[:port]/path` into (host, Some(port)?, path). Path is "" if none.
