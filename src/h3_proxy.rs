@@ -228,9 +228,7 @@ async fn proxy_inbound_h3_inner(
         .await
         .context("starting inbound HTTP/3 connection")?;
     let activity = Arc::new(Notify::new());
-    let request_limit = Arc::new(Semaphore::new(
-        MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION,
-    ));
+    let request_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION));
     let idle_timeout = context.idle_timeout;
 
     let serve = async {
