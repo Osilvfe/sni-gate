@@ -97,6 +97,17 @@ fn plain_h3_client_configs() -> Arc<Mutex<HashMap<OutboundRouteKey, quinn::Clien
         .clone()
 }
 
+fn upstream_h3_transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quic_runtime::limits()
+            .upstream_pool_idle
+            .try_into()
+            .context("converting upstream H3 pool idle timeout to QUIC transport units")?,
+    ));
+    Ok(Arc::new(transport))
+}
+
 #[derive(Clone)]
 struct H3ProxyContext {
     router: Arc<Router>,
@@ -927,7 +938,8 @@ async fn plain_h3_client_config(
     }
     let crypto = QuicClientConfig::try_from(tls)
         .context("converting shared H3 rustls client config to Quinn")?;
-    let config = quinn::ClientConfig::new(Arc::new(crypto));
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(upstream_h3_transport_config()?);
     configs.insert(key, config.clone());
     Ok(config)
 }
@@ -960,6 +972,7 @@ async fn connect_ech_quinn(
         .as_ref()
         .ok_or_else(|| anyhow!("h3-ech route {} missing ECH provider", route.name))?;
     let alpn = [b"h3".to_vec()];
+    let transport = upstream_h3_transport_config()?;
     let mut attempt = 0u32;
     loop {
         let client = ech
@@ -968,9 +981,11 @@ async fn connect_ech_quinn(
             .context("assembling H3 ECH client config")?;
         let crypto = QuicClientConfig::try_from(client.client_config)
             .context("converting H3 ECH rustls config to Quinn")?;
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(transport.clone());
         match connect_quinn(
             endpoint,
-            quinn::ClientConfig::new(Arc::new(crypto)),
+            config,
             addr,
             inner,
             route.connect_timeout,
