@@ -36,6 +36,12 @@ mod tests;
 /// QUIC forwarding has its own independent flow quotas.
 const MAX_ACTIVE_H3_CONNECTIONS: usize = 1024;
 
+/// Bound semantic request work independently of QUIC's transport stream
+/// accounting. Once this many requests are active on one inbound connection we
+/// stop accepting more until an existing request finishes, which applies
+/// backpressure instead of creating an unbounded number of Tokio tasks.
+const MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION: usize = 256;
+
 /// Bound the peer-advertised HTTP/3 field section size in both directions.
 /// 64 KiB is intentionally generous for ordinary browser/API traffic while
 /// preventing an unbounded header/QPACK memory commitment per connection.
@@ -222,6 +228,9 @@ async fn proxy_inbound_h3_inner(
         .await
         .context("starting inbound HTTP/3 connection")?;
     let activity = Arc::new(Notify::new());
+    let request_limit = Arc::new(Semaphore::new(
+        MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION,
+    ));
     let idle_timeout = context.idle_timeout;
 
     let serve = async {
@@ -241,10 +250,16 @@ async fn proxy_inbound_h3_inner(
                     return Err(error).context("accepting HTTP/3 request");
                 }
             };
+            let request_permit = request_limit
+                .clone()
+                .acquire_owned()
+                .await
+                .context("H3 request limiter closed")?;
             let context = context.clone();
             let activity = activity.clone();
             let upstream = upstream.clone();
             tokio::spawn(async move {
+                let _request_permit = request_permit;
                 let result = async {
                     let (request, stream) = resolver
                         .resolve_request()
