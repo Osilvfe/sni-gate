@@ -7,14 +7,14 @@
 
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -26,6 +26,26 @@ use crate::router::Router;
 #[cfg(test)]
 #[path = "h3_proxy/tests.rs"]
 mod tests;
+
+/// A terminating H3 connection owns an inbound QUIC connection, an upstream
+/// QUIC connection, H3/QPACK state, and potentially many request-stream tasks.
+/// Keep a process-wide hard ceiling even before these knobs become configurable
+/// so a burst of successfully authenticated handshakes cannot grow state without
+/// bound. Raw QUIC forwarding has its own independent flow quotas.
+const MAX_ACTIVE_H3_CONNECTIONS: usize = 1024;
+
+/// Bound the peer-advertised HTTP/3 field section size in both directions.
+/// 64 KiB is intentionally generous for ordinary browser/API traffic while
+/// preventing an unbounded header/QPACK memory commitment per connection.
+const MAX_H3_FIELD_SECTION_SIZE: u64 = 64 * 1024;
+
+static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn h3_connection_limit() -> Arc<Semaphore> {
+    H3_CONNECTION_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_H3_CONNECTIONS)))
+        .clone()
+}
 
 #[derive(Clone)]
 struct H3ProxyContext {
@@ -45,6 +65,19 @@ pub async fn serve_inbound(
     handshake_route: usize,
     handshake_sni: String,
 ) -> Result<()> {
+    let _connection_permit = match h3_connection_limit().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            debug!(
+                %peer,
+                max_connections = MAX_ACTIVE_H3_CONNECTIONS,
+                "rejecting H3 connection because the active connection limit is reached"
+            );
+            connection.close(0u32.into(), b"H3 connection capacity exhausted");
+            return Ok(());
+        }
+    };
+
     let route = state
         .routes
         .get(handshake_route)
@@ -75,7 +108,10 @@ async fn proxy_inbound_h3_inner(
     upstream: UpstreamH3,
 ) -> Result<()> {
     let quic = h3_quinn::Connection::new(connection);
-    let mut inbound = h3::server::Connection::new(quic)
+    let mut inbound_builder = h3::server::builder();
+    inbound_builder.max_field_section_size(MAX_H3_FIELD_SECTION_SIZE);
+    let mut inbound = inbound_builder
+        .build(quic)
         .await
         .context("starting inbound HTTP/3 connection")?;
     let activity = Arc::new(Notify::new());
@@ -349,7 +385,10 @@ async fn connect_upstream_h3(
     );
 
     let quic = h3_quinn::Connection::new(connection);
-    let (mut driver, sender) = h3::client::new(quic)
+    let mut upstream_builder = h3::client::builder();
+    upstream_builder.max_field_section_size(MAX_H3_FIELD_SECTION_SIZE);
+    let (mut driver, sender) = upstream_builder
+        .build(quic)
         .await
         .context("starting upstream HTTP/3 client")?;
     let route_name = route.name.clone();
