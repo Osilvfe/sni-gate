@@ -121,6 +121,7 @@ enum UpstreamProvider {
 struct UpstreamLease {
     upstream: UpstreamH3,
     pool_key: Option<UpstreamPoolKey>,
+    pool_generation: Option<Arc<AtomicBool>>,
 }
 
 impl UpstreamProvider {
@@ -130,9 +131,10 @@ impl UpstreamProvider {
             Self::Fixed(upstream) => Ok(UpstreamLease {
                 upstream: upstream.clone(),
                 pool_key: None,
+                pool_generation: None,
             }),
             Self::Pooled(context) => {
-                let (pool_key, upstream) = pooled_upstream_h3(
+                let (pool_key, upstream, pool_generation) = pooled_upstream_h3(
                     context.listener,
                     context.route_id,
                     &context.route,
@@ -144,6 +146,7 @@ impl UpstreamProvider {
                 Ok(UpstreamLease {
                     upstream,
                     pool_key: Some(pool_key),
+                    pool_generation: Some(pool_generation),
                 })
             }
         }
@@ -152,8 +155,22 @@ impl UpstreamProvider {
 
 impl UpstreamLease {
     async fn invalidate(self) {
-        if let Some(key) = self.pool_key {
-            upstream_h3_pool().lock().await.remove(&key);
+        let (Some(key), Some(generation)) = (self.pool_key, self.pool_generation) else {
+            return;
+        };
+
+        // Mark this generation unusable immediately, then remove it only if the
+        // pool still points at the same generation. A stale request from an old
+        // connection must never evict a healthy replacement inserted under the
+        // same logical key while that request was in flight.
+        generation.store(true, Ordering::Release);
+        let pool = upstream_h3_pool();
+        let mut entries = pool.lock().await;
+        let same_generation = entries
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.closed, &generation));
+        if same_generation {
+            entries.remove(&key);
         }
     }
 }
@@ -463,7 +480,7 @@ async fn pooled_upstream_h3(
     handshake_sni: &str,
     peer: SocketAddr,
     cert_resolver: &Arc<DynamicResolver>,
-) -> Result<(UpstreamPoolKey, UpstreamH3)> {
+) -> Result<(UpstreamPoolKey, UpstreamH3, Arc<AtomicBool>)> {
     let limits = quic_runtime::limits();
     let identity = upstream_identity(route, handshake_sni)?;
     let key = UpstreamPoolKey {
@@ -493,7 +510,7 @@ async fn pooled_upstream_h3(
                 sni = %identity.server_name,
                 "reusing pooled upstream H3 connection"
             );
-            return Ok((key, entry.upstream.clone()));
+            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
         }
     }
 
@@ -525,7 +542,7 @@ async fn pooled_upstream_h3(
                 sni = %identity.server_name,
                 "reusing upstream H3 connection after connect-capacity wait"
             );
-            return Ok((key, entry.upstream.clone()));
+            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
         }
     }
 
@@ -540,7 +557,7 @@ async fn pooled_upstream_h3(
     if let Some(entry) = entries.get_mut(&key) {
         if !entry.closed.load(Ordering::Acquire) {
             entry.last_used = Instant::now();
-            return Ok((key, entry.upstream.clone()));
+            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
         }
         entries.remove(&key);
     }
@@ -555,6 +572,7 @@ async fn pooled_upstream_h3(
         }
     }
     let upstream = created.upstream.clone();
+    let generation = created.closed.clone();
     entries.insert(
         key.clone(),
         UpstreamPoolEntry {
@@ -564,7 +582,7 @@ async fn pooled_upstream_h3(
             last_used: Instant::now(),
         },
     );
-    Ok((key, upstream))
+    Ok((key, upstream, generation))
 }
 
 fn upstream_identity(route: &RouteRuntime, handshake_sni: &str) -> Result<UpstreamIdentity> {
