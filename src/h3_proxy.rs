@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
+use super::quic_runtime;
 use crate::config::{RouteType, SniPolicy};
 use crate::proxy::{upstream_certs, ListenerState, RouteRuntime};
 use crate::resolver::DynamicResolver;
@@ -29,36 +30,6 @@ use crate::router::Router;
 #[path = "h3_proxy/tests.rs"]
 mod tests;
 
-/// A terminating H3 connection owns an inbound QUIC connection, H3/QPACK
-/// state, and potentially many request-stream tasks. Keep a process-wide hard
-/// ceiling even before these knobs become configurable so a burst of
-/// successfully authenticated handshakes cannot grow state without bound. Raw
-/// QUIC forwarding has its own independent flow quotas.
-const MAX_ACTIVE_H3_CONNECTIONS: usize = 1024;
-
-/// Bound semantic request work independently of QUIC's transport stream
-/// accounting. Once this many requests are active on one inbound connection we
-/// stop accepting more until an existing request finishes, which applies
-/// backpressure instead of creating an unbounded number of Tokio tasks.
-const MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION: usize = 256;
-
-/// Bound the peer-advertised HTTP/3 field section size in both directions.
-/// 64 KiB is intentionally generous for ordinary browser/API traffic while
-/// preventing an unbounded header/QPACK memory commitment per connection.
-const MAX_H3_FIELD_SECTION_SIZE: u64 = 64 * 1024;
-
-/// Pooling avoids paying a fresh UDP socket + QUIC/TLS/H3 handshake for every
-/// inbound H3 connection. Keys use logical upstream identity rather than the
-/// resolved address, so healthy pool hits do not perform DNS. DNS is refreshed
-/// naturally when a connection is evicted or ages out and must be rebuilt.
-const MAX_UPSTREAM_H3_POOL_ENTRIES: usize = 256;
-const UPSTREAM_H3_POOL_IDLE: Duration = Duration::from_secs(60);
-
-/// Cold starts and upstream outages can create many simultaneous pool misses.
-/// Bound the expensive DNS + UDP bind + QUIC/TLS/ECH/H3 establishment path so
-/// one burst cannot fan out into an unbounded handshake storm.
-const MAX_PENDING_UPSTREAM_H3_CONNECTS: usize = 64;
-
 static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static UPSTREAM_H3_CONNECT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>> =
@@ -66,13 +37,21 @@ static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoo
 
 fn h3_connection_limit() -> Arc<Semaphore> {
     H3_CONNECTION_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_H3_CONNECTIONS)))
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                quic_runtime::limits().max_h3_connections,
+            ))
+        })
         .clone()
 }
 
 fn upstream_h3_connect_limit() -> Arc<Semaphore> {
     UPSTREAM_H3_CONNECT_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(MAX_PENDING_UPSTREAM_H3_CONNECTS)))
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                quic_runtime::limits().max_pending_upstream_connects,
+            ))
+        })
         .clone()
 }
 
@@ -190,12 +169,13 @@ pub async fn serve_inbound(
     handshake_route: usize,
     handshake_sni: String,
 ) -> Result<()> {
+    let limits = quic_runtime::limits();
     let _connection_permit = match h3_connection_limit().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             debug!(
                 %peer,
-                max_connections = MAX_ACTIVE_H3_CONNECTIONS,
+                max_connections = limits.max_h3_connections,
                 "rejecting H3 connection because the active connection limit is reached"
             );
             connection.close(0u32.into(), b"H3 connection capacity exhausted");
@@ -239,15 +219,16 @@ async fn proxy_inbound_h3_inner(
     context: H3ProxyContext,
     upstream: UpstreamProvider,
 ) -> Result<()> {
+    let limits = quic_runtime::limits();
     let quic = h3_quinn::Connection::new(connection);
     let mut inbound_builder = h3::server::builder();
-    inbound_builder.max_field_section_size(MAX_H3_FIELD_SECTION_SIZE);
+    inbound_builder.max_field_section_size(limits.max_field_section_size);
     let mut inbound = inbound_builder
         .build(quic)
         .await
         .context("starting inbound HTTP/3 connection")?;
     let activity = Arc::new(Notify::new());
-    let request_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_H3_REQUESTS_PER_CONNECTION));
+    let request_limit = Arc::new(Semaphore::new(limits.max_requests_per_connection));
     let idle_timeout = context.idle_timeout;
 
     let serve = async {
@@ -487,6 +468,7 @@ async fn pooled_upstream_h3(
     peer: SocketAddr,
     cert_resolver: &Arc<DynamicResolver>,
 ) -> Result<(UpstreamPoolKey, UpstreamH3)> {
+    let limits = quic_runtime::limits();
     let identity = upstream_identity(route, handshake_sni)?;
     let key = UpstreamPoolKey {
         listener,
@@ -503,7 +485,7 @@ async fn pooled_upstream_h3(
         let mut entries = pool.lock().await;
         entries.retain(|_, entry| {
             !entry.closed.load(Ordering::Acquire)
-                && now.duration_since(entry.last_used) < UPSTREAM_H3_POOL_IDLE
+                && now.duration_since(entry.last_used) < limits.upstream_pool_idle
         });
         if let Some(entry) = entries.get_mut(&key) {
             entry.last_used = now;
@@ -535,7 +517,7 @@ async fn pooled_upstream_h3(
         let mut entries = pool.lock().await;
         entries.retain(|_, entry| {
             !entry.closed.load(Ordering::Acquire)
-                && now.duration_since(entry.last_used) < UPSTREAM_H3_POOL_IDLE
+                && now.duration_since(entry.last_used) < limits.upstream_pool_idle
         });
         if let Some(entry) = entries.get_mut(&key) {
             entry.last_used = now;
@@ -567,7 +549,7 @@ async fn pooled_upstream_h3(
         entries.remove(&key);
     }
 
-    if entries.len() >= MAX_UPSTREAM_H3_POOL_ENTRIES {
+    if entries.len() >= limits.max_upstream_pool_entries {
         if let Some(oldest) = entries
             .iter()
             .min_by_key(|(_, entry)| entry.last_used)
@@ -713,7 +695,7 @@ async fn connect_upstream_h3_target(
 
     let quic = h3_quinn::Connection::new(connection);
     let mut upstream_builder = h3::client::builder();
-    upstream_builder.max_field_section_size(MAX_H3_FIELD_SECTION_SIZE);
+    upstream_builder.max_field_section_size(quic_runtime::limits().max_field_section_size);
     let (mut driver, sender) = upstream_builder
         .build(quic)
         .await
