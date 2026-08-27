@@ -49,8 +49,9 @@ const MAX_UPSTREAM_H3_POOL_ENTRIES: usize = 256;
 const UPSTREAM_H3_POOL_IDLE: Duration = Duration::from_secs(60);
 
 static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>> =
-    OnceLock::new();
+static UPSTREAM_H3_POOL: OnceLock<
+    Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>,
+> = OnceLock::new();
 
 fn h3_connection_limit() -> Arc<Semaphore> {
     H3_CONNECTION_LIMIT
@@ -255,13 +256,13 @@ async fn proxy_inbound_h3_inner(
                     let authority = request
                         .uri()
                         .authority()
-                        .map(|authority| authority.host())
-                        .unwrap_or(context.handshake_sni.as_str());
-                    let request_route = context.router.match_host(authority);
+                        .map(|authority| authority.host().to_string())
+                        .unwrap_or_else(|| context.handshake_sni.clone());
+                    let request_route = context.router.match_host(&authority);
                     if !authority_reuses_upstream(
                         request_route,
                         context.handshake_route,
-                        authority,
+                        &authority,
                         &context.handshake_sni,
                         context.reflects_dial_host,
                         context.reflects_server_name,
@@ -404,10 +405,11 @@ fn authority_reuses_upstream(
 }
 
 fn upstream_failure_status(error: &anyhow::Error) -> StatusCode {
-    if error
-        .chain()
-        .any(|source| source.downcast_ref::<tokio::time::error::Elapsed>().is_some())
-    {
+    if error.chain().any(|source| {
+        source
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    }) {
         StatusCode::GATEWAY_TIMEOUT
     } else {
         StatusCode::BAD_GATEWAY
@@ -476,7 +478,8 @@ async fn pooled_upstream_h3(
         }
     }
 
-    let created = connect_upstream_h3_target(route, handshake_sni, peer, cert_resolver, &target).await?;
+    let created =
+        connect_upstream_h3_target(route, handshake_sni, peer, cert_resolver, &target).await?;
 
     let mut entries = pool.lock().await;
     // Another task may have connected the same key while we were handshaking.
