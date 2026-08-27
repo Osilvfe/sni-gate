@@ -334,7 +334,13 @@ async fn proxy_inbound_h3_inner(
                             return empty_response(stream, status).await;
                         }
                     };
-                    let mut sender = lease.upstream.sender.clone();
+                    // Keep an endpoint-owning handle alive for the complete
+                    // request/response stream lifetime. The reusable pool entry
+                    // may be evicted for idleness/capacity while this request is
+                    // still transferring; eviction must not tear down an active
+                    // QUIC connection underneath its H3 RequestStream.
+                    let upstream_guard = lease.upstream.clone();
+                    let mut sender = upstream_guard.sender.clone();
                     let upstream_stream = match sender.send_request(request).await {
                         Ok(stream) => stream,
                         Err(error) => {
@@ -355,7 +361,9 @@ async fn proxy_inbound_h3_inner(
                             return empty_response(stream, StatusCode::BAD_GATEWAY).await;
                         }
                     };
-                    proxy_stream(stream, upstream_stream, &activity).await
+                    let result = proxy_stream(stream, upstream_stream, &activity).await;
+                    drop(upstream_guard);
+                    result
                 }
                 .await;
 
