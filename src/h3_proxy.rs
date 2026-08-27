@@ -5,18 +5,20 @@
 //! HTTP/3 request semantics. Request authority is re-routed per stream so H3
 //! connection coalescing can never bypass the listener's route boundaries.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::future::poll_fn;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
@@ -32,8 +34,16 @@ mod tests;
 
 static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static UPSTREAM_H3_CONNECT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>> =
+static UPSTREAM_H3_POOL_ENTRY_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static UPSTREAM_H3_POOL: OnceLock<Arc<UpstreamH3Pool>> = OnceLock::new();
+type UpstreamConnectFlight = Arc<Mutex<()>>;
+type UpstreamConnectFlights = Arc<Mutex<HashMap<UpstreamPoolKey, Weak<Mutex<()>>>>>;
+static UPSTREAM_H3_CONNECT_FLIGHTS: OnceLock<UpstreamConnectFlights> = OnceLock::new();
+static OUTBOUND_H3_ENDPOINTS: OnceLock<Arc<Mutex<HashMap<OutboundEndpointKey, quinn::Endpoint>>>> =
     OnceLock::new();
+static PLAIN_H3_CLIENT_CONFIGS: OnceLock<
+    Arc<Mutex<HashMap<OutboundRouteKey, quinn::ClientConfig>>>,
+> = OnceLock::new();
 
 fn h3_connection_limit() -> Arc<Semaphore> {
     H3_CONNECTION_LIMIT
@@ -51,8 +61,38 @@ fn upstream_h3_connect_limit() -> Arc<Semaphore> {
         .clone()
 }
 
-fn upstream_h3_pool() -> Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>> {
+const UPSTREAM_H3_POOL_SHARDS: usize = 16;
+
+fn upstream_h3_pool_entry_limit() -> Arc<Semaphore> {
+    UPSTREAM_H3_POOL_ENTRY_LIMIT
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                quic_runtime::limits().max_upstream_pool_entries,
+            ))
+        })
+        .clone()
+}
+
+fn upstream_h3_pool() -> Arc<UpstreamH3Pool> {
     UPSTREAM_H3_POOL
+        .get_or_init(|| Arc::new(UpstreamH3Pool::new()))
+        .clone()
+}
+
+fn upstream_h3_connect_flights() -> UpstreamConnectFlights {
+    UPSTREAM_H3_CONNECT_FLIGHTS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+fn outbound_h3_endpoints() -> Arc<Mutex<HashMap<OutboundEndpointKey, quinn::Endpoint>>> {
+    OUTBOUND_H3_ENDPOINTS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+fn plain_h3_client_configs() -> Arc<Mutex<HashMap<OutboundRouteKey, quinn::ClientConfig>>> {
+    PLAIN_H3_CLIENT_CONFIGS
         .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
         .clone()
 }
@@ -78,11 +118,78 @@ struct UpstreamPoolKey {
     ech: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OutboundRouteKey {
+    listener: SocketAddr,
+    route_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OutboundAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl From<IpAddr> for OutboundAddressFamily {
+    fn from(addr: IpAddr) -> Self {
+        match addr {
+            IpAddr::V4(_) => Self::Ipv4,
+            IpAddr::V6(_) => Self::Ipv6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OutboundEndpointKey {
+    route: OutboundRouteKey,
+    family: OutboundAddressFamily,
+}
+
 struct UpstreamPoolEntry {
     upstream: UpstreamH3,
     upstream_addr: SocketAddr,
     closed: Arc<AtomicBool>,
     last_used: Instant,
+    _pool_slot: OwnedSemaphorePermit,
+}
+
+struct UpstreamH3Pool {
+    shards: Box<[Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>]>,
+}
+
+impl UpstreamH3Pool {
+    fn new() -> Self {
+        let shards = (0..UPSTREAM_H3_POOL_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { shards }
+    }
+
+    fn shard_index(&self, key: &UpstreamPoolKey) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % self.shards.len()
+    }
+
+    fn shard(&self, key: &UpstreamPoolKey) -> &Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>> {
+        &self.shards[self.shard_index(key)]
+    }
+
+    async fn evict_one(&self) -> bool {
+        for shard in &self.shards {
+            let mut entries = shard.lock().await;
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest {
+                entries.remove(&key);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 struct UpstreamIdentity {
@@ -165,7 +272,7 @@ impl UpstreamLease {
         // same logical key while that request was in flight.
         generation.store(true, Ordering::Release);
         let pool = upstream_h3_pool();
-        let mut entries = pool.lock().await;
+        let mut entries = pool.shard(&key).lock().await;
         let same_generation = entries
             .get(&key)
             .is_some_and(|entry| Arc::ptr_eq(&entry.closed, &generation));
@@ -328,11 +435,10 @@ async fn proxy_inbound_h3_inner(
                             return empty_response(stream, status).await;
                         }
                     };
-                    // Keep an endpoint-owning handle alive for the complete
-                    // request/response stream lifetime. The reusable pool entry
-                    // may be evicted for idleness/capacity while this request is
-                    // still transferring; eviction must not tear down an active
-                    // QUIC connection underneath its H3 RequestStream.
+                    // Keep a generation handle alive for the complete stream
+                    // lifetime. The shared endpoint registry outlives pool
+                    // eviction, while this sender clone ensures an active
+                    // request never depends on the reusable map entry itself.
                     let upstream_guard = lease.upstream.clone();
                     let mut sender = upstream_guard.sender.clone();
                     let upstream_stream = match sender.send_request(request).await {
@@ -467,10 +573,65 @@ async fn h3_idle_guard(activity: &Notify, idle: Duration) {
 
 #[derive(Clone)]
 struct UpstreamH3 {
-    /// Keep the endpoint alive for at least as long as the H3 sender. Quinn
-    /// closes all of an endpoint's connections when the last handle is dropped.
-    _endpoint: quinn::Endpoint,
     sender: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+}
+
+struct UpstreamPoolHit {
+    upstream: UpstreamH3,
+    upstream_addr: SocketAddr,
+    closed: Arc<AtomicBool>,
+}
+
+async fn lookup_upstream_h3_pool(
+    pool: &UpstreamH3Pool,
+    key: &UpstreamPoolKey,
+    now: Instant,
+) -> Option<UpstreamPoolHit> {
+    let idle = quic_runtime::limits().upstream_pool_idle;
+    let mut entries = pool.shard(key).lock().await;
+    entries.retain(|_, entry| {
+        !entry.closed.load(Ordering::Acquire) && now.duration_since(entry.last_used) < idle
+    });
+    let entry = entries.get_mut(key)?;
+    entry.last_used = now;
+    Some(UpstreamPoolHit {
+        upstream: entry.upstream.clone(),
+        upstream_addr: entry.upstream_addr,
+        closed: entry.closed.clone(),
+    })
+}
+
+async fn upstream_h3_connect_flight(key: &UpstreamPoolKey) -> UpstreamConnectFlight {
+    let flights = upstream_h3_connect_flights();
+    let mut flights = flights.lock().await;
+    if flights.len()
+        > quic_runtime::limits()
+            .max_upstream_pool_entries
+            .saturating_mul(4)
+    {
+        flights.retain(|_, flight| flight.strong_count() > 0);
+    }
+    if let Some(flight) = flights.get(key).and_then(Weak::upgrade) {
+        return flight;
+    }
+    let flight = Arc::new(Mutex::new(()));
+    flights.insert(key.clone(), Arc::downgrade(&flight));
+    flight
+}
+
+async fn reserve_upstream_h3_pool_slot(pool: &UpstreamH3Pool) -> Result<OwnedSemaphorePermit> {
+    let limit = upstream_h3_pool_entry_limit();
+    if let Ok(permit) = limit.clone().try_acquire_owned() {
+        return Ok(permit);
+    }
+    if !pool.evict_one().await {
+        return Err(anyhow!(
+            "upstream H3 pool capacity exhausted without an evictable entry"
+        ));
+    }
+    limit
+        .try_acquire_owned()
+        .context("upstream H3 pool slot was not released after eviction")
 }
 
 async fn pooled_upstream_h3(
@@ -481,7 +642,6 @@ async fn pooled_upstream_h3(
     peer: SocketAddr,
     cert_resolver: &Arc<DynamicResolver>,
 ) -> Result<(UpstreamPoolKey, UpstreamH3, Arc<AtomicBool>)> {
-    let limits = quic_runtime::limits();
     let identity = upstream_identity(route, handshake_sni)?;
     let key = UpstreamPoolKey {
         listener,
@@ -492,26 +652,35 @@ async fn pooled_upstream_h3(
         ech: route.route_type == RouteType::H3Ech,
     };
     let pool = upstream_h3_pool();
-    let now = Instant::now();
+    if let Some(hit) = lookup_upstream_h3_pool(&pool, &key, Instant::now()).await {
+        debug!(
+            %peer,
+            route = %route.name,
+            host = %identity.host,
+            upstream = %hit.upstream_addr,
+            sni = %identity.server_name,
+            "reusing pooled upstream H3 connection"
+        );
+        return Ok((key, hit.upstream, hit.closed));
+    }
 
-    {
-        let mut entries = pool.lock().await;
-        entries.retain(|_, entry| {
-            !entry.closed.load(Ordering::Acquire)
-                && now.duration_since(entry.last_used) < limits.upstream_pool_idle
-        });
-        if let Some(entry) = entries.get_mut(&key) {
-            entry.last_used = now;
-            debug!(
-                %peer,
-                route = %route.name,
-                host = %identity.host,
-                upstream = %entry.upstream_addr,
-                sni = %identity.server_name,
-                "reusing pooled upstream H3 connection"
-            );
-            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
-        }
+    let flight = upstream_h3_connect_flight(&key).await;
+    let _flight_guard = timeout(route.connect_timeout, flight.lock())
+        .await
+        .context("waiting for same-key upstream H3 connection timed out")?;
+
+    // The task that owned this key's flight may have populated the pool while
+    // we waited. Only the flight owner reaches DNS and QUIC establishment.
+    if let Some(hit) = lookup_upstream_h3_pool(&pool, &key, Instant::now()).await {
+        debug!(
+            %peer,
+            route = %route.name,
+            host = %identity.host,
+            upstream = %hit.upstream_addr,
+            sni = %identity.server_name,
+            "reusing upstream H3 connection after same-key wait"
+        );
+        return Ok((key, hit.upstream, hit.closed));
     }
 
     let _connect_permit = timeout(
@@ -522,54 +691,33 @@ async fn pooled_upstream_h3(
     .context("waiting for upstream H3 connect capacity timed out")?
     .context("upstream H3 connect limiter closed")?;
 
-    // A request that arrived while the connect limiter was saturated may find
-    // that another request populated this key while it waited. Re-check before
-    // paying for DNS and another QUIC/TLS/H3 handshake.
-    let now = Instant::now();
-    {
-        let mut entries = pool.lock().await;
-        entries.retain(|_, entry| {
-            !entry.closed.load(Ordering::Acquire)
-                && now.duration_since(entry.last_used) < limits.upstream_pool_idle
-        });
-        if let Some(entry) = entries.get_mut(&key) {
-            entry.last_used = now;
-            debug!(
-                %peer,
-                route = %route.name,
-                host = %identity.host,
-                upstream = %entry.upstream_addr,
-                sni = %identity.server_name,
-                "reusing upstream H3 connection after connect-capacity wait"
-            );
-            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
-        }
-    }
-
+    // Reserve exact process-wide pool capacity before starting an operation
+    // whose successful result must be retained. A failed resolve/handshake
+    // drops this permit automatically; concurrent connects can never create an
+    // unbounded set of completed-but-not-yet-inserted connections.
+    let pool_slot = reserve_upstream_h3_pool_slot(&pool).await?;
     let target = resolve_upstream_target(route, &identity).await?;
-    let created =
-        connect_upstream_h3_target(route, handshake_sni, peer, cert_resolver, &target).await?;
+    let created = connect_upstream_h3_target(
+        listener,
+        route_id,
+        route,
+        handshake_sni,
+        peer,
+        cert_resolver,
+        &target,
+    )
+    .await?;
 
-    let mut entries = pool.lock().await;
-    // Another task may have connected the same logical key while we were
-    // resolving/handshaking. Prefer its healthy connection and let our
-    // duplicate drop naturally.
+    let mut entries = pool.shard(&key).lock().await;
+    // Defensive re-check: per-key singleflight should make a duplicate
+    // impossible, but invalidation and future pool callers must not replace a
+    // healthy generation accidentally.
     if let Some(entry) = entries.get_mut(&key) {
         if !entry.closed.load(Ordering::Acquire) {
             entry.last_used = Instant::now();
             return Ok((key, entry.upstream.clone(), entry.closed.clone()));
         }
         entries.remove(&key);
-    }
-
-    if entries.len() >= limits.max_upstream_pool_entries {
-        if let Some(oldest) = entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            entries.remove(&oldest);
-        }
     }
     let upstream = created.upstream.clone();
     let generation = created.closed.clone();
@@ -580,6 +728,7 @@ async fn pooled_upstream_h3(
             upstream_addr: target.upstream_addr,
             closed: created.closed,
             last_used: Instant::now(),
+            _pool_slot: pool_slot,
         },
     );
     Ok((key, upstream, generation))
@@ -629,31 +778,21 @@ async fn resolve_upstream_target(
 }
 
 async fn connect_upstream_h3_target(
+    listener: SocketAddr,
+    route_id: usize,
     route: &RouteRuntime,
     handshake_sni: &str,
     peer: SocketAddr,
     cert_resolver: &Arc<DynamicResolver>,
     target: &UpstreamTarget,
 ) -> Result<CreatedUpstream> {
-    let bind_addr = match target.upstream_addr.ip() {
-        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    };
-    let endpoint = quinn::Endpoint::client(bind_addr).context("binding H3 client endpoint")?;
+    let route_key = OutboundRouteKey { listener, route_id };
+    let endpoint = outbound_h3_endpoint(route_key, target.upstream_addr.ip()).await?;
     let connection = match route.route_type {
         RouteType::H3 => {
-            let mut tls = rustls::ClientConfig::builder()
-                .with_root_certificates(route.root_store.as_ref().clone())
-                .with_no_client_auth();
-            tls.alpn_protocols = vec![b"h3".to_vec()];
-            if route.sni_policy == SniPolicy::Omit {
-                tls.enable_sni = false;
-            }
-            let crypto = QuicClientConfig::try_from(tls)
-                .context("converting H3 rustls client config to Quinn")?;
             connect_quinn(
                 &endpoint,
-                quinn::ClientConfig::new(Arc::new(crypto)),
+                plain_h3_client_config(route_key, route).await?,
                 target.upstream_addr,
                 &target.server_name,
                 route.connect_timeout,
@@ -732,12 +871,55 @@ async fn connect_upstream_h3_target(
     });
 
     Ok(CreatedUpstream {
-        upstream: UpstreamH3 {
-            _endpoint: endpoint,
-            sender,
-        },
+        upstream: UpstreamH3 { sender },
         closed,
     })
+}
+
+async fn outbound_h3_endpoint(
+    route: OutboundRouteKey,
+    upstream_ip: IpAddr,
+) -> Result<quinn::Endpoint> {
+    let family = OutboundAddressFamily::from(upstream_ip);
+    let key = OutboundEndpointKey { route, family };
+    let endpoints = outbound_h3_endpoints();
+    let mut endpoints = endpoints.lock().await;
+    if let Some(endpoint) = endpoints.get(&key) {
+        return Ok(endpoint.clone());
+    }
+
+    let bind_addr = match family {
+        OutboundAddressFamily::Ipv4 => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        OutboundAddressFamily::Ipv6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let endpoint =
+        quinn::Endpoint::client(bind_addr).context("binding shared H3 client endpoint")?;
+    endpoints.insert(key, endpoint.clone());
+    Ok(endpoint)
+}
+
+async fn plain_h3_client_config(
+    key: OutboundRouteKey,
+    route: &RouteRuntime,
+) -> Result<quinn::ClientConfig> {
+    let configs = plain_h3_client_configs();
+    let mut configs = configs.lock().await;
+    if let Some(config) = configs.get(&key) {
+        return Ok(config.clone());
+    }
+
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(route.root_store.as_ref().clone())
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    if route.sni_policy == SniPolicy::Omit {
+        tls.enable_sni = false;
+    }
+    let crypto = QuicClientConfig::try_from(tls)
+        .context("converting shared H3 rustls client config to Quinn")?;
+    let config = quinn::ClientConfig::new(Arc::new(crypto));
+    configs.insert(key, config.clone());
+    Ok(config)
 }
 
 async fn connect_quinn(

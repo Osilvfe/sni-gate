@@ -12,8 +12,8 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 
 use super::{
-    authority_reuses_upstream, proxy_inbound_h3, upstream_failure_status, Router, UpstreamH3,
-    UpstreamPoolKey,
+    authority_reuses_upstream, outbound_h3_endpoint, proxy_inbound_h3, upstream_failure_status,
+    upstream_h3_connect_flight, OutboundRouteKey, Router, UpstreamH3, UpstreamPoolKey,
 };
 
 const FRONT_SNI: &str = "front.h3.test";
@@ -98,6 +98,59 @@ fn upstream_pool_key_is_scoped_by_route_and_tls_identity() {
 }
 
 #[tokio::test]
+async fn outbound_endpoint_is_reused_per_route_and_address_family() {
+    let route = OutboundRouteKey {
+        listener: "127.0.0.1:54443".parse().unwrap(),
+        route_id: 9001,
+    };
+    let first = outbound_h3_endpoint(route, "127.0.0.1".parse().unwrap())
+        .await
+        .unwrap();
+    let second = outbound_h3_endpoint(route, "127.0.0.2".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first.local_addr().unwrap(), second.local_addr().unwrap());
+
+    let other_route = outbound_h3_endpoint(
+        OutboundRouteKey {
+            route_id: route.route_id + 1,
+            ..route
+        },
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        first.local_addr().unwrap(),
+        other_route.local_addr().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn same_pool_key_shares_one_connect_flight() {
+    let key = UpstreamPoolKey {
+        listener: "127.0.0.1:55443".parse().unwrap(),
+        route_id: 9002,
+        host: "singleflight.example".to_string(),
+        port: 443,
+        server_name: "singleflight.example".to_string(),
+        ech: false,
+    };
+    let first = upstream_h3_connect_flight(&key).await;
+    let second = upstream_h3_connect_flight(&key).await;
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let guard = first.lock().await;
+    assert!(timeout(Duration::from_millis(10), second.lock())
+        .await
+        .is_err());
+    drop(guard);
+    let _released = timeout(Duration::from_secs(1), second.lock())
+        .await
+        .expect("same-key waiter should proceed after flight owner releases");
+}
+
+#[tokio::test]
 async fn upstream_failures_map_to_gateway_statuses() {
     let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
         .await
@@ -161,8 +214,9 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
                 .is_some()
             {}
 
-            // Give the client time to drop the original pool-owned handle. The
-            // request-scoped clone must keep the Quinn endpoint alive here.
+            // Give the client time to drop the original pool-owned sender. The
+            // shared endpoint remains alive independently, and the request-
+            // scoped sender clone must preserve the active stream generation.
             sleep(Duration::from_millis(75)).await;
             let response = Response::builder()
                 .status(StatusCode::NO_CONTENT)
@@ -199,10 +253,7 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
         let _ = poll_fn(|cx| driver.poll_close(cx)).await;
     });
 
-    let pooled_handle = UpstreamH3 {
-        _endpoint: client_endpoint,
-        sender,
-    };
+    let pooled_handle = UpstreamH3 { sender };
     let request_guard = pooled_handle.clone();
     let mut request_sender = request_guard.sender.clone();
     let request = Request::get(format!("https://{UPSTREAM_SNI}/lifetime"))
@@ -332,7 +383,6 @@ async fn semantic_proxy_preserves_h3_message_and_blocks_unsafe_coalescing() {
         let _ = poll_fn(|cx| upstream_driver.poll_close(cx)).await;
     });
     let upstream = UpstreamH3 {
-        _endpoint: upstream_client_endpoint,
         sender: upstream_sender,
     };
 

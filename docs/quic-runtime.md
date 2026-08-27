@@ -40,9 +40,13 @@ The inbound handshake semaphore and both byte budgets are shared by every listen
 
 Terminating H3 requests acquire upstream connections lazily. Healthy connections are pooled by listener, route, logical dial host/port, upstream TLS server name, and ECH mode. A pool hit happens before DNS resolution, so normal reuse avoids both DNS and a fresh QUIC/TLS/H3 handshake.
 
-Closed or idle entries are removed, and cold-start/upstream-outage connection storms are bounded by `SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS`. After waiting for connect capacity, the pool is checked again before DNS/handshake so concurrent misses can reuse a connection another request established while they waited.
+Closed or idle entries are removed, and cold-start/upstream-outage connection storms are bounded by `SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS`. A request rechecks the pool after acquiring its same-key flight, before it consumes global connect capacity or performs DNS and a QUIC/TLS/H3 handshake.
 
-A request that already opened an upstream stream holds an endpoint-owning guard for the complete stream lifetime. Pool eviction therefore affects only future reuse and does not terminate an active response. Failed stale leases are generation-checked before eviction so an old request cannot remove a newer healthy replacement stored under the same logical pool key.
+The pool is split into 16 independently locked shards. Misses for the same logical key share a per-key singleflight lock, so only one task performs DNS and QUIC/TLS/H3 establishment while other keys continue independently. Pool capacity remains an exact process-wide limit; each retained entry or connection being prepared for retention owns one global slot permit, and capacity eviction happens only when all permits are occupied.
+
+Outbound Quinn endpoints are reused by listener, route, and address family. A route therefore normally owns one IPv4 and/or one IPv6 UDP client socket rather than one socket per upstream connection. Plain-H3 routes also reuse one Quinn/rustls client configuration per listener and route, preserving TLS session tickets across reconnects. ECH routes reuse the `EchProvider`'s cached `Arc<ClientConfig>` for the same inner name and ALPN.
+
+A request that already opened an upstream stream holds a generation-specific sender guard for the complete stream lifetime, while the shared endpoint registry remains process-owned. Pool eviction therefore affects only future reuse and does not terminate an active response. Failed stale leases are generation-checked before eviction so an old request cannot remove a newer healthy replacement stored under the same logical pool key.
 
 Upstream acquisition timeout returns HTTP `504`; other acquisition failures return `502`. A `send_request` failure evicts that specific pooled generation and returns `502`. The proxy intentionally does not automatically replay the current request because replay can be unsafe for non-idempotent methods.
 
