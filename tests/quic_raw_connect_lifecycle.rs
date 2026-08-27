@@ -23,11 +23,9 @@ fn raw_connect_slot_releases_after_success_while_flow_stays_active() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     runtime.block_on(async {
-        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
-            SNI_ONE.to_string(),
-            SNI_TWO.to_string(),
-        ])
-        .expect("test certificate");
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![SNI_ONE.to_string(), SNI_TWO.to_string()])
+                .expect("test certificate");
         let cert_der = cert.der().clone();
         let key = PrivatePkcs8KeyDer::from(signing_key.serialize_der());
         let server_config =
@@ -258,26 +256,21 @@ idle_timeout = "5s"
 
 fn quinn_client(cert_der: &CertificateDer<'static>) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(cert_der.clone())
-        .expect("trust test QUIC server");
+    roots.add(cert_der.clone()).expect("trust test QUIC server");
     let mut client = quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
         .expect("bind QUIC client");
     client.set_default_client_config(
-        quinn::ClientConfig::with_root_certificates(Arc::new(roots))
-            .expect("QUIC client config"),
+        quinn::ClientConfig::with_root_certificates(Arc::new(roots)).expect("QUIC client config"),
     );
     client
 }
 
-async fn connect(
-    client: &quinn::Endpoint,
-    addr: SocketAddr,
-    sni: &str,
-) -> quinn::Connection {
+async fn connect(client: &quinn::Endpoint, addr: SocketAddr, sni: &str) -> quinn::Connection {
     tokio::time::timeout(
         Duration::from_secs(10),
-        client.connect(addr, sni).expect("start raw QUIC connection"),
+        client
+            .connect(addr, sni)
+            .expect("start raw QUIC connection"),
     )
     .await
     .expect("raw QUIC handshake timed out")
