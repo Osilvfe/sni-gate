@@ -139,11 +139,10 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
                 .expect("lifetime test QUIC connection")
                 .await
                 .expect("lifetime test QUIC handshake");
-            let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(
-                connection,
-            ))
-            .await
-            .expect("start lifetime test H3 server");
+            let mut h3 =
+                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection))
+                    .await
+                    .expect("start lifetime test H3 server");
             let resolver = h3
                 .accept()
                 .await
@@ -171,7 +170,10 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
                 .send_response(response)
                 .await
                 .expect("send lifetime test response");
-            stream.finish().await.expect("finish lifetime test response");
+            stream
+                .finish()
+                .await
+                .expect("finish lifetime test response");
         }
     });
 
