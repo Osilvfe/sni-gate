@@ -37,11 +37,7 @@ static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoo
 
 fn h3_connection_limit() -> Arc<Semaphore> {
     H3_CONNECTION_LIMIT
-        .get_or_init(|| {
-            Arc::new(Semaphore::new(
-                quic_runtime::limits().max_h3_connections,
-            ))
-        })
+        .get_or_init(|| Arc::new(Semaphore::new(quic_runtime::limits().max_h3_connections)))
         .clone()
 }
 
