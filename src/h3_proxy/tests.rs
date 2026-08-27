@@ -8,6 +8,7 @@ use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response, StatusCode};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 
 use super::{
@@ -130,6 +131,7 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
     )
     .expect("bind upstream lifetime test server");
     let server_addr = server_endpoint.local_addr().unwrap();
+    let (response_observed_tx, response_observed_rx) = oneshot::channel();
     let server_task = tokio::spawn({
         let endpoint = server_endpoint.clone();
         async move {
@@ -174,6 +176,12 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
                 .finish()
                 .await
                 .expect("finish lifetime test response");
+
+            // Keep the H3 connection itself alive until the client has actually
+            // observed the response. Otherwise a graceful H3_NO_ERROR close can
+            // race delivery and turn this endpoint-lifetime test into a server-
+            // shutdown timing test.
+            let _ = response_observed_rx.await;
         }
     });
 
@@ -214,6 +222,7 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
         .expect("active request should survive pool-handle eviction")
         .expect("receive lifetime test response");
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let _ = response_observed_tx.send(());
 
     drop(request_guard);
     server_task.await.expect("lifetime test server task");
