@@ -139,9 +139,11 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
                 .expect("lifetime test QUIC connection")
                 .await
                 .expect("lifetime test QUIC handshake");
-            let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
-                .await
-                .expect("start lifetime test H3 server");
+            let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(
+                connection,
+            ))
+            .await
+            .expect("start lifetime test H3 server");
             let resolver = h3
                 .accept()
                 .await
@@ -161,8 +163,12 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
             // Give the client time to drop the original pool-owned handle. The
             // request-scoped clone must keep the Quinn endpoint alive here.
             sleep(Duration::from_millis(75)).await;
+            let response = Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(())
+                .unwrap();
             stream
-                .send_response(Response::builder().status(StatusCode::NO_CONTENT).body(()).unwrap())
+                .send_response(response)
                 .await
                 .expect("send lifetime test response");
             stream.finish().await.expect("finish lifetime test response");
@@ -172,11 +178,7 @@ async fn upstream_handle_clone_keeps_active_request_alive() {
     let client_endpoint =
         quinn::Endpoint::client(localhost_ephemeral()).expect("bind lifetime test client");
     let connection = client_endpoint
-        .connect_with(
-            h3_client_config(cert_der),
-            server_addr,
-            UPSTREAM_SNI,
-        )
+        .connect_with(h3_client_config(cert_der), server_addr, UPSTREAM_SNI)
         .expect("start lifetime test upstream QUIC connection")
         .await
         .expect("lifetime test upstream QUIC handshake");
