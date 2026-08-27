@@ -129,12 +129,11 @@ idle_timeout = "300ms"
                 SNI_TWO,
             )
             .expect("start capacity-rejected raw connection");
-        match tokio::time::timeout(Duration::from_millis(800), second_attempt).await {
-            Ok(Ok(connection)) => {
-                connection.close(0u32.into(), b"unexpected admission success");
-                panic!("second raw flow established while process-wide limit was occupied");
-            }
-            Ok(Err(_)) | Err(_) => {}
+        if let Ok(Ok(connection)) =
+            tokio::time::timeout(Duration::from_millis(800), second_attempt).await
+        {
+            connection.close(0u32.into(), b"unexpected admission success");
+            panic!("second raw flow established while process-wide limit was occupied");
         }
 
         first.close(0u32.into(), b"release admission slot");
