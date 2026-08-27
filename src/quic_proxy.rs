@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -28,6 +28,7 @@ const MAX_INITIAL_BYTES: usize = 32 * 1024;
 const MAX_FLOWS: usize = 4096;
 const MAX_INSPECTING_FLOWS: usize = 256;
 const MAX_INSPECTION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_H3_HANDSHAKES: usize = 256;
 const MAX_CID_LEN: usize = 20;
 const MAX_CIDS_PER_FLOW: usize = 32;
 const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -703,12 +704,48 @@ fn start_h3_endpoint(
     .context("creating shared Quinn endpoint")?;
 
     let accept_endpoint = endpoint.clone();
+    let handshake_limit = Arc::new(Semaphore::new(MAX_PENDING_H3_HANDSHAKES));
     tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
+            let handshake_permit = match handshake_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let peer = incoming.remote_address();
+                    if !incoming.remote_address_validated() {
+                        match incoming.retry() {
+                            Ok(()) => {
+                                debug!(
+                                    %peer,
+                                    max_pending = MAX_PENDING_H3_HANDSHAKES,
+                                    "sent QUIC Retry because H3 handshake capacity is exhausted"
+                                );
+                            }
+                            Err(error) => {
+                                error.into_incoming().refuse();
+                                debug!(
+                                    %peer,
+                                    max_pending = MAX_PENDING_H3_HANDSHAKES,
+                                    "refused QUIC handshake after Retry became unavailable"
+                                );
+                            }
+                        }
+                    } else {
+                        incoming.refuse();
+                        debug!(
+                            %peer,
+                            max_pending = MAX_PENDING_H3_HANDSHAKES,
+                            "refused validated QUIC handshake because H3 handshake capacity is exhausted"
+                        );
+                    }
+                    continue;
+                }
+            };
             let state = state.clone();
             tokio::spawn(async move {
                 let peer = incoming.remote_address();
-                match incoming.await {
+                let established = incoming.await;
+                drop(handshake_permit);
+                match established {
                     Ok(connection) => {
                         let handshake = connection.handshake_data().and_then(|data| {
                             data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
