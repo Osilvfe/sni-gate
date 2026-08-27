@@ -19,7 +19,7 @@ log = "info"                                   # or SNI_GATE_LOG / RUST_LOG
 
 # Generic DNS resolver used for both ECH HTTPS-record lookups and upstream
 # A/AAAA, unless overridden. Forms:
-#   "system"                          the OS resolver
+#   "system"                          the OS resolver (no hard-coded public DNS)
 #   "https://host[:port]/dns-query"   DoH
 #   "tls://host[:port]"               DoT
 #   "udp://ip[:port]" | "ip[:port]"   plain DNS to an IP
@@ -28,7 +28,7 @@ resolver = "system"                            # e.g. "https://dns.example/dns-q
 # ech_resolver / addr_resolver may override the generic resolver per purpose.
 ech_refresh = "1h"                             # ECH config refresh bound
 # nat64_prefix = "64:ff9b::"                   # /96 prefix, hierarchical
-# address_family = "dual"                      # dual (default) | ipv4 | ipv6
+# address_family = "dual"                      # dual (default, Happy Eyeballs) | ipv4 | ipv6
 # Fail/unmatched policy. Field-less modes take a bare string; passthrough needs
 # a table:  unmatched = "close"  |  "system-outbound"  |
 #           { mode = "passthrough", addr = "127.0.0.1:80" }

@@ -476,6 +476,10 @@ A resolver spec may appear at any scope and takes one of these forms:
 HTTPS-record lookups; `addr_resolver` overrides it for upstream A/AAAA. Each is
 independently overridable per scope.
 
+`system` reads the operating system's resolver configuration and options (for
+example `/etc/resolv.conf` on Unix); it does not substitute a hard-coded public
+DNS service.
+
 ### Named resolvers: `[resolvers.<name>]`
 
 **Named resolvers** let you declare DNS resolvers as first-class configuration
@@ -647,11 +651,17 @@ Concurrent rebuilds are idempotent via generation counters.
 
 ## Upstream address family & NAT64
 
-- `address_family = "dual"` (default) prefers AAAA and falls back to A;
-  `"ipv4"` uses A only; `"ipv6"` uses AAAA only.
+- `address_family = "dual"` (default) queries AAAA and A concurrently and keeps
+  every returned address; `"ipv4"` uses A only; `"ipv6"` uses AAAA only.
+- Data-plane connections use an RFC 8305-style Happy Eyeballs race. Dual-stack
+  candidates are interleaved IPv6-first and attempts are staggered by 250 ms;
+  a prompt failure starts the next candidate immediately. This applies to raw,
+  HTTP, TLS, and ECH over TCP, terminating H3/H3+ECH, and raw QUIC. Raw QUIC
+  selects the first candidate that returns a server datagram, since UDP
+  `connect` alone cannot establish reachability.
 - `nat64_prefix` (a /96 prefix such as `64:ff9b::` or `2a01:4f8:c2c:123f:64:5`)
   synthesizes an IPv6 target from a resolved IPv4 (RFC 6052). NAT64 is applied
-  in `dual`/`ipv4` when only an A record is available; it is **disabled** in
+  to A candidates in `dual`/`ipv4`; it is **disabled** in
   `ipv6` mode. You can also write a literal IPv6 upstream in bracket form,
   e.g. `upstream = "[2a01:4f8:c2c:123f:64:5:203:405]:443"`.
 

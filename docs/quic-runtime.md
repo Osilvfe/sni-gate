@@ -46,6 +46,13 @@ The pool is split into 16 independently locked shards. Misses for the same logic
 
 Outbound Quinn endpoints are reused by listener, route, and address family. A route therefore normally owns one IPv4 and/or one IPv6 UDP client socket rather than one socket per upstream connection. Plain-H3 routes also reuse one Quinn/rustls client configuration per listener and route, preserving TLS session tickets across reconnects. ECH routes reuse the `EchProvider`'s cached `Arc<ClientConfig>` for the same inner name and ALPN.
 
+On a pool miss, DNS keeps all A/AAAA answers and H3 races complete QUIC
+handshakes with an IPv6-first, 250 ms Happy Eyeballs stagger. The retained pool
+entry records the address that actually won. Raw QUIC performs the equivalent
+race using the first upstream response datagram as the success signal; merely
+calling UDP `connect` would not detect an unreachable or selectively blocked
+address.
+
 A request that already opened an upstream stream holds a generation-specific sender guard for the complete stream lifetime, while the shared endpoint registry remains process-owned. Pool eviction therefore affects only future reuse and does not terminate an active response. Failed stale leases are generation-checked before eviction so an old request cannot remove a newer healthy replacement stored under the same logical pool key.
 
 Upstream acquisition timeout returns HTTP `504`; other acquisition failures return `502`. A `send_request` failure evicts that specific pooled generation and returns `502`. The proxy intentionally does not automatically replay the current request because replay can be unsafe for non-idempotent methods.

@@ -8,6 +8,7 @@
 mod ca;
 mod certscope;
 pub mod config;
+mod connect;
 mod dns;
 mod dns_resolvers;
 mod ech;

@@ -354,9 +354,9 @@ async fn serve_mirrored(
             rt.name
         )
     })?;
-    let upstream_addr = rt
+    let upstream_addrs = rt
         .addr_resolver
-        .lookup_addr(
+        .lookup_addrs(
             &host,
             rt.upstream_port,
             rt.address_family,
@@ -369,7 +369,7 @@ async fn serve_mirrored(
     let up = match rt.route_type {
         RouteType::Tls => {
             let name = sni.clone().unwrap_or_else(|| host.clone());
-            dial_tls(upstream_addr, &name, rt, &client_offer).await?
+            dial_tls(&upstream_addrs, &name, rt, &client_offer).await?
         }
         RouteType::Ech => {
             // An inner name is required even when it will not be *sent*: it is
@@ -381,7 +381,7 @@ async fn serve_mirrored(
                     rt.name
                 )
             })?;
-            dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
+            dial_ech(&upstream_addrs, &inner, peer, rt, &client_offer).await?
         }
         RouteType::Http | RouteType::Raw | RouteType::H3 | RouteType::H3Ech => {
             unreachable!("mirroring only applies to tls/ech routes")
@@ -447,9 +447,9 @@ where
         )
     })?;
 
-    let upstream_addr = rt
+    let upstream_addrs = rt
         .addr_resolver
-        .lookup_addr(
+        .lookup_addrs(
             &host,
             rt.upstream_port,
             rt.address_family,
@@ -460,7 +460,7 @@ where
 
     match rt.route_type {
         RouteType::Http => {
-            let up = dial(upstream_addr, rt.connect_timeout).await?;
+            let up = dial(&upstream_addrs, rt.connect_timeout).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
         // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
@@ -468,7 +468,7 @@ where
         // and let it default to HTTP/1.1 too, exactly as before.
         RouteType::Tls => {
             let name = sni.clone().unwrap_or_else(|| host.clone());
-            let up = dial_tls(upstream_addr, &name, rt, &[]).await?;
+            let up = dial_tls(&upstream_addrs, &name, rt, &[]).await?;
             // HTTP/2 is off for this connection, so it cannot coalesce — but a
             // later connection for the same name can, and this is a free look at
             // what the upstream's certificate covers.
@@ -485,7 +485,7 @@ where
                     rt.name
                 )
             })?;
-            let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
+            let up = dial_ech(&upstream_addrs, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
             splice(inbound, up, rt.idle_timeout).await
         }
@@ -497,13 +497,10 @@ where
 }
 
 /// Plain TCP dial with a timeout.
-async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> {
-    let up = timeout(connect_timeout, TcpStream::connect(addr))
+async fn dial(addrs: &[SocketAddr], connect_timeout: Duration) -> Result<TcpStream> {
+    crate::connect::tcp(addrs, connect_timeout)
         .await
-        .map_err(|_| anyhow!("upstream connect timed out"))?
-        .with_context(|| format!("connecting to {addr}"))?;
-    up.set_nodelay(true).ok();
-    Ok(up)
+        .map(|(stream, _)| stream)
 }
 
 /// Dial a plain-TLS upstream, verifying the presented `server_name` and offering
@@ -514,7 +511,7 @@ async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> 
 /// [`SniPolicy`]: `Omit` clears `enable_sni`, so the handshake carries no
 /// `server_name` while the certificate is still checked against that name.
 async fn dial_tls(
-    addr: SocketAddr,
+    addrs: &[SocketAddr],
     server_name: &str,
     rt: &RouteRuntime,
     alpn: &[Vec<u8>],
@@ -527,7 +524,7 @@ async fn dial_tls(
     let connector = TlsConnector::from(Arc::new(config));
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid upstream SNI {server_name:?}"))?;
-    let tcp = dial(addr, rt.connect_timeout).await?;
+    let tcp = dial(addrs, rt.connect_timeout).await?;
     let tls = timeout(rt.connect_timeout, connector.connect(name, tcp))
         .await
         .map_err(|_| anyhow!("upstream TLS handshake timed out"))?
@@ -537,7 +534,7 @@ async fn dial_tls(
 
 /// Dial an ECH upstream for `inner` offering `alpn`, with retry on ECH rejection.
 async fn dial_ech(
-    addr: SocketAddr,
+    addrs: &[SocketAddr],
     inner: &str,
     peer: SocketAddr,
     rt: &RouteRuntime,
@@ -558,7 +555,7 @@ async fn dial_ech(
             .await
             .context("assembling ECH client config")?;
         let connector = TlsConnector::from(client.client_config.clone());
-        let tcp = dial(addr, rt.connect_timeout).await?;
+        let tcp = dial(addrs, rt.connect_timeout).await?;
 
         match timeout(rt.connect_timeout, connector.connect(name.clone(), tcp)).await {
             Ok(Ok(tls)) => {
@@ -695,16 +692,16 @@ async fn raw_passthrough(
                 rt.name
             )
         })?;
-        let upstream_addr = rt
+        let upstream_addrs = rt
             .addr_resolver
-            .lookup_addr(
+            .lookup_addrs(
                 &host,
                 rt.upstream_port,
                 rt.address_family,
                 rt.nat64.as_ref(),
             )
             .await?;
-        dial(upstream_addr, rt.connect_timeout).await
+        dial(&upstream_addrs, rt.connect_timeout).await
     }
     .await;
 
@@ -736,7 +733,7 @@ async fn apply_fail(
             Ok(())
         }
         FailPolicy::Passthrough { addr } => {
-            let up = dial(*addr, Duration::from_secs(10)).await?;
+            let up = dial(std::slice::from_ref(addr), Duration::from_secs(10)).await?;
             splice_tcp(client, up, Duration::from_secs(120)).await
         }
         FailPolicy::SystemOutbound => {

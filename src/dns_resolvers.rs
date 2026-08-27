@@ -386,7 +386,7 @@ impl DnsResolver {
         self.ech_bytes.read().expect("ech lock poisoned").clone()
     }
 
-    /// Resolve `host:port` to a connectable address, applying the caller's
+    /// Resolve `host:port` to every connectable address, applying the caller's
     /// address family and NAT64 prefix.
     ///
     /// `family` and `nat64` belong to the *caller* (a route decides the family
@@ -395,19 +395,19 @@ impl DnsResolver {
     ///
     /// On an ECH rejection the resolver is rebuilt from a fresh ECHConfigList
     /// and the lookup is retried, up to the plan's `max_retries`.
-    pub async fn lookup_addr(
+    pub async fn lookup_addrs(
         &self,
         host: &str,
         port: u16,
         family: AddressFamily,
         nat64: Option<&Nat64Prefix>,
-    ) -> Result<SocketAddr> {
+    ) -> Result<Vec<SocketAddr>> {
         let max_retries = self.plan.as_ref().map_or(0, |p| p.max_retries());
         let mut attempt = 0u32;
         loop {
             let seen = self.generation();
             let resolver = self.snapshot();
-            match dns::resolve_upstream(&resolver, host, port, family, nat64).await {
+            match dns::resolve_upstream_addrs(&resolver, host, port, family, nat64).await {
                 Err(e) if attempt < max_retries && ech::is_ech_reject_chain(&e) => {
                     warn!(
                         resolver = %self.label,
@@ -420,6 +420,23 @@ impl DnsResolver {
                 other => return other,
             }
         }
+    }
+
+    /// Resolve to the first preferred address. DNS endpoint bootstrapping and
+    /// startup probes use one concrete target; data-plane connections should
+    /// use [`Self::lookup_addrs`] so they can race all candidates.
+    pub async fn lookup_addr(
+        &self,
+        host: &str,
+        port: u16,
+        family: AddressFamily,
+        nat64: Option<&Nat64Prefix>,
+    ) -> Result<SocketAddr> {
+        self.lookup_addrs(host, port, family, nat64)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no address for {host}"))
     }
 
     /// Run a raw record lookup through this resolver, with the same reactive ECH
@@ -663,8 +680,11 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
     }
 
     // --- 3. Name server config: dial address and TLS name move separately ---
-    let config = match &plan.endpoint {
-        Endpoint::System => dns::system_resolver_config()?,
+    let (config, system_opts) = match &plan.endpoint {
+        Endpoint::System => {
+            let (config, opts) = dns::system_resolver_config()?;
+            (config, Some(opts))
+        }
         Endpoint::Doh { path, .. } => {
             let ip = dial_ip.expect("non-system endpoints resolve a dial IP");
             let name = plan
@@ -678,7 +698,7 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
             ns.connections
                 .iter_mut()
                 .for_each(|c| c.port = plan.dial_port);
-            ResolverConfig::from_parts(None, vec![], vec![ns])
+            (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
         }
         Endpoint::Dot { .. } => {
             let ip = dial_ip.expect("non-system endpoints resolve a dial IP");
@@ -690,7 +710,7 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
             ns.connections
                 .iter_mut()
                 .for_each(|c| c.port = plan.dial_port);
-            ResolverConfig::from_parts(None, vec![], vec![ns])
+            (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
         }
         Endpoint::Plain { .. } => {
             let ip = dial_ip.expect("non-system endpoints resolve a dial IP");
@@ -698,7 +718,7 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
             ns.connections
                 .iter_mut()
                 .for_each(|c| c.port = plan.dial_port);
-            ResolverConfig::from_parts(None, vec![], vec![ns])
+            (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
         }
     };
 
@@ -706,6 +726,9 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
     {
         let opts = builder.options_mut();
+        if let Some(system_opts) = system_opts {
+            *opts = system_opts;
+        }
         opts.ip_strategy = dns::strategy_for(plan.family);
         // An explicitly configured resolver must answer purely from its own
         // server, never from the local hosts file; only `system` honours hosts,

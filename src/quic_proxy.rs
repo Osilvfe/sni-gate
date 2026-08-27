@@ -1047,9 +1047,9 @@ async fn run_raw_flow(
                 route.name
             )
         })?;
-    let upstream_addr = route
+    let upstream_addrs = route
         .addr_resolver
-        .lookup_addr(
+        .lookup_addrs(
             &host,
             route.upstream_port,
             route.address_family,
@@ -1058,17 +1058,40 @@ async fn run_raw_flow(
         .await
         .with_context(|| format!("resolving QUIC upstream {host}"))?;
 
-    let bind = match upstream_addr.ip() {
-        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    };
-    let upstream = UdpSocket::bind(bind).await?;
-    upstream.connect(upstream_addr).await?;
-    for packet in packets {
-        upstream.send(&packet.bytes).await?;
-    }
-
     let peer = *peer_rx.borrow();
+    // UDP connect alone cannot prove that an address is reachable. Race the
+    // complete initial exchange instead: each staggered candidate receives the
+    // buffered client flight and the first upstream response selects the path.
+    // Losing sockets are dropped, so later packets go to exactly one upstream.
+    let packets = &packets;
+    let ((upstream, first_response), upstream_addr) = crate::connect::race(
+        &upstream_addrs,
+        route.connect_timeout,
+        move |upstream_addr| async move {
+            let bind = match upstream_addr.ip() {
+                IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+            };
+            let upstream = UdpSocket::bind(bind).await?;
+            upstream.connect(upstream_addr).await?;
+            for packet in packets {
+                upstream.send(&packet.bytes).await?;
+            }
+            let mut response = vec![0u8; UDP_BUF];
+            let n = upstream.recv(&mut response).await?;
+            response.truncate(n);
+            Ok((upstream, response))
+        },
+    )
+    .await?;
+
+    if let Some(header) = LongHeader::parse(&first_response) {
+        flows
+            .lock()
+            .await
+            .observe_upstream_scid(flow_id, header.scid);
+    }
+    listener.send_to(&first_response, peer).await?;
     info!(flow_id, %peer, route = %route.name, upstream = %upstream_addr, "QUIC raw flow established");
     let idle = route.idle_timeout;
     let mut buf = vec![0u8; UDP_BUF];

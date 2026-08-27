@@ -200,11 +200,12 @@ struct UpstreamIdentity {
 struct UpstreamTarget {
     host: String,
     server_name: String,
-    upstream_addr: SocketAddr,
+    upstream_addrs: Vec<SocketAddr>,
 }
 
 struct CreatedUpstream {
     upstream: UpstreamH3,
+    upstream_addr: SocketAddr,
     closed: Arc<AtomicBool>,
 }
 
@@ -725,7 +726,7 @@ async fn pooled_upstream_h3(
         key.clone(),
         UpstreamPoolEntry {
             upstream: created.upstream,
-            upstream_addr: target.upstream_addr,
+            upstream_addr: created.upstream_addr,
             closed: created.closed,
             last_used: Instant::now(),
             _pool_slot: pool_slot,
@@ -759,9 +760,9 @@ async fn resolve_upstream_target(
     route: &RouteRuntime,
     identity: &UpstreamIdentity,
 ) -> Result<UpstreamTarget> {
-    let upstream_addr = route
+    let upstream_addrs = route
         .addr_resolver
-        .lookup_addr(
+        .lookup_addrs(
             &identity.host,
             route.upstream_port,
             route.address_family,
@@ -773,7 +774,7 @@ async fn resolve_upstream_target(
     Ok(UpstreamTarget {
         host: identity.host.clone(),
         server_name: identity.server_name.clone(),
-        upstream_addr,
+        upstream_addrs,
     })
 }
 
@@ -787,25 +788,33 @@ async fn connect_upstream_h3_target(
     target: &UpstreamTarget,
 ) -> Result<CreatedUpstream> {
     let route_key = OutboundRouteKey { listener, route_id };
-    let endpoint = outbound_h3_endpoint(route_key, target.upstream_addr.ip()).await?;
-    let connection = match route.route_type {
+    let (connection, upstream_addr) = match route.route_type {
         RouteType::H3 => {
-            connect_quinn(
-                &endpoint,
-                plain_h3_client_config(route_key, route).await?,
-                target.upstream_addr,
-                &target.server_name,
-                route.connect_timeout,
-            )
+            let config = plain_h3_client_config(route_key, route).await?;
+            crate::connect::race(&target.upstream_addrs, route.connect_timeout, |addr| {
+                let config = config.clone();
+                async move {
+                    let endpoint = outbound_h3_endpoint(route_key, addr.ip()).await?;
+                    connect_quinn(
+                        &endpoint,
+                        config,
+                        addr,
+                        &target.server_name,
+                        route.connect_timeout,
+                    )
+                    .await
+                }
+            })
             .await?
         }
         RouteType::H3Ech => {
-            connect_ech_quinn(
-                &endpoint,
-                target.upstream_addr,
-                &target.server_name,
-                route,
-                peer,
+            crate::connect::race(
+                &target.upstream_addrs,
+                route.connect_timeout,
+                |addr| async move {
+                    let endpoint = outbound_h3_endpoint(route_key, addr.ip()).await?;
+                    connect_ech_quinn(&endpoint, addr, &target.server_name, route, peer).await
+                },
             )
             .await?
         }
@@ -841,7 +850,7 @@ async fn connect_upstream_h3_target(
         %peer,
         route = %route.name,
         host = %target.host,
-        upstream = %target.upstream_addr,
+        upstream = %upstream_addr,
         sni = %target.server_name,
         "upstream H3 connection established"
     );
@@ -872,6 +881,7 @@ async fn connect_upstream_h3_target(
 
     Ok(CreatedUpstream {
         upstream: UpstreamH3 { sender },
+        upstream_addr,
         closed,
     })
 }

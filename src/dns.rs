@@ -11,12 +11,13 @@
 //! deployment can send ECH HTTPS-record lookups and upstream A/AAAA lookups to
 //! different servers.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::TokioResolver;
@@ -83,8 +84,11 @@ impl ResolverSpec {
 
     /// Build a shared Tokio resolver honoring `family` for A/AAAA strategy.
     pub fn build(&self, family: AddressFamily) -> Result<Arc<TokioResolver>> {
-        let config = match self {
-            ResolverSpec::System => system_resolver_config()?,
+        let (config, system_opts) = match self {
+            ResolverSpec::System => {
+                let (config, opts) = system_resolver_config()?;
+                (config, Some(opts))
+            }
             ResolverSpec::Doh {
                 ip,
                 server_name,
@@ -95,22 +99,25 @@ impl ResolverSpec {
                     Arc::from(server_name.as_str()),
                     Some(Arc::from(path.as_str())),
                 );
-                ResolverConfig::from_parts(None, vec![], vec![ns])
+                (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
             }
             ResolverSpec::Dot { ip, server_name } => {
                 let ns = NameServerConfig::tls(*ip, Arc::from(server_name.as_str()));
-                ResolverConfig::from_parts(None, vec![], vec![ns])
+                (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
             }
             ResolverSpec::Plain { addr } => {
                 let mut ns = NameServerConfig::udp_and_tcp(addr.ip());
                 ns.connections.iter_mut().for_each(|c| c.port = addr.port());
-                ResolverConfig::from_parts(None, vec![], vec![ns])
+                (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
             }
         };
 
         let mut builder =
             TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         let opts = builder.options_mut();
+        if let Some(system_opts) = system_opts {
+            *opts = system_opts;
+        }
         opts.ip_strategy = strategy_for(family);
         // An explicitly configured DoH/DoT/plain-IP resolver is an upstream DNS
         // choice: it must answer purely from that server, never the local hosts
@@ -124,48 +131,83 @@ impl ResolverSpec {
     }
 }
 
-/// Resolve an upstream host to a connectable `SocketAddr`, honoring the address
-/// family and applying NAT64 synthesis when only IPv4 is available.
-pub async fn resolve_upstream(
+/// Resolve all connectable addresses for an upstream host, honoring the address
+/// family and applying NAT64 synthesis to IPv4 answers when configured.
+///
+/// Dual-stack results are interleaved IPv6-first. Connection code can therefore
+/// apply the RFC 8305 stagger without starving either family, while still
+/// retaining every answer published by the resolver.
+pub async fn resolve_upstream_addrs(
     resolver: &TokioResolver,
     host: &str,
     port: u16,
     family: AddressFamily,
     nat64: Option<&Nat64Prefix>,
-) -> Result<SocketAddr> {
+) -> Result<Vec<SocketAddr>> {
     // A literal IP needs no lookup. A literal IPv4 still goes through NAT64
     // synthesis when a prefix is configured (unless ipv6-only mode, where NAT64
     // is disabled), so a v4 destination is reachable from a v6-only host.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(match ip {
+        return Ok(vec![match ip {
             IpAddr::V4(v4) if family != AddressFamily::Ipv6 => nat64_or_v4(v4, port, nat64),
             other => SocketAddr::new(other, port),
-        });
+        }]);
     }
 
     let resolved = match family {
-        AddressFamily::Ipv6 => {
-            // AAAA only; NAT64 disabled.
-            let v6 = lookup_v6(resolver, host).await?;
-            SocketAddr::new(IpAddr::V6(v6), port)
-        }
-        AddressFamily::Ipv4 => {
-            let v4 = lookup_v4(resolver, host).await?;
-            nat64_or_v4(v4, port, nat64)
-        }
+        AddressFamily::Ipv6 => lookup_v6(resolver, host)
+            .await?
+            .into_iter()
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), port))
+            .collect(),
+        AddressFamily::Ipv4 => lookup_v4(resolver, host)
+            .await?
+            .into_iter()
+            .map(|ip| nat64_or_v4(ip, port, nat64))
+            .collect(),
         AddressFamily::Dual => {
-            // Prefer AAAA; fall back to A (with optional NAT64).
-            match lookup_v6(resolver, host).await {
-                Ok(v6) => SocketAddr::new(IpAddr::V6(v6), port),
-                Err(_) => {
-                    let v4 = lookup_v4(resolver, host).await?;
-                    nat64_or_v4(v4, port, nat64)
-                }
-            }
+            let (v6, v4) = tokio::join!(lookup_v6(resolver, host), lookup_v4(resolver, host));
+            let v6 = v6
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ip| SocketAddr::new(IpAddr::V6(ip), port));
+            let v4 = v4
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ip| nat64_or_v4(ip, port, nat64));
+            interleave(v6.collect(), v4.collect())
         }
     };
-    tracing::debug!(host, %resolved, ?family, nat64 = nat64.is_some(), "resolved upstream");
+    if resolved.is_empty() {
+        return Err(anyhow!("no A or AAAA record for {host}"));
+    }
+    tracing::debug!(
+        host,
+        ?resolved,
+        ?family,
+        nat64 = nat64.is_some(),
+        "resolved upstream candidates"
+    );
     Ok(resolved)
+}
+
+fn interleave<T>(preferred: Vec<T>, alternate: Vec<T>) -> Vec<T> {
+    let mut preferred = preferred.into_iter();
+    let mut alternate = alternate.into_iter();
+    let mut out = Vec::new();
+    loop {
+        match (preferred.next(), alternate.next()) {
+            (None, None) => break,
+            (Some(value), alternate_value) => {
+                out.push(value);
+                if let Some(value) = alternate_value {
+                    out.push(value);
+                }
+            }
+            (None, Some(value)) => out.push(value),
+        }
+    }
+    out
 }
 
 fn nat64_or_v4(v4: Ipv4Addr, port: u16, nat64: Option<&Nat64Prefix>) -> SocketAddr {
@@ -175,35 +217,45 @@ fn nat64_or_v4(v4: Ipv4Addr, port: u16, nat64: Option<&Nat64Prefix>) -> SocketAd
     }
 }
 
-async fn lookup_v4(resolver: &TokioResolver, host: &str) -> Result<Ipv4Addr> {
+async fn lookup_v4(resolver: &TokioResolver, host: &str) -> Result<Vec<Ipv4Addr>> {
     use hickory_resolver::proto::rr::RData;
     let lookup = resolver
         .lookup(host, RecordType::A)
         .await
         .with_context(|| format!("A lookup for {host}"))?;
-    lookup
+    let mut addrs: Vec<_> = lookup
         .answers()
         .iter()
-        .find_map(|r| match &r.data {
+        .filter_map(|r| match &r.data {
             RData::A(a) => Some(a.0),
             _ => None,
         })
+        .collect();
+    let mut seen = HashSet::new();
+    addrs.retain(|addr| seen.insert(*addr));
+    (!addrs.is_empty())
+        .then_some(addrs)
         .ok_or_else(|| anyhow!("no A record for {host}"))
 }
 
-async fn lookup_v6(resolver: &TokioResolver, host: &str) -> Result<Ipv6Addr> {
+async fn lookup_v6(resolver: &TokioResolver, host: &str) -> Result<Vec<Ipv6Addr>> {
     use hickory_resolver::proto::rr::RData;
     let lookup = resolver
         .lookup(host, RecordType::AAAA)
         .await
         .with_context(|| format!("AAAA lookup for {host}"))?;
-    lookup
+    let mut addrs: Vec<_> = lookup
         .answers()
         .iter()
-        .find_map(|r| match &r.data {
+        .filter_map(|r| match &r.data {
             RData::AAAA(a) => Some(a.0),
             _ => None,
         })
+        .collect();
+    let mut seen = HashSet::new();
+    addrs.retain(|addr| seen.insert(*addr));
+    (!addrs.is_empty())
+        .then_some(addrs)
         .ok_or_else(|| anyhow!("no AAAA record for {host}"))
 }
 
@@ -217,13 +269,9 @@ pub fn strategy_for(family: AddressFamily) -> LookupIpStrategy {
 
 /// Build the system resolver config.
 ///
-/// hickory's `read_system_conf` is feature/platform-gated and not always
-/// available; to keep `system` dependable everywhere we resolve through a
-/// well-known public resolver (Cloudflare) over UDP+TCP. Deployments that need
-/// the exact OS resolver can point `resolver` at a specific server instead.
-pub fn system_resolver_config() -> Result<ResolverConfig> {
-    let ns = NameServerConfig::udp_and_tcp(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-    Ok(ResolverConfig::from_parts(None, vec![], vec![ns]))
+/// Read the operating system's resolver configuration and options.
+pub fn system_resolver_config() -> Result<(ResolverConfig, ResolverOpts)> {
+    hickory_resolver::system_conf::read_system_conf().context("reading system resolver config")
 }
 
 /// Split `host[:port]/path` into (host, Some(port)?, path). Path is "" if none.
@@ -282,7 +330,7 @@ mod tests {
         let resolver = ResolverSpec::System.build(AddressFamily::Ipv4).unwrap();
         let prefix = "64:ff9b::".parse::<Nat64Prefix>().unwrap();
 
-        let out = resolve_upstream(
+        let out = resolve_upstream_addrs(
             &resolver,
             "1.2.3.4",
             443,
@@ -291,10 +339,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, "[64:ff9b::102:304]:443".parse().unwrap());
+        assert_eq!(out, vec!["[64:ff9b::102:304]:443".parse().unwrap()]);
 
         // A literal IPv6 upstream is returned as-is.
-        let out6 = resolve_upstream(
+        let out6 = resolve_upstream_addrs(
             &resolver,
             "2a01:4f8::1",
             443,
@@ -303,7 +351,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out6, "[2a01:4f8::1]:443".parse().unwrap());
+        assert_eq!(out6, vec!["[2a01:4f8::1]:443".parse().unwrap()]);
     }
 
     #[test]
@@ -346,5 +394,14 @@ mod tests {
             ResolverSpec::Doh { path, .. } => assert_eq!(path, "/dns-query"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn dual_stack_candidates_are_interleaved() {
+        assert_eq!(
+            interleave(vec![1, 2, 3], vec![10, 20]),
+            vec![1, 10, 2, 20, 3]
+        );
+        assert_eq!(interleave(Vec::<u8>::new(), vec![10, 20]), vec![10, 20]);
     }
 }
