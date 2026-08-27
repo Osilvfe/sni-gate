@@ -172,6 +172,10 @@ impl<'a> LongHeader<'a> {
     }
 }
 
+fn is_quic_initial(datagram: &[u8]) -> bool {
+    LongHeader::parse(datagram).is_some_and(|header| header.is_initial())
+}
+
 impl FlowTable {
     fn len(&self) -> usize {
         self.entries.len()
@@ -501,10 +505,16 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     // Keep the endpoint alive for the lifetime of the listener.
     let _h3_endpoint = h3.map(|(endpoint, _)| endpoint);
     let allow_peer_fallback = h3_ingress.is_none();
+    let h3_only = h3_ingress.is_some()
+        && state
+            .routes
+            .iter()
+            .all(|route| matches!(route.route_type, RouteType::H3 | RouteType::H3Ech));
     info!(
         addr = %state.addr,
         routes = state.routes.len(),
         h3 = h3_ingress.is_some(),
+        h3_fast_path = h3_only,
         max_pending_h3_handshakes = limits.max_pending_handshakes,
         max_h3_connections = limits.max_h3_connections,
         "QUIC listening"
@@ -514,6 +524,17 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     loop {
         let (n, peer) = listener.recv_from(&mut buf).await?;
         let datagram = &buf[..n];
+
+        // On a pure terminating-H3 listener, only Initial packets need the
+        // stateless SNI inspector. Every other QUIC packet belongs to Quinn, so
+        // bypass the shared raw-flow table entirely. Mixed raw+H3 listeners keep
+        // the conservative CID ownership path below.
+        if h3_only && !is_quic_initial(datagram) {
+            if let Some(ingress) = &h3_ingress {
+                dispatch_to_h3(ingress, peer, datagram);
+            }
+            continue;
+        }
 
         let action = {
             let now = Instant::now();
@@ -962,6 +983,19 @@ mod tests {
         packet.push(scid.len() as u8);
         packet.extend_from_slice(scid);
         packet
+    }
+
+    #[test]
+    fn h3_fast_path_keeps_initial_packets_on_inspection_path() {
+        let v1_initial = long_header(QUIC_V1, 0xc0, b"v1initial", b"client01");
+        let v2_initial = long_header(QUIC_V2, 0xd0, b"v2initial", b"client02");
+        let v1_handshake = long_header(QUIC_V1, 0xe0, b"handshake", b"client03");
+        let short_header = [0x40, 0xaa, 0xbb, 0xcc];
+
+        assert!(is_quic_initial(&v1_initial));
+        assert!(is_quic_initial(&v2_initial));
+        assert!(!is_quic_initial(&v1_handshake));
+        assert!(!is_quic_initial(&short_header));
     }
 
     #[test]
