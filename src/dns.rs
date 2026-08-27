@@ -84,11 +84,8 @@ impl ResolverSpec {
 
     /// Build a shared Tokio resolver honoring `family` for A/AAAA strategy.
     pub fn build(&self, family: AddressFamily) -> Result<Arc<TokioResolver>> {
-        let (config, system_opts) = match self {
-            ResolverSpec::System => {
-                let (config, opts) = system_resolver_config()?;
-                (config, Some(opts))
-            }
+        let config = match self {
+            ResolverSpec::System => system_resolver_config()?.0,
             ResolverSpec::Doh {
                 ip,
                 server_name,
@@ -99,25 +96,22 @@ impl ResolverSpec {
                     Arc::from(server_name.as_str()),
                     Some(Arc::from(path.as_str())),
                 );
-                (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
+                ResolverConfig::from_parts(None, vec![], vec![ns])
             }
             ResolverSpec::Dot { ip, server_name } => {
                 let ns = NameServerConfig::tls(*ip, Arc::from(server_name.as_str()));
-                (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
+                ResolverConfig::from_parts(None, vec![], vec![ns])
             }
             ResolverSpec::Plain { addr } => {
                 let mut ns = NameServerConfig::udp_and_tcp(addr.ip());
                 ns.connections.iter_mut().for_each(|c| c.port = addr.port());
-                (ResolverConfig::from_parts(None, vec![], vec![ns]), None)
+                ResolverConfig::from_parts(None, vec![], vec![ns])
             }
         };
 
         let mut builder =
             TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         let opts = builder.options_mut();
-        if let Some(system_opts) = system_opts {
-            *opts = system_opts;
-        }
         opts.ip_strategy = strategy_for(family);
         // An explicitly configured DoH/DoT/plain-IP resolver is an upstream DNS
         // choice: it must answer purely from that server, never the local hosts
@@ -267,11 +261,18 @@ pub fn strategy_for(family: AddressFamily) -> LookupIpStrategy {
     }
 }
 
-/// Build the system resolver config.
+/// Build the resolver config used by the legacy `system` setting.
 ///
-/// Read the operating system's resolver configuration and options.
+/// Keep the pre-Happy-Eyeballs behavior here: the QUIC connection-racing work
+/// should not also redefine where DNS queries are sent. The second tuple item
+/// preserves the current caller API without enabling Hickory's `system-config`
+/// feature or reading OS resolver state.
 pub fn system_resolver_config() -> Result<(ResolverConfig, ResolverOpts)> {
-    hickory_resolver::system_conf::read_system_conf().context("reading system resolver config")
+    let ns = NameServerConfig::udp_and_tcp(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    Ok((
+        ResolverConfig::from_parts(None, vec![], vec![ns]),
+        ResolverOpts::default(),
+    ))
 }
 
 /// Split `host[:port]/path` into (host, Some(port)?, path). Path is "" if none.
