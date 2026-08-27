@@ -1268,10 +1268,11 @@ mod tests {
         assert_eq!(selected, new_peer.local_addr().unwrap());
 
         let mut buf = [0u8; 16];
-        let (n, source) = tokio::time::timeout(Duration::from_secs(1), new_peer.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
+        let (n, source) =
+            tokio::time::timeout(Duration::from_secs(1), new_peer.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(&buf[..n], b"reply");
         assert_eq!(source, sender.local_addr().unwrap());
     }
