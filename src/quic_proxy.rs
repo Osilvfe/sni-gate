@@ -370,10 +370,14 @@ impl FlowTable {
     }
 
     /// A server long-header SCID is a CID the client can use as its future DCID.
-    /// Upstream packets arrive through a connected UDP socket, so this is the
-    /// only dynamic CID-learning direction trusted by the raw flow table.
-    fn observe_upstream_scid(&mut self, id: FlowId, scid: &[u8]) {
-        self.add_routing_cid(id, scid, true);
+    /// Version Negotiation is the exception: its SCID echoes the client's
+    /// original DCID, so learning it would turn a client-chosen CID into a
+    /// short-header routing token.
+    fn observe_upstream_header(&mut self, id: FlowId, header: &LongHeader<'_>) {
+        if header.version == 0 {
+            return;
+        }
+        self.add_routing_cid(id, header.scid, true);
     }
 
     fn forwarding_sender(&self, id: FlowId) -> Option<mpsc::Sender<QueuedDatagram>> {
@@ -1165,7 +1169,7 @@ async fn run_raw_flow(
         flows
             .lock()
             .await
-            .observe_upstream_scid(flow_id, header.scid);
+            .observe_upstream_header(flow_id, &header);
     }
     // The client may have rebound while DNS/Happy Eyeballs was in progress.
     // Read the watch channel only after upstream setup so the first response is
@@ -1183,7 +1187,7 @@ async fn run_raw_flow(
             received = upstream.recv(&mut buf) => {
                 let n = received?;
                 if let Some(header) = LongHeader::parse(&buf[..n]) {
-                    flows.lock().await.observe_upstream_scid(flow_id, header.scid);
+                    flows.lock().await.observe_upstream_header(flow_id, &header);
                 }
                 send_to_current_raw_peer(&listener, &peer_rx, &buf[..n]).await?;
             },
@@ -1442,7 +1446,8 @@ mod tests {
         let id = flows.insert_inspecting(old_peer, now, Some(b"initial1"));
         let server_cid = b"server01";
         let response = long_header(QUIC_V1, 0xc0, b"client01", server_cid);
-        flows.observe_upstream_scid(id, LongHeader::parse(&response).unwrap().scid);
+        let header = LongHeader::parse(&response).unwrap();
+        flows.observe_upstream_header(id, &header);
         let (tx, _rx) = mpsc::channel(1);
         let (peer_tx, peer_rx) = watch::channel(old_peer);
         assert!(flows.promote(id, tx, peer_tx));
@@ -1489,6 +1494,30 @@ mod tests {
     }
 
     #[test]
+    fn version_negotiation_scid_is_not_learned_as_a_short_header_cid() {
+        let peer: SocketAddr = "127.0.0.1:4800".parse().unwrap();
+        let mut flows = FlowTable::default();
+        let client_initial_dcid = b"clientcid";
+        let id = flows.insert_inspecting(peer, Instant::now(), Some(client_initial_dcid));
+
+        // A Version Negotiation packet reverses the client's Initial CID pair:
+        // the server SCID is the client's original DCID, not a server-issued CID.
+        let version_negotiation = long_header(0, 0x80, b"clientsci", client_initial_dcid);
+        let header = LongHeader::parse(&version_negotiation).unwrap();
+        flows.observe_upstream_header(id, &header);
+
+        let entry = flows.entries.get(&id).unwrap();
+        assert_eq!(entry.routing_cids.len(), 1);
+        assert!(entry.short_cids.is_empty());
+        assert_eq!(flows.short_cid_lengths[client_initial_dcid.len()], 0);
+
+        let mut short = vec![0x40];
+        short.extend_from_slice(client_initial_dcid);
+        short.extend_from_slice(b"ciphertext");
+        assert_eq!(flows.short_header_owner(&short), None);
+    }
+
+    #[test]
     fn upstream_scid_routes_short_header_after_rebinding() {
         let now = Instant::now();
         let old_peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
@@ -1497,7 +1526,8 @@ mod tests {
         let id = flows.insert_inspecting(old_peer, now, Some(b"initial1"));
         let server_cid = b"srv-short";
         let response = long_header(QUIC_V1, 0xc0, b"client03", server_cid);
-        flows.observe_upstream_scid(id, LongHeader::parse(&response).unwrap().scid);
+        let header = LongHeader::parse(&response).unwrap();
+        flows.observe_upstream_header(id, &header);
 
         let mut short = vec![0x40];
         short.extend_from_slice(server_cid);
@@ -1517,7 +1547,8 @@ mod tests {
         for value in 0u8..100 {
             let scid = [value; 8];
             let response = long_header(QUIC_V1, 0xc0, b"client04", &scid);
-            flows.observe_upstream_scid(id, LongHeader::parse(&response).unwrap().scid);
+            let header = LongHeader::parse(&response).unwrap();
+            flows.observe_upstream_header(id, &header);
         }
 
         let entry = flows.entries.get(&id).unwrap();
@@ -1533,8 +1564,10 @@ mod tests {
         let mut flows = FlowTable::default();
         let first = flows.insert_inspecting("127.0.0.1:6300".parse().unwrap(), now, None);
         let second = flows.insert_inspecting("127.0.0.1:6301".parse().unwrap(), now, None);
-        flows.observe_upstream_scid(first, b"same-cid");
-        flows.observe_upstream_scid(second, b"same-cid");
+        let response = long_header(QUIC_V1, 0xc0, b"client05", b"same-cid");
+        let header = LongHeader::parse(&response).unwrap();
+        flows.observe_upstream_header(first, &header);
+        flows.observe_upstream_header(second, &header);
         assert_eq!(flows.short_cid_lengths[8], 1);
 
         flows.remove(first);
@@ -1559,7 +1592,9 @@ mod tests {
             );
             let id = flows.insert_inspecting(peer, now, None);
             let cid = (index as u64).to_be_bytes();
-            flows.observe_upstream_scid(id, &cid);
+            let response = long_header(QUIC_V1, 0xc0, b"client06", &cid);
+            let header = LongHeader::parse(&response).unwrap();
+            flows.observe_upstream_header(id, &header);
             let (tx, _rx) = mpsc::channel(1);
             let (peer_tx, _peer_rx) = watch::channel(peer);
             assert!(flows.promote(id, tx, peer_tx));
