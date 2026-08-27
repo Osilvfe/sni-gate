@@ -621,6 +621,8 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
         max_pending_h3_handshakes = limits.max_pending_handshakes,
         max_h3_connections = limits.max_h3_connections,
         max_h3_ingress_bytes = limits.max_h3_ingress_bytes,
+        max_raw_flows = limits.max_raw_flows,
+        max_pending_raw_connects = limits.max_pending_raw_connects,
         max_raw_forwarding_bytes = limits.max_raw_forwarding_bytes,
         "QUIC listening"
     );
@@ -999,6 +1001,8 @@ struct RawFlowContext {
     route: Arc<RouteRuntime>,
     sni: String,
     packets: Vec<QueuedDatagram>,
+    _flow_permit: OwnedSemaphorePermit,
+    connect_permit: OwnedSemaphorePermit,
 }
 
 async fn spawn_raw_flow(
@@ -1010,6 +1014,31 @@ async fn spawn_raw_flow(
     packets: Vec<Vec<u8>>,
     byte_budget: Arc<ByteBudget>,
 ) {
+    let flow_permit = match quic_runtime::raw_flow_limit().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            flows.lock().await.remove(flow_id);
+            debug!(
+                flow_id,
+                max_raw_flows = quic_runtime::limits().max_raw_flows,
+                "dropping QUIC raw flow because process-wide active flow capacity is exhausted"
+            );
+            return;
+        }
+    };
+    let connect_permit = match quic_runtime::raw_connect_limit().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            flows.lock().await.remove(flow_id);
+            debug!(
+                flow_id,
+                max_pending = quic_runtime::limits().max_pending_raw_connects,
+                "dropping QUIC raw flow because upstream setup capacity is exhausted"
+            );
+            return;
+        }
+    };
+
     let mut reserved_packets = Vec::with_capacity(packets.len());
     for packet in packets {
         match QueuedDatagram::reserve(packet, &byte_budget) {
@@ -1047,6 +1076,8 @@ async fn spawn_raw_flow(
         route,
         sni,
         packets: reserved_packets,
+        _flow_permit: flow_permit,
+        connect_permit,
     };
     tokio::spawn(async move {
         if let Err(error) = run_raw_flow(context, rx, peer_rx).await {
@@ -1055,6 +1086,16 @@ async fn spawn_raw_flow(
         cleanup_flows.lock().await.remove(flow_id);
         debug!(flow_id, "QUIC raw flow closed");
     });
+}
+
+async fn send_to_current_raw_peer(
+    listener: &UdpSocket,
+    peer_rx: &watch::Receiver<SocketAddr>,
+    datagram: &[u8],
+) -> Result<SocketAddr> {
+    let peer = *peer_rx.borrow();
+    listener.send_to(datagram, peer).await?;
+    Ok(peer)
 }
 
 async fn run_raw_flow(
@@ -1069,6 +1110,8 @@ async fn run_raw_flow(
         route,
         sni,
         packets,
+        _flow_permit,
+        connect_permit,
     } = context;
     let host = route
         .upstream_host
@@ -1091,7 +1134,6 @@ async fn run_raw_flow(
         .await
         .with_context(|| format!("resolving QUIC upstream {host}"))?;
 
-    let peer = *peer_rx.borrow();
     // UDP connect alone cannot prove that an address is reachable. Race the
     // complete initial exchange instead: each staggered candidate receives the
     // buffered client flight and the first upstream response selects the path.
@@ -1117,6 +1159,7 @@ async fn run_raw_flow(
         },
     )
     .await?;
+    drop(connect_permit);
 
     if let Some(header) = LongHeader::parse(&first_response) {
         flows
@@ -1124,7 +1167,10 @@ async fn run_raw_flow(
             .await
             .observe_upstream_scid(flow_id, header.scid);
     }
-    listener.send_to(&first_response, peer).await?;
+    // The client may have rebound while DNS/Happy Eyeballs was in progress.
+    // Read the watch channel only after upstream setup so the first response is
+    // sent to the same latest peer used by every later response.
+    let peer = send_to_current_raw_peer(&listener, &peer_rx, &first_response).await?;
     info!(flow_id, %peer, route = %route.name, upstream = %upstream_addr, "QUIC raw flow established");
     let idle = route.idle_timeout;
     let mut buf = vec![0u8; UDP_BUF];
@@ -1139,8 +1185,7 @@ async fn run_raw_flow(
                 if let Some(header) = LongHeader::parse(&buf[..n]) {
                     flows.lock().await.observe_upstream_scid(flow_id, header.scid);
                 }
-                let current_peer = *peer_rx.borrow();
-                listener.send_to(&buf[..n], current_peer).await?;
+                send_to_current_raw_peer(&listener, &peer_rx, &buf[..n]).await?;
             },
             _ = tokio::time::sleep(idle), if !idle.is_zero() => {
                 debug!(flow_id, route = %route.name, "QUIC raw flow idle timeout");
@@ -1207,6 +1252,28 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn raw_response_uses_latest_migrated_peer() {
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (peer_tx, peer_rx) = watch::channel(old_peer.local_addr().unwrap());
+        peer_tx.send(new_peer.local_addr().unwrap()).unwrap();
+
+        let selected = send_to_current_raw_peer(&sender, &peer_rx, b"reply")
+            .await
+            .unwrap();
+        assert_eq!(selected, new_peer.local_addr().unwrap());
+
+        let mut buf = [0u8; 16];
+        let (n, source) = tokio::time::timeout(Duration::from_secs(1), new_peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"reply");
+        assert_eq!(source, sender.local_addr().unwrap());
     }
 
     #[test]
