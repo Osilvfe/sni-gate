@@ -54,13 +54,25 @@ const MAX_H3_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 const MAX_UPSTREAM_H3_POOL_ENTRIES: usize = 256;
 const UPSTREAM_H3_POOL_IDLE: Duration = Duration::from_secs(60);
 
+/// Cold starts and upstream outages can create many simultaneous pool misses.
+/// Bound the expensive DNS + UDP bind + QUIC/TLS/ECH/H3 establishment path so
+/// one burst cannot fan out into an unbounded handshake storm.
+const MAX_PENDING_UPSTREAM_H3_CONNECTS: usize = 64;
+
 static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static UPSTREAM_H3_CONNECT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>> =
     OnceLock::new();
 
 fn h3_connection_limit() -> Arc<Semaphore> {
     H3_CONNECTION_LIMIT
         .get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_H3_CONNECTIONS)))
+        .clone()
+}
+
+fn upstream_h3_connect_limit() -> Arc<Semaphore> {
+    UPSTREAM_H3_CONNECT_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_PENDING_UPSTREAM_H3_CONNECTS)))
         .clone()
 }
 
@@ -494,6 +506,38 @@ async fn pooled_upstream_h3(
                 upstream = %entry.upstream_addr,
                 sni = %identity.server_name,
                 "reusing pooled upstream H3 connection"
+            );
+            return Ok((key, entry.upstream.clone()));
+        }
+    }
+
+    let _connect_permit = timeout(
+        route.connect_timeout,
+        upstream_h3_connect_limit().acquire_owned(),
+    )
+    .await
+    .context("waiting for upstream H3 connect capacity timed out")?
+    .context("upstream H3 connect limiter closed")?;
+
+    // A request that arrived while the connect limiter was saturated may find
+    // that another request populated this key while it waited. Re-check before
+    // paying for DNS and another QUIC/TLS/H3 handshake.
+    let now = Instant::now();
+    {
+        let mut entries = pool.lock().await;
+        entries.retain(|_, entry| {
+            !entry.closed.load(Ordering::Acquire)
+                && now.duration_since(entry.last_used) < UPSTREAM_H3_POOL_IDLE
+        });
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.last_used = now;
+            debug!(
+                %peer,
+                route = %route.name,
+                host = %identity.host,
+                upstream = %entry.upstream_addr,
+                sni = %identity.server_name,
+                "reusing upstream H3 connection after connect-capacity wait"
             );
             return Ok((key, entry.upstream.clone()));
         }
