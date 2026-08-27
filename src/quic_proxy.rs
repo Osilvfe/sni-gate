@@ -2,6 +2,8 @@
 
 #[path = "h3_proxy.rs"]
 mod h3_proxy;
+#[path = "quic_runtime.rs"]
+mod quic_runtime;
 #[path = "quic_socket.rs"]
 mod quic_socket;
 
@@ -14,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -168,6 +170,10 @@ impl<'a> LongHeader<'a> {
             _ => false,
         }
     }
+}
+
+fn is_quic_initial(datagram: &[u8]) -> bool {
+    LongHeader::parse(datagram).is_some_and(|header| header.is_initial())
 }
 
 impl FlowTable {
@@ -486,6 +492,7 @@ fn warn_unsupported_fail_policies(state: &ListenerState) {
 
 /// Serve one UDP/QUIC listener.
 pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
+    let limits = quic_runtime::init_from_env().context("loading QUIC runtime limits")?;
     let listener = Arc::new(
         UdpSocket::bind(state.addr)
             .await
@@ -498,10 +505,18 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     // Keep the endpoint alive for the lifetime of the listener.
     let _h3_endpoint = h3.map(|(endpoint, _)| endpoint);
     let allow_peer_fallback = h3_ingress.is_none();
+    let h3_only = h3_ingress.is_some()
+        && state
+            .routes
+            .iter()
+            .all(|route| matches!(route.route_type, RouteType::H3 | RouteType::H3Ech));
     info!(
         addr = %state.addr,
         routes = state.routes.len(),
         h3 = h3_ingress.is_some(),
+        h3_fast_path = h3_only,
+        max_pending_h3_handshakes = limits.max_pending_handshakes,
+        max_h3_connections = limits.max_h3_connections,
         "QUIC listening"
     );
 
@@ -509,6 +524,17 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
     loop {
         let (n, peer) = listener.recv_from(&mut buf).await?;
         let datagram = &buf[..n];
+
+        // On a pure terminating-H3 listener, only Initial packets need the
+        // stateless SNI inspector. Every other QUIC packet belongs to Quinn, so
+        // bypass the shared raw-flow table entirely. Mixed raw+H3 listeners keep
+        // the conservative CID ownership path below.
+        if h3_only && !is_quic_initial(datagram) {
+            if let Some(ingress) = &h3_ingress {
+                dispatch_to_h3(ingress, peer, datagram);
+            }
+            continue;
+        }
 
         let action = {
             let now = Instant::now();
@@ -703,12 +729,49 @@ fn start_h3_endpoint(
     .context("creating shared Quinn endpoint")?;
 
     let accept_endpoint = endpoint.clone();
+    let max_pending_handshakes = quic_runtime::limits().max_pending_handshakes;
+    let handshake_limit = Arc::new(Semaphore::new(max_pending_handshakes));
     tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
+            let handshake_permit = match handshake_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let peer = incoming.remote_address();
+                    if !incoming.remote_address_validated() {
+                        match incoming.retry() {
+                            Ok(()) => {
+                                debug!(
+                                    %peer,
+                                    max_pending = max_pending_handshakes,
+                                    "sent QUIC Retry because H3 handshake capacity is exhausted"
+                                );
+                            }
+                            Err(error) => {
+                                error.into_incoming().refuse();
+                                debug!(
+                                    %peer,
+                                    max_pending = max_pending_handshakes,
+                                    "refused QUIC handshake after Retry became unavailable"
+                                );
+                            }
+                        }
+                    } else {
+                        incoming.refuse();
+                        debug!(
+                            %peer,
+                            max_pending = max_pending_handshakes,
+                            "refused validated QUIC handshake because H3 handshake capacity is exhausted"
+                        );
+                    }
+                    continue;
+                }
+            };
             let state = state.clone();
             tokio::spawn(async move {
                 let peer = incoming.remote_address();
-                match incoming.await {
+                let established = incoming.await;
+                drop(handshake_permit);
+                match established {
                     Ok(connection) => {
                         let handshake = connection.handshake_data().and_then(|data| {
                             data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
@@ -920,6 +983,19 @@ mod tests {
         packet.push(scid.len() as u8);
         packet.extend_from_slice(scid);
         packet
+    }
+
+    #[test]
+    fn h3_fast_path_keeps_initial_packets_on_inspection_path() {
+        let v1_initial = long_header(QUIC_V1, 0xc0, b"v1initial", b"client01");
+        let v2_initial = long_header(QUIC_V2, 0xd0, b"v2initial", b"client02");
+        let v1_handshake = long_header(QUIC_V1, 0xe0, b"handshake", b"client03");
+        let short_header = [0x40, 0xaa, 0xbb, 0xcc];
+
+        assert!(is_quic_initial(&v1_initial));
+        assert!(is_quic_initial(&v2_initial));
+        assert!(!is_quic_initial(&v1_handshake));
+        assert!(!is_quic_initial(&short_header));
     }
 
     #[test]

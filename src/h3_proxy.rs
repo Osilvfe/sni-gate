@@ -5,19 +5,22 @@
 //! HTTP/3 request semantics. Request authority is re-routed per stream so H3
 //! connection coalescing can never bypass the listener's route boundaries.
 
+use std::collections::HashMap;
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Buf;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
-use tokio::sync::Notify;
-use tokio::time::timeout;
+use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
+use super::quic_runtime;
 use crate::config::{RouteType, SniPolicy};
 use crate::proxy::{upstream_certs, ListenerState, RouteRuntime};
 use crate::resolver::DynamicResolver;
@@ -26,6 +29,33 @@ use crate::router::Router;
 #[cfg(test)]
 #[path = "h3_proxy/tests.rs"]
 mod tests;
+
+static H3_CONNECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static UPSTREAM_H3_CONNECT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static UPSTREAM_H3_POOL: OnceLock<Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>>> =
+    OnceLock::new();
+
+fn h3_connection_limit() -> Arc<Semaphore> {
+    H3_CONNECTION_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(quic_runtime::limits().max_h3_connections)))
+        .clone()
+}
+
+fn upstream_h3_connect_limit() -> Arc<Semaphore> {
+    UPSTREAM_H3_CONNECT_LIMIT
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                quic_runtime::limits().max_pending_upstream_connects,
+            ))
+        })
+        .clone()
+}
+
+fn upstream_h3_pool() -> Arc<Mutex<HashMap<UpstreamPoolKey, UpstreamPoolEntry>>> {
+    UPSTREAM_H3_POOL
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
 
 #[derive(Clone)]
 struct H3ProxyContext {
@@ -38,6 +68,113 @@ struct H3ProxyContext {
     idle_timeout: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UpstreamPoolKey {
+    listener: SocketAddr,
+    route_id: usize,
+    host: String,
+    port: u16,
+    server_name: String,
+    ech: bool,
+}
+
+struct UpstreamPoolEntry {
+    upstream: UpstreamH3,
+    upstream_addr: SocketAddr,
+    closed: Arc<AtomicBool>,
+    last_used: Instant,
+}
+
+struct UpstreamIdentity {
+    host: String,
+    server_name: String,
+}
+
+struct UpstreamTarget {
+    host: String,
+    server_name: String,
+    upstream_addr: SocketAddr,
+}
+
+struct CreatedUpstream {
+    upstream: UpstreamH3,
+    closed: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct PooledUpstreamContext {
+    listener: SocketAddr,
+    route_id: usize,
+    route: Arc<RouteRuntime>,
+    handshake_sni: String,
+    peer: SocketAddr,
+    cert_resolver: Arc<DynamicResolver>,
+}
+
+#[derive(Clone)]
+enum UpstreamProvider {
+    #[cfg(test)]
+    Fixed(UpstreamH3),
+    Pooled(PooledUpstreamContext),
+}
+
+struct UpstreamLease {
+    upstream: UpstreamH3,
+    pool_key: Option<UpstreamPoolKey>,
+    pool_generation: Option<Arc<AtomicBool>>,
+}
+
+impl UpstreamProvider {
+    async fn acquire(&self) -> Result<UpstreamLease> {
+        match self {
+            #[cfg(test)]
+            Self::Fixed(upstream) => Ok(UpstreamLease {
+                upstream: upstream.clone(),
+                pool_key: None,
+                pool_generation: None,
+            }),
+            Self::Pooled(context) => {
+                let (pool_key, upstream, pool_generation) = pooled_upstream_h3(
+                    context.listener,
+                    context.route_id,
+                    &context.route,
+                    &context.handshake_sni,
+                    context.peer,
+                    &context.cert_resolver,
+                )
+                .await?;
+                Ok(UpstreamLease {
+                    upstream,
+                    pool_key: Some(pool_key),
+                    pool_generation: Some(pool_generation),
+                })
+            }
+        }
+    }
+}
+
+impl UpstreamLease {
+    async fn invalidate(self) {
+        let (Some(key), Some(generation)) = (self.pool_key, self.pool_generation) else {
+            return;
+        };
+
+        // Mark this generation unusable immediately, then remove it only if the
+        // pool still points at the same generation. A stale request from an old
+        // connection must never evict a healthy replacement inserted under the
+        // same logical key while that request was in flight.
+        generation.store(true, Ordering::Release);
+        let pool = upstream_h3_pool();
+        let mut entries = pool.lock().await;
+        let same_generation = entries
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.closed, &generation));
+        if same_generation {
+            entries.remove(&key);
+        }
+    }
+}
+
 pub async fn serve_inbound(
     connection: quinn::Connection,
     peer: SocketAddr,
@@ -45,6 +182,20 @@ pub async fn serve_inbound(
     handshake_route: usize,
     handshake_sni: String,
 ) -> Result<()> {
+    let limits = quic_runtime::limits();
+    let _connection_permit = match h3_connection_limit().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            debug!(
+                %peer,
+                max_connections = limits.max_h3_connections,
+                "rejecting H3 connection because the active connection limit is reached"
+            );
+            connection.close(0u32.into(), b"H3 connection capacity exhausted");
+            return Ok(());
+        }
+    };
+
     let route = state
         .routes
         .get(handshake_route)
@@ -59,26 +210,38 @@ pub async fn serve_inbound(
         reflects_server_name: matches!(route.sni_policy, SniPolicy::Reflect | SniPolicy::Omit),
         idle_timeout: route.idle_timeout,
     };
-
-    let upstream = connect_upstream_h3(&route, &handshake_sni, peer, &state.cert_resolver).await?;
+    let upstream = UpstreamProvider::Pooled(PooledUpstreamContext {
+        listener: state.addr,
+        route_id: handshake_route,
+        route,
+        handshake_sni,
+        peer,
+        cert_resolver: state.cert_resolver.clone(),
+    });
     proxy_inbound_h3_inner(connection, peer, context, upstream).await
 }
 
-/// Proxy an established inbound HTTP/3 connection through an already-created
-/// upstream HTTP/3 client connection. Keeping transport establishment separate
-/// from request semantics makes the latter independently testable without
-/// weakening production certificate verification.
+/// Proxy an established inbound HTTP/3 connection. Production acquires a
+/// healthy pooled upstream lazily per request; tests can inject a fixed sender.
+/// Lazy acquisition matters operationally: an unavailable upstream becomes an
+/// HTTP 502/504 for the request instead of tearing down an otherwise valid
+/// inbound QUIC connection before the H3 layer can respond.
 async fn proxy_inbound_h3_inner(
     connection: quinn::Connection,
     peer: SocketAddr,
     context: H3ProxyContext,
-    upstream: UpstreamH3,
+    upstream: UpstreamProvider,
 ) -> Result<()> {
+    let limits = quic_runtime::limits();
     let quic = h3_quinn::Connection::new(connection);
-    let mut inbound = h3::server::Connection::new(quic)
+    let mut inbound_builder = h3::server::builder();
+    inbound_builder.max_field_section_size(limits.max_field_section_size);
+    let mut inbound = inbound_builder
+        .build(quic)
         .await
         .context("starting inbound HTTP/3 connection")?;
     let activity = Arc::new(Notify::new());
+    let request_limit = Arc::new(Semaphore::new(limits.max_requests_per_connection));
     let idle_timeout = context.idle_timeout;
 
     let serve = async {
@@ -98,10 +261,16 @@ async fn proxy_inbound_h3_inner(
                     return Err(error).context("accepting HTTP/3 request");
                 }
             };
+            let request_permit = request_limit
+                .clone()
+                .acquire_owned()
+                .await
+                .context("H3 request limiter closed")?;
             let context = context.clone();
             let activity = activity.clone();
-            let mut sender = upstream.sender.clone();
+            let upstream = upstream.clone();
             tokio::spawn(async move {
+                let _request_permit = request_permit;
                 let result = async {
                     let (request, stream) = resolver
                         .resolve_request()
@@ -112,13 +281,13 @@ async fn proxy_inbound_h3_inner(
                     let authority = request
                         .uri()
                         .authority()
-                        .map(|authority| authority.host())
-                        .unwrap_or(context.handshake_sni.as_str());
-                    let request_route = context.router.match_host(authority);
+                        .map(|authority| authority.host().to_string())
+                        .unwrap_or_else(|| context.handshake_sni.clone());
+                    let request_route = context.router.match_host(&authority);
                     if !authority_reuses_upstream(
                         request_route,
                         context.handshake_route,
-                        authority,
+                        &authority,
                         &context.handshake_sni,
                         context.reflects_dial_host,
                         context.reflects_server_name,
@@ -143,11 +312,52 @@ async fn proxy_inbound_h3_inner(
                         method = %request.method(),
                         "forwarding HTTP/3 request"
                     );
-                    let upstream_stream = sender
-                        .send_request(request)
-                        .await
-                        .context("sending upstream HTTP/3 request headers")?;
-                    proxy_stream(stream, upstream_stream, &activity).await
+
+                    let lease = match upstream.acquire().await {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let status = upstream_failure_status(&error);
+                            warn!(
+                                %peer,
+                                route = %context.route_name,
+                                %authority,
+                                %status,
+                                error = %format!("{error:#}"),
+                                "upstream H3 connection unavailable"
+                            );
+                            return empty_response(stream, status).await;
+                        }
+                    };
+                    // Keep an endpoint-owning handle alive for the complete
+                    // request/response stream lifetime. The reusable pool entry
+                    // may be evicted for idleness/capacity while this request is
+                    // still transferring; eviction must not tear down an active
+                    // QUIC connection underneath its H3 RequestStream.
+                    let upstream_guard = lease.upstream.clone();
+                    let mut sender = upstream_guard.sender.clone();
+                    let upstream_stream = match sender.send_request(request).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            // A send failure means this pooled connection is no
+                            // longer safe to hand to subsequent requests. Do not
+                            // replay the current request automatically: the peer
+                            // may have received enough header bytes to make a
+                            // non-idempotent retry unsafe. Evict it and let the
+                            // next request establish a fresh connection.
+                            lease.invalidate().await;
+                            warn!(
+                                %peer,
+                                route = %context.route_name,
+                                %authority,
+                                error = %error,
+                                "pooled upstream H3 send failed; evicted connection"
+                            );
+                            return empty_response(stream, StatusCode::BAD_GATEWAY).await;
+                        }
+                    };
+                    let result = proxy_stream(stream, upstream_stream, &activity).await;
+                    drop(upstream_guard);
+                    result
                 }
                 .await;
 
@@ -197,7 +407,7 @@ async fn proxy_inbound_h3(
             reflects_server_name,
             idle_timeout: Duration::ZERO,
         },
-        upstream,
+        UpstreamProvider::Fixed(upstream),
     )
     .await
 }
@@ -227,6 +437,18 @@ fn authority_reuses_upstream(
     !(reflects_dial_host || reflects_server_name)
 }
 
+fn upstream_failure_status(error: &anyhow::Error) -> StatusCode {
+    if error.chain().any(|source| {
+        source
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    }) {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 /// Resolve only after the H3 application layer has seen no request/response
 /// headers, DATA, or trailers for `idle`. QUIC keepalives and transport ACKs do
 /// not count as application activity. Zero disables the route-level timeout.
@@ -243,6 +465,7 @@ async fn h3_idle_guard(activity: &Notify, idle: Duration) {
     }
 }
 
+#[derive(Clone)]
 struct UpstreamH3 {
     /// Keep the endpoint alive for at least as long as the H3 sender. Quinn
     /// closes all of an endpoint's connections when the last handle is dropped.
@@ -250,12 +473,119 @@ struct UpstreamH3 {
     sender: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
 }
 
-async fn connect_upstream_h3(
+async fn pooled_upstream_h3(
+    listener: SocketAddr,
+    route_id: usize,
     route: &RouteRuntime,
     handshake_sni: &str,
     peer: SocketAddr,
     cert_resolver: &Arc<DynamicResolver>,
-) -> Result<UpstreamH3> {
+) -> Result<(UpstreamPoolKey, UpstreamH3, Arc<AtomicBool>)> {
+    let limits = quic_runtime::limits();
+    let identity = upstream_identity(route, handshake_sni)?;
+    let key = UpstreamPoolKey {
+        listener,
+        route_id,
+        host: identity.host.clone(),
+        port: route.upstream_port,
+        server_name: identity.server_name.clone(),
+        ech: route.route_type == RouteType::H3Ech,
+    };
+    let pool = upstream_h3_pool();
+    let now = Instant::now();
+
+    {
+        let mut entries = pool.lock().await;
+        entries.retain(|_, entry| {
+            !entry.closed.load(Ordering::Acquire)
+                && now.duration_since(entry.last_used) < limits.upstream_pool_idle
+        });
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.last_used = now;
+            debug!(
+                %peer,
+                route = %route.name,
+                host = %identity.host,
+                upstream = %entry.upstream_addr,
+                sni = %identity.server_name,
+                "reusing pooled upstream H3 connection"
+            );
+            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
+        }
+    }
+
+    let _connect_permit = timeout(
+        route.connect_timeout,
+        upstream_h3_connect_limit().acquire_owned(),
+    )
+    .await
+    .context("waiting for upstream H3 connect capacity timed out")?
+    .context("upstream H3 connect limiter closed")?;
+
+    // A request that arrived while the connect limiter was saturated may find
+    // that another request populated this key while it waited. Re-check before
+    // paying for DNS and another QUIC/TLS/H3 handshake.
+    let now = Instant::now();
+    {
+        let mut entries = pool.lock().await;
+        entries.retain(|_, entry| {
+            !entry.closed.load(Ordering::Acquire)
+                && now.duration_since(entry.last_used) < limits.upstream_pool_idle
+        });
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.last_used = now;
+            debug!(
+                %peer,
+                route = %route.name,
+                host = %identity.host,
+                upstream = %entry.upstream_addr,
+                sni = %identity.server_name,
+                "reusing upstream H3 connection after connect-capacity wait"
+            );
+            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
+        }
+    }
+
+    let target = resolve_upstream_target(route, &identity).await?;
+    let created =
+        connect_upstream_h3_target(route, handshake_sni, peer, cert_resolver, &target).await?;
+
+    let mut entries = pool.lock().await;
+    // Another task may have connected the same logical key while we were
+    // resolving/handshaking. Prefer its healthy connection and let our
+    // duplicate drop naturally.
+    if let Some(entry) = entries.get_mut(&key) {
+        if !entry.closed.load(Ordering::Acquire) {
+            entry.last_used = Instant::now();
+            return Ok((key, entry.upstream.clone(), entry.closed.clone()));
+        }
+        entries.remove(&key);
+    }
+
+    if entries.len() >= limits.max_upstream_pool_entries {
+        if let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest);
+        }
+    }
+    let upstream = created.upstream.clone();
+    let generation = created.closed.clone();
+    entries.insert(
+        key.clone(),
+        UpstreamPoolEntry {
+            upstream: created.upstream,
+            upstream_addr: target.upstream_addr,
+            closed: created.closed,
+            last_used: Instant::now(),
+        },
+    );
+    Ok((key, upstream, generation))
+}
+
+fn upstream_identity(route: &RouteRuntime, handshake_sni: &str) -> Result<UpstreamIdentity> {
     let host = route
         .upstream_host
         .clone()
@@ -273,18 +603,39 @@ async fn connect_upstream_h3(
         }
         SniPolicy::Reflect | SniPolicy::Omit => host.clone(),
     };
+    Ok(UpstreamIdentity { host, server_name })
+}
+
+async fn resolve_upstream_target(
+    route: &RouteRuntime,
+    identity: &UpstreamIdentity,
+) -> Result<UpstreamTarget> {
     let upstream_addr = route
         .addr_resolver
         .lookup_addr(
-            &host,
+            &identity.host,
             route.upstream_port,
             route.address_family,
             route.nat64.as_ref(),
         )
         .await
-        .with_context(|| format!("resolving H3 upstream {host}"))?;
+        .with_context(|| format!("resolving H3 upstream {}", identity.host))?;
 
-    let bind_addr = match upstream_addr.ip() {
+    Ok(UpstreamTarget {
+        host: identity.host.clone(),
+        server_name: identity.server_name.clone(),
+        upstream_addr,
+    })
+}
+
+async fn connect_upstream_h3_target(
+    route: &RouteRuntime,
+    handshake_sni: &str,
+    peer: SocketAddr,
+    cert_resolver: &Arc<DynamicResolver>,
+    target: &UpstreamTarget,
+) -> Result<CreatedUpstream> {
+    let bind_addr = match target.upstream_addr.ip() {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
@@ -303,14 +654,21 @@ async fn connect_upstream_h3(
             connect_quinn(
                 &endpoint,
                 quinn::ClientConfig::new(Arc::new(crypto)),
-                upstream_addr,
-                &server_name,
+                target.upstream_addr,
+                &target.server_name,
                 route.connect_timeout,
             )
             .await?
         }
         RouteType::H3Ech => {
-            connect_ech_quinn(&endpoint, upstream_addr, &server_name, route, peer).await?
+            connect_ech_quinn(
+                &endpoint,
+                target.upstream_addr,
+                &target.server_name,
+                route,
+                peer,
+            )
+            .await?
         }
         _ => return Err(anyhow!("route {} is not an HTTP/3 route", route.name)),
     };
@@ -343,18 +701,25 @@ async fn connect_upstream_h3(
     debug!(
         %peer,
         route = %route.name,
-        upstream = %upstream_addr,
-        sni = %server_name,
+        host = %target.host,
+        upstream = %target.upstream_addr,
+        sni = %target.server_name,
         "upstream H3 connection established"
     );
 
     let quic = h3_quinn::Connection::new(connection);
-    let (mut driver, sender) = h3::client::new(quic)
+    let mut upstream_builder = h3::client::builder();
+    upstream_builder.max_field_section_size(quic_runtime::limits().max_field_section_size);
+    let (mut driver, sender) = upstream_builder
+        .build(quic)
         .await
         .context("starting upstream HTTP/3 client")?;
     let route_name = route.name.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let driver_closed = closed.clone();
     tokio::spawn(async move {
         let close = poll_fn(|cx| driver.poll_close(cx)).await;
+        driver_closed.store(true, Ordering::Release);
         if close.is_h3_no_error() {
             debug!(route = %route_name, "upstream H3 driver closed normally");
         } else {
@@ -366,9 +731,12 @@ async fn connect_upstream_h3(
         }
     });
 
-    Ok(UpstreamH3 {
-        _endpoint: endpoint,
-        sender,
+    Ok(CreatedUpstream {
+        upstream: UpstreamH3 {
+            _endpoint: endpoint,
+            sender,
+        },
+        closed,
     })
 }
 
@@ -384,7 +752,7 @@ async fn connect_quinn(
         .with_context(|| format!("starting H3 QUIC connection to {server_name}"))?;
     timeout(connect_timeout, connecting)
         .await
-        .map_err(|_| anyhow!("upstream H3 QUIC handshake timed out"))?
+        .context("upstream H3 QUIC handshake timed out")?
         .context("upstream H3 QUIC handshake")
 }
 

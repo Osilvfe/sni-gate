@@ -1,0 +1,56 @@
+# QUIC / HTTP/3 runtime policy
+
+The public route model stays transport-agnostic: `tls`, `ech`, `raw`, and `http` keep the same meaning in configuration, while a QUIC listener maps terminating `tls` / `ech` routes to HTTP/3 internally.
+
+Resource limits for the QUIC/H3 data path are deliberately **process-wide runtime policy**, not route-level `[http3]` settings. `[http3]` controls automatic UDP companion generation and inherits through the normal config hierarchy; admission, pooling, and memory limits must not accidentally vary per route.
+
+## Runtime environment variables
+
+All values are parsed once when the first QUIC listener starts. Invalid or zero values fail startup. Omitting a variable keeps the production default.
+
+| Environment variable | Default | Purpose |
+|---|---:|---|
+| `SNI_GATE_QUIC_MAX_PENDING_HANDSHAKES` | `256` | Maximum simultaneous inbound QUIC handshakes. When saturated, unvalidated peers receive stateless Retry and already-validated peers are refused. |
+| `SNI_GATE_QUIC_MAX_H3_CONNECTIONS` | `1024` | Maximum active terminating HTTP/3 connections across the process. |
+| `SNI_GATE_QUIC_MAX_REQUESTS_PER_CONNECTION` | `256` | Maximum concurrent semantic HTTP/3 request tasks on one inbound connection. Further requests are backpressured until capacity is available. |
+| `SNI_GATE_QUIC_MAX_FIELD_SECTION_SIZE` | `65536` | HTTP/3 field-section limit in bytes advertised/applied by both inbound server and upstream client H3 builders. |
+| `SNI_GATE_QUIC_MAX_UPSTREAM_POOL_ENTRIES` | `256` | Maximum number of reusable upstream HTTP/3 connections retained by the process. |
+| `SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS` | `60` | Idle age in seconds after which a reusable upstream H3 pool entry is discarded. Active request streams keep their endpoint alive even if the reusable pool entry is evicted. |
+| `SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS` | `64` | Maximum simultaneous upstream DNS + UDP bind + QUIC/TLS/ECH/H3 establishment operations. Waiting for this capacity is bounded by the route's existing `connect_timeout`. |
+
+Example:
+
+```sh
+SNI_GATE_QUIC_MAX_H3_CONNECTIONS=4096 \
+SNI_GATE_QUIC_MAX_PENDING_HANDSHAKES=512 \
+SNI_GATE_QUIC_MAX_UPSTREAM_POOL_ENTRIES=512 \
+SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS=120 \
+./sni-gate --config sni-gate.toml
+```
+
+These are capacity controls rather than performance targets. Raising them increases the maximum amount of live QUIC/H3 state the process may retain; tune them together with OS UDP socket buffers, memory limits, and expected concurrency.
+
+## Upstream HTTP/3 pooling
+
+Terminating H3 requests acquire upstream connections lazily. Healthy connections are pooled by listener, route, logical dial host/port, upstream TLS server name, and ECH mode. A pool hit happens before DNS resolution, so normal reuse avoids both DNS and a fresh QUIC/TLS/H3 handshake.
+
+Closed or idle entries are removed, and cold-start/upstream-outage connection storms are bounded by `SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS`. After waiting for connect capacity, the pool is checked again before DNS/handshake so concurrent misses can reuse a connection another request established while they waited.
+
+A request that already opened an upstream stream holds an endpoint-owning guard for the complete stream lifetime. Pool eviction therefore affects only future reuse and does not terminate an active response. Failed stale leases are generation-checked before eviction so an old request cannot remove a newer healthy replacement stored under the same logical pool key.
+
+Upstream acquisition timeout returns HTTP `504`; other acquisition failures return `502`. A `send_request` failure evicts that specific pooled generation and returns `502`. The proxy intentionally does not automatically replay the current request because replay can be unsafe for non-idempotent methods.
+
+## Shared UDP fast path
+
+A QUIC listener containing only terminating `tls` / `ech` routes uses an H3-only fast path:
+
+- QUIC Initial packets still enter the stateless SNI inspection path.
+- Handshake, 0-RTT, 1-RTT/short-header, and other non-Initial datagrams are sent directly to Quinn ingress without taking the raw `FlowTable` mutex.
+
+The fast path is **disabled whenever any `raw` route is present**. Mixed raw + H3 listeners continue to use conservative CID/flow ownership logic for every datagram, preserving transparent raw routing and avoiding accidental capture of raw traffic by the terminating endpoint.
+
+## Defaults and compatibility
+
+The defaults above are the same hardening values used before runtime configurability was added. Leaving every `SNI_GATE_QUIC_*` variable unset therefore preserves existing behavior.
+
+The runtime policy is intentionally separate from `[http3] enabled = true`: the latter decides whether automatic QUIC companion listeners exist; the former controls process resource budgets once QUIC/H3 traffic is running.

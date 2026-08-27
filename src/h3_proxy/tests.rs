@@ -8,9 +8,13 @@ use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response, StatusCode};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use tokio::time::timeout;
+use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 
-use super::{authority_reuses_upstream, proxy_inbound_h3, Router, UpstreamH3};
+use super::{
+    authority_reuses_upstream, proxy_inbound_h3, upstream_failure_status, Router, UpstreamH3,
+    UpstreamPoolKey,
+};
 
 const FRONT_SNI: &str = "front.h3.test";
 const SIBLING_SNI: &str = "sibling.h3.test";
@@ -61,6 +65,168 @@ fn same_route_coalescing_requires_stable_upstream_identity() {
         false,
         false
     ));
+}
+
+#[test]
+fn upstream_pool_key_is_scoped_by_route_and_tls_identity() {
+    let base = UpstreamPoolKey {
+        listener: "127.0.0.1:443".parse().unwrap(),
+        route_id: 3,
+        host: "origin.example".to_string(),
+        port: 443,
+        server_name: "origin.example".to_string(),
+        ech: false,
+    };
+
+    assert_eq!(base, base.clone());
+
+    let mut other_route = base.clone();
+    other_route.route_id += 1;
+    assert_ne!(base, other_route);
+
+    let mut other_host = base.clone();
+    other_host.host = "other.example".to_string();
+    assert_ne!(base, other_host);
+
+    let mut other_tls_name = base.clone();
+    other_tls_name.server_name = "tls.example".to_string();
+    assert_ne!(base, other_tls_name);
+
+    let mut ech = base.clone();
+    ech.ech = true;
+    assert_ne!(base, ech);
+}
+
+#[tokio::test]
+async fn upstream_failures_map_to_gateway_statuses() {
+    let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .expect_err("zero timeout should elapse");
+    let timeout_error = anyhow::Error::new(elapsed);
+    assert_eq!(
+        upstream_failure_status(&timeout_error),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+
+    let ordinary_error = anyhow::anyhow!("upstream refused connection");
+    assert_eq!(
+        upstream_failure_status(&ordinary_error),
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_handle_clone_keeps_active_request_alive() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec![UPSTREAM_SNI.to_string()])
+            .expect("generate upstream lifetime test certificate");
+    let cert_der = cert.der().clone();
+    let key_der = signing_key.serialize_der();
+
+    let server_endpoint = quinn::Endpoint::server(
+        h3_server_config(cert_der.clone(), key_der),
+        localhost_ephemeral(),
+    )
+    .expect("bind upstream lifetime test server");
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let (response_observed_tx, response_observed_rx) = oneshot::channel();
+    let server_task = tokio::spawn({
+        let endpoint = server_endpoint.clone();
+        async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("lifetime test QUIC connection")
+                .await
+                .expect("lifetime test QUIC handshake");
+            let mut h3 =
+                h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection))
+                    .await
+                    .expect("start lifetime test H3 server");
+            let resolver = h3
+                .accept()
+                .await
+                .expect("accept lifetime test H3 request")
+                .expect("one lifetime test request");
+            let (_, mut stream) = resolver
+                .resolve_request()
+                .await
+                .expect("resolve lifetime test request");
+            while stream
+                .recv_data()
+                .await
+                .expect("read lifetime test request body")
+                .is_some()
+            {}
+
+            // Give the client time to drop the original pool-owned handle. The
+            // request-scoped clone must keep the Quinn endpoint alive here.
+            sleep(Duration::from_millis(75)).await;
+            let response = Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(())
+                .unwrap();
+            stream
+                .send_response(response)
+                .await
+                .expect("send lifetime test response");
+            stream
+                .finish()
+                .await
+                .expect("finish lifetime test response");
+
+            // Keep the H3 connection itself alive until the client has actually
+            // observed the response. Otherwise a graceful H3_NO_ERROR close can
+            // race delivery and turn this endpoint-lifetime test into a server-
+            // shutdown timing test.
+            let _ = response_observed_rx.await;
+        }
+    });
+
+    let client_endpoint =
+        quinn::Endpoint::client(localhost_ephemeral()).expect("bind lifetime test client");
+    let connection = client_endpoint
+        .connect_with(h3_client_config(cert_der), server_addr, UPSTREAM_SNI)
+        .expect("start lifetime test upstream QUIC connection")
+        .await
+        .expect("lifetime test upstream QUIC handshake");
+    let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("start lifetime test H3 client");
+    let driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let pooled_handle = UpstreamH3 {
+        _endpoint: client_endpoint,
+        sender,
+    };
+    let request_guard = pooled_handle.clone();
+    let mut request_sender = request_guard.sender.clone();
+    let request = Request::get(format!("https://{UPSTREAM_SNI}/lifetime"))
+        .body(())
+        .unwrap();
+    let mut stream = request_sender
+        .send_request(request)
+        .await
+        .expect("open lifetime test H3 request");
+    stream.finish().await.expect("finish lifetime test request");
+
+    drop(request_sender);
+    drop(pooled_handle);
+
+    let response = timeout(Duration::from_secs(2), stream.recv_response())
+        .await
+        .expect("active request should survive pool-handle eviction")
+        .expect("receive lifetime test response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let _ = response_observed_tx.send(());
+
+    drop(request_guard);
+    server_task.await.expect("lifetime test server task");
+    driver_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
