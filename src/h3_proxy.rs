@@ -983,15 +983,7 @@ async fn connect_ech_quinn(
             .context("converting H3 ECH rustls config to Quinn")?;
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
         config.transport_config(transport.clone());
-        match connect_quinn(
-            endpoint,
-            config,
-            addr,
-            inner,
-            route.connect_timeout,
-        )
-        .await
-        {
+        match connect_quinn(endpoint, config, addr, inner, route.connect_timeout).await {
             Ok(connection) => {
                 debug!(%peer, route = %route.name, attempt, "H3 ECH handshake established");
                 return Ok(connection);
