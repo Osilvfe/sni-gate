@@ -20,6 +20,8 @@ pub const DEFAULT_MAX_UPSTREAM_POOL_ENTRIES: usize = 256;
 pub const DEFAULT_UPSTREAM_POOL_IDLE: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_PENDING_UPSTREAM_CONNECTS: usize = 64;
 pub const DEFAULT_MAX_H3_INGRESS_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_RAW_FLOWS: usize = 4096;
+pub const DEFAULT_MAX_PENDING_RAW_CONNECTS: usize = 64;
 pub const DEFAULT_MAX_RAW_FORWARDING_BYTES: usize = 64 * 1024 * 1024;
 
 const ENV_MAX_PENDING_HANDSHAKES: &str = "SNI_GATE_QUIC_MAX_PENDING_HANDSHAKES";
@@ -30,6 +32,8 @@ const ENV_MAX_UPSTREAM_POOL_ENTRIES: &str = "SNI_GATE_QUIC_MAX_UPSTREAM_POOL_ENT
 const ENV_UPSTREAM_POOL_IDLE_SECS: &str = "SNI_GATE_QUIC_UPSTREAM_POOL_IDLE_SECS";
 const ENV_MAX_PENDING_UPSTREAM_CONNECTS: &str = "SNI_GATE_QUIC_MAX_PENDING_UPSTREAM_CONNECTS";
 const ENV_MAX_H3_INGRESS_BYTES: &str = "SNI_GATE_QUIC_MAX_H3_INGRESS_BYTES";
+const ENV_MAX_RAW_FLOWS: &str = "SNI_GATE_QUIC_MAX_RAW_FLOWS";
+const ENV_MAX_PENDING_RAW_CONNECTS: &str = "SNI_GATE_QUIC_MAX_PENDING_RAW_CONNECTS";
 const ENV_MAX_RAW_FORWARDING_BYTES: &str = "SNI_GATE_QUIC_MAX_RAW_FORWARDING_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +46,8 @@ pub struct QuicRuntimeLimits {
     pub upstream_pool_idle: Duration,
     pub max_pending_upstream_connects: usize,
     pub max_h3_ingress_bytes: usize,
+    pub max_raw_flows: usize,
+    pub max_pending_raw_connects: usize,
     pub max_raw_forwarding_bytes: usize,
 }
 
@@ -56,6 +62,8 @@ impl Default for QuicRuntimeLimits {
             upstream_pool_idle: DEFAULT_UPSTREAM_POOL_IDLE,
             max_pending_upstream_connects: DEFAULT_MAX_PENDING_UPSTREAM_CONNECTS,
             max_h3_ingress_bytes: DEFAULT_MAX_H3_INGRESS_BYTES,
+            max_raw_flows: DEFAULT_MAX_RAW_FLOWS,
+            max_pending_raw_connects: DEFAULT_MAX_PENDING_RAW_CONNECTS,
             max_raw_forwarding_bytes: DEFAULT_MAX_RAW_FORWARDING_BYTES,
         }
     }
@@ -64,6 +72,8 @@ impl Default for QuicRuntimeLimits {
 static LIMITS: OnceLock<QuicRuntimeLimits> = OnceLock::new();
 static INBOUND_HANDSHAKE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static H3_INGRESS_BYTE_BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
+static RAW_FLOW_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static RAW_CONNECT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static RAW_FORWARDING_BYTE_BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
 
 /// A non-blocking, process-wide byte budget. The owned permit is stored beside
@@ -133,6 +143,18 @@ pub fn h3_ingress_byte_budget() -> Arc<ByteBudget> {
         .clone()
 }
 
+pub fn raw_flow_limit() -> Arc<Semaphore> {
+    RAW_FLOW_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(limits().max_raw_flows)))
+        .clone()
+}
+
+pub fn raw_connect_limit() -> Arc<Semaphore> {
+    RAW_CONNECT_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(limits().max_pending_raw_connects)))
+        .clone()
+}
+
 pub fn raw_forwarding_byte_budget() -> Arc<ByteBudget> {
     RAW_FORWARDING_BYTE_BUDGET
         .get_or_init(|| Arc::new(ByteBudget::new(limits().max_raw_forwarding_bytes)))
@@ -174,6 +196,11 @@ impl QuicRuntimeLimits {
             max_h3_ingress_bytes: parse_byte_budget(
                 ENV_MAX_H3_INGRESS_BYTES,
                 defaults.max_h3_ingress_bytes,
+            )?,
+            max_raw_flows: parse_positive_usize(ENV_MAX_RAW_FLOWS, defaults.max_raw_flows)?,
+            max_pending_raw_connects: parse_positive_usize(
+                ENV_MAX_PENDING_RAW_CONNECTS,
+                defaults.max_pending_raw_connects,
             )?,
             max_raw_forwarding_bytes: parse_byte_budget(
                 ENV_MAX_RAW_FORWARDING_BYTES,
@@ -242,6 +269,8 @@ mod tests {
         assert_eq!(limits.upstream_pool_idle, Duration::from_secs(60));
         assert_eq!(limits.max_pending_upstream_connects, 64);
         assert_eq!(limits.max_h3_ingress_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.max_raw_flows, 4096);
+        assert_eq!(limits.max_pending_raw_connects, 64);
         assert_eq!(limits.max_raw_forwarding_bytes, 64 * 1024 * 1024);
     }
 
@@ -265,6 +294,8 @@ mod tests {
             &h3_ingress_byte_budget(),
             &h3_ingress_byte_budget()
         ));
+        assert!(Arc::ptr_eq(&raw_flow_limit(), &raw_flow_limit()));
+        assert!(Arc::ptr_eq(&raw_connect_limit(), &raw_connect_limit()));
         assert!(Arc::ptr_eq(
             &raw_forwarding_byte_budget(),
             &raw_forwarding_byte_budget()
