@@ -2,6 +2,8 @@
 
 #[path = "h3_proxy.rs"]
 mod h3_proxy;
+#[path = "quic_runtime.rs"]
+mod quic_runtime;
 #[path = "quic_socket.rs"]
 mod quic_socket;
 
@@ -28,7 +30,6 @@ const MAX_INITIAL_BYTES: usize = 32 * 1024;
 const MAX_FLOWS: usize = 4096;
 const MAX_INSPECTING_FLOWS: usize = 256;
 const MAX_INSPECTION_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PENDING_H3_HANDSHAKES: usize = 256;
 const MAX_CID_LEN: usize = 20;
 const MAX_CIDS_PER_FLOW: usize = 32;
 const INITIAL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -268,7 +269,7 @@ impl FlowTable {
     }
 
     fn migrate_peer(&mut self, id: FlowId, new_peer: SocketAddr) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
+        let Some(entry) = self.entries.get_mut(id) else {
             return false;
         };
         let old_peer = entry.peer;
@@ -487,6 +488,7 @@ fn warn_unsupported_fail_policies(state: &ListenerState) {
 
 /// Serve one UDP/QUIC listener.
 pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
+    let limits = quic_runtime::init_from_env().context("loading QUIC runtime limits")?;
     let listener = Arc::new(
         UdpSocket::bind(state.addr)
             .await
@@ -503,6 +505,8 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
         addr = %state.addr,
         routes = state.routes.len(),
         h3 = h3_ingress.is_some(),
+        max_pending_h3_handshakes = limits.max_pending_handshakes,
+        max_h3_connections = limits.max_h3_connections,
         "QUIC listening"
     );
 
@@ -704,7 +708,8 @@ fn start_h3_endpoint(
     .context("creating shared Quinn endpoint")?;
 
     let accept_endpoint = endpoint.clone();
-    let handshake_limit = Arc::new(Semaphore::new(MAX_PENDING_H3_HANDSHAKES));
+    let max_pending_handshakes = quic_runtime::limits().max_pending_handshakes;
+    let handshake_limit = Arc::new(Semaphore::new(max_pending_handshakes));
     tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
             let handshake_permit = match handshake_limit.clone().try_acquire_owned() {
@@ -716,7 +721,7 @@ fn start_h3_endpoint(
                             Ok(()) => {
                                 debug!(
                                     %peer,
-                                    max_pending = MAX_PENDING_H3_HANDSHAKES,
+                                    max_pending = max_pending_handshakes,
                                     "sent QUIC Retry because H3 handshake capacity is exhausted"
                                 );
                             }
@@ -724,7 +729,7 @@ fn start_h3_endpoint(
                                 error.into_incoming().refuse();
                                 debug!(
                                     %peer,
-                                    max_pending = MAX_PENDING_H3_HANDSHAKES,
+                                    max_pending = max_pending_handshakes,
                                     "refused QUIC handshake after Retry became unavailable"
                                 );
                             }
@@ -733,7 +738,7 @@ fn start_h3_endpoint(
                         incoming.refuse();
                         debug!(
                             %peer,
-                            max_pending = MAX_PENDING_H3_HANDSHAKES,
+                            max_pending = max_pending_handshakes,
                             "refused validated QUIC handshake because H3 handshake capacity is exhausted"
                         );
                     }
