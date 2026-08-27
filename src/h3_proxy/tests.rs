@@ -10,7 +10,9 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::time::timeout;
 
-use super::{authority_reuses_upstream, proxy_inbound_h3, Router, UpstreamH3};
+use super::{
+    authority_reuses_upstream, proxy_inbound_h3, upstream_failure_status, Router, UpstreamH3,
+};
 
 const FRONT_SNI: &str = "front.h3.test";
 const SIBLING_SNI: &str = "sibling.h3.test";
@@ -61,6 +63,24 @@ fn same_route_coalescing_requires_stable_upstream_identity() {
         false,
         false
     ));
+}
+
+#[tokio::test]
+async fn upstream_failures_map_to_gateway_statuses() {
+    let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .expect_err("zero timeout should elapse");
+    let timeout_error = anyhow::Error::new(elapsed);
+    assert_eq!(
+        upstream_failure_status(&timeout_error),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+
+    let ordinary_error = anyhow::anyhow!("upstream refused connection");
+    assert_eq!(
+        upstream_failure_status(&ordinary_error),
+        StatusCode::BAD_GATEWAY
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
