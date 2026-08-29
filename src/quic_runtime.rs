@@ -165,15 +165,15 @@ impl QuicRuntimeLimits {
     fn from_env() -> Result<Self> {
         let defaults = Self::default();
         Ok(Self {
-            max_pending_handshakes: parse_positive_usize(
+            max_pending_handshakes: parse_semaphore_limit(
                 ENV_MAX_PENDING_HANDSHAKES,
                 defaults.max_pending_handshakes,
             )?,
-            max_h3_connections: parse_positive_usize(
+            max_h3_connections: parse_semaphore_limit(
                 ENV_MAX_H3_CONNECTIONS,
                 defaults.max_h3_connections,
             )?,
-            max_requests_per_connection: parse_positive_usize(
+            max_requests_per_connection: parse_semaphore_limit(
                 ENV_MAX_REQUESTS_PER_CONNECTION,
                 defaults.max_requests_per_connection,
             )?,
@@ -181,7 +181,7 @@ impl QuicRuntimeLimits {
                 ENV_MAX_FIELD_SECTION_SIZE,
                 defaults.max_field_section_size,
             )?,
-            max_upstream_pool_entries: parse_positive_usize(
+            max_upstream_pool_entries: parse_semaphore_limit(
                 ENV_MAX_UPSTREAM_POOL_ENTRIES,
                 defaults.max_upstream_pool_entries,
             )?,
@@ -189,20 +189,20 @@ impl QuicRuntimeLimits {
                 ENV_UPSTREAM_POOL_IDLE_SECS,
                 defaults.upstream_pool_idle.as_secs(),
             )?),
-            max_pending_upstream_connects: parse_positive_usize(
+            max_pending_upstream_connects: parse_semaphore_limit(
                 ENV_MAX_PENDING_UPSTREAM_CONNECTS,
                 defaults.max_pending_upstream_connects,
             )?,
-            max_h3_ingress_bytes: parse_byte_budget(
+            max_h3_ingress_bytes: parse_semaphore_limit(
                 ENV_MAX_H3_INGRESS_BYTES,
                 defaults.max_h3_ingress_bytes,
             )?,
-            max_raw_flows: parse_positive_usize(ENV_MAX_RAW_FLOWS, defaults.max_raw_flows)?,
-            max_pending_raw_connects: parse_positive_usize(
+            max_raw_flows: parse_semaphore_limit(ENV_MAX_RAW_FLOWS, defaults.max_raw_flows)?,
+            max_pending_raw_connects: parse_semaphore_limit(
                 ENV_MAX_PENDING_RAW_CONNECTS,
                 defaults.max_pending_raw_connects,
             )?,
-            max_raw_forwarding_bytes: parse_byte_budget(
+            max_raw_forwarding_bytes: parse_semaphore_limit(
                 ENV_MAX_RAW_FORWARDING_BYTES,
                 defaults.max_raw_forwarding_bytes,
             )?,
@@ -210,8 +210,12 @@ impl QuicRuntimeLimits {
     }
 }
 
-fn parse_byte_budget(name: &str, default: usize) -> Result<usize> {
+fn parse_semaphore_limit(name: &str, default: usize) -> Result<usize> {
     let value = parse_positive_usize(name, default)?;
+    validate_semaphore_limit(name, value)
+}
+
+fn validate_semaphore_limit(name: &str, value: usize) -> Result<usize> {
     if value > Semaphore::MAX_PERMITS {
         return Err(anyhow!("{name} must not exceed {}", Semaphore::MAX_PERMITS));
     }
@@ -272,6 +276,20 @@ mod tests {
         assert_eq!(limits.max_raw_flows, 4096);
         assert_eq!(limits.max_pending_raw_connects, 64);
         assert_eq!(limits.max_raw_forwarding_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn semaphore_limits_accept_maximum_and_reject_larger_values() {
+        assert_eq!(
+            validate_semaphore_limit("TEST_LIMIT", Semaphore::MAX_PERMITS).unwrap(),
+            Semaphore::MAX_PERMITS
+        );
+        let too_large = Semaphore::MAX_PERMITS.checked_add(1).unwrap();
+        let error = validate_semaphore_limit("TEST_LIMIT", too_large).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("TEST_LIMIT must not exceed {}", Semaphore::MAX_PERMITS)
+        );
     }
 
     #[test]
