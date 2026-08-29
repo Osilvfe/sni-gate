@@ -312,13 +312,11 @@ impl FlowTable {
         self.entries.get(&id).map(|entry| entry.peer)
     }
 
-    fn migrate_peer(&mut self, id: FlowId, new_peer: SocketAddr) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
+    fn migrate_peer(&mut self, id: FlowId, new_peer: SocketAddr) -> Option<SocketAddr> {
+        let entry = self.entries.get_mut(&id)?;
         let old_peer = entry.peer;
         if old_peer == new_peer {
-            return false;
+            return None;
         }
         entry.peer = new_peer;
         let peer_tx = match &entry.state {
@@ -339,7 +337,7 @@ impl FlowTable {
         if let Some(peer_tx) = peer_tx {
             let _ = peer_tx.send(new_peer);
         }
-        true
+        Some(old_peer)
     }
 
     fn add_routing_cid(&mut self, id: FlowId, cid: &[u8], short_header: bool) {
@@ -662,13 +660,18 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                         if let Some(ingress) = &h3_ingress {
                             dispatch_to_h3(ingress, peer, datagram);
                         } else {
-                            debug!(%peer, "dropping QUIC datagram with no known raw flow/CID");
+                            debug!(
+                                %peer,
+                                reason = "unknown_raw_flow_or_cid",
+                                "dropping QUIC datagram with no known raw flow/CID"
+                            );
                         }
                         continue;
                     };
                     if !table.make_room_for_inspecting() {
                         warn!(
                             %peer,
+                            reason = "inspection_capacity_exhausted",
                             max_flows = MAX_FLOWS,
                             max_inspecting = MAX_INSPECTING_FLOWS,
                             max_inspection_bytes = MAX_INSPECTION_BYTES,
@@ -680,8 +683,13 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                 }
             };
 
-            if table.migrate_peer(id, peer) {
-                debug!(%peer, flow_id = id, "QUIC flow client address changed");
+            if let Some(old_peer) = table.migrate_peer(id, peer) {
+                debug!(
+                    flow_id = id,
+                    %old_peer,
+                    new_peer = %peer,
+                    "QUIC flow client address changed"
+                );
             }
 
             if let Some(tx) = table.forwarding_sender(id) {
@@ -695,6 +703,7 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                     debug!(
                         %peer,
                         flow_id = id,
+                        reason = "inspection_memory_exhausted",
                         inspection_bytes,
                         max_inspection_bytes = MAX_INSPECTION_BYTES,
                         "dropping QUIC Initial flow because global inspection memory budget was exceeded"
@@ -717,7 +726,12 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                                     "forwarding statelessly-uninspectable QUIC Initial to H3 endpoint"
                                 );
                             } else {
-                                debug!(%peer, flow_id = id, "dropping malformed or oversized QUIC Initial flight");
+                                debug!(
+                                    %peer,
+                                    flow_id = id,
+                                    reason = "invalid_initial_flight",
+                                    "dropping malformed or oversized QUIC Initial flight"
+                                );
                             }
                             None
                         }
@@ -739,6 +753,7 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
                     debug!(
                         %peer,
                         flow_id,
+                        reason = "raw_forwarding_byte_budget_exhausted",
                         bytes = datagram.len(),
                         max_bytes = raw_forwarding_budget.capacity(),
                         "dropping QUIC datagram because raw forwarding byte budget is exhausted"
@@ -749,9 +764,20 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
             match tx.try_send(queued) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
-                    debug!(%peer, flow_id, "dropping QUIC datagram because raw flow queue is full");
+                    debug!(
+                        %peer,
+                        flow_id,
+                        reason = "raw_flow_queue_full",
+                        "dropping QUIC datagram because raw flow queue is full"
+                    );
                 }
                 Err(TrySendError::Closed(_)) => {
+                    debug!(
+                        %peer,
+                        flow_id,
+                        reason = "raw_flow_queue_closed",
+                        "dropping QUIC datagram because raw flow queue is closed"
+                    );
                     flows.lock().await.remove(flow_id);
                 }
             }
@@ -768,7 +794,13 @@ pub async fn serve(state: Arc<ListenerState>) -> Result<()> {
         };
         let Some(route_id) = route_id else {
             flows.lock().await.remove(flow_id);
-            debug!(%peer, flow_id, sni = %display_sni(&sni), "unmatched QUIC Initial");
+            debug!(
+                %peer,
+                flow_id,
+                reason = "unmatched_sni",
+                sni = %display_sni(&sni),
+                "unmatched QUIC Initial"
+            );
             continue;
         };
         let route = state.routes[route_id].clone();
@@ -1024,6 +1056,7 @@ async fn spawn_raw_flow(
             flows.lock().await.remove(flow_id);
             debug!(
                 flow_id,
+                reason = "raw_flow_capacity_exhausted",
                 max_raw_flows = quic_runtime::limits().max_raw_flows,
                 "dropping QUIC raw flow because process-wide active flow capacity is exhausted"
             );
@@ -1036,6 +1069,7 @@ async fn spawn_raw_flow(
             flows.lock().await.remove(flow_id);
             debug!(
                 flow_id,
+                reason = "raw_connect_capacity_exhausted",
                 max_pending = quic_runtime::limits().max_pending_raw_connects,
                 "dropping QUIC raw flow because upstream setup capacity is exhausted"
             );
@@ -1051,6 +1085,7 @@ async fn spawn_raw_flow(
                 flows.lock().await.remove(flow_id);
                 debug!(
                     flow_id,
+                    reason = "raw_setup_byte_budget_exhausted",
                     bytes = packet.len(),
                     max_bytes = byte_budget.capacity(),
                     "dropping QUIC raw flow because forwarding byte budget is exhausted during upstream setup"
@@ -1451,7 +1486,8 @@ mod tests {
 
         let packet = long_header(QUIC_V1, 0xe0, server_cid, b"client02");
         assert_eq!(flows.flow_id_for(new_peer, &packet, true), Some(id));
-        assert!(flows.migrate_peer(id, new_peer));
+        assert_eq!(flows.migrate_peer(id, new_peer), Some(old_peer));
+        assert_eq!(flows.migrate_peer(id, new_peer), None);
         assert_eq!(*peer_rx.borrow(), new_peer);
         assert_eq!(flows.unique_peer_owner(old_peer), None);
         assert_eq!(flows.unique_peer_owner(new_peer), Some(id));
