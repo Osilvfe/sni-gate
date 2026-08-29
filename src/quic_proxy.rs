@@ -313,9 +313,7 @@ impl FlowTable {
     }
 
     fn migrate_peer(&mut self, id: FlowId, new_peer: SocketAddr) -> Option<SocketAddr> {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return None;
-        };
+        let entry = self.entries.get_mut(&id)?;
         let old_peer = entry.peer;
         if old_peer == new_peer {
             return None;
