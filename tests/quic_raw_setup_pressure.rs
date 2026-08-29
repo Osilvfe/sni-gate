@@ -19,7 +19,9 @@ const FLOOD_SNI: &str = "flood.raw-pressure.test";
 const HEALTHY_SNI: &str = "healthy.raw-pressure.test";
 const FLOOD_ATTEMPTS: usize = 1024;
 const MAX_PENDING_RAW_CONNECTS: usize = 64;
-const FLOOD_WINDOW: Duration = Duration::from_secs(1);
+const FLOOD_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const FLOOD_WINDOW: Duration = Duration::from_millis(500);
+const MIN_EXPECTED_RECOVERY: Duration = Duration::from_secs(1);
 
 #[test]
 #[ignore = "manual release-mode raw QUIC setup pressure baseline"]
@@ -89,6 +91,7 @@ idle_timeout = "10s"
   type = "raw"
   match_sni = ["{FLOOD_SNI}"]
   upstream = "127.0.0.1:{blackhole_port}"
+  connect_timeout = "3s"
 
   [[listener.route]]
   name = "raw-healthy"
@@ -127,7 +130,7 @@ idle_timeout = "10s"
         let healthy_client = quinn_client(&cert_der);
         let recovery_started = Instant::now();
         let healthy = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(6),
             healthy_client
                 .connect(gateway_addr, HEALTHY_SNI)
                 .expect("start healthy raw QUIC connection"),
@@ -136,11 +139,15 @@ idle_timeout = "10s"
         .expect("healthy raw QUIC connection did not recover after setup pressure")
         .expect("healthy raw QUIC handshake after setup pressure");
         let recovery_elapsed = recovery_started.elapsed();
+        assert!(
+            recovery_elapsed >= MIN_EXPECTED_RECOVERY,
+            "setup pressure did not keep raw connect admission saturated long enough: recovered in {recovery_elapsed:?}"
+        );
 
         eprintln!(
             "raw-quic setup pressure: attempts={FLOOD_ATTEMPTS} max_pending={} \
-             flood_window={FLOOD_WINDOW:?} upstream_datagrams={observed_datagrams} \
-             recovery={recovery_elapsed:?}",
+             flood_connect_timeout={FLOOD_CONNECT_TIMEOUT:?} flood_window={FLOOD_WINDOW:?} \
+             upstream_datagrams={observed_datagrams} recovery={recovery_elapsed:?}",
             MAX_PENDING_RAW_CONNECTS,
         );
 
