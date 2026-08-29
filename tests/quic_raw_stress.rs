@@ -166,13 +166,11 @@ async fn echo_all(connections: &[quinn::Connection], concurrency: usize) {
                 let (mut send, mut recv) = connection.open_bi().await.expect("open stress stream");
                 send.write_all(PAYLOAD).await.expect("send stress payload");
                 send.finish().expect("finish stress request");
-                let echoed = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    recv.read_to_end(64 * 1024),
-                )
-                .await
-                .expect("stress echo timed out")
-                .expect("read stress echo");
+                let echoed =
+                    tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(64 * 1024))
+                        .await
+                        .expect("stress echo timed out")
+                        .expect("read stress echo");
                 assert_eq!(echoed, PAYLOAD);
             });
             next += 1;
@@ -215,7 +213,9 @@ fn spawn_echo_accept_loop(endpoint: &quinn::Endpoint) -> tokio::task::JoinHandle
 
 fn quinn_client(cert_der: &CertificateDer<'static>) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert_der.clone()).expect("trust stress QUIC server");
+    roots
+        .add(cert_der.clone())
+        .expect("trust stress QUIC server");
     let mut client = quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
         .expect("bind QUIC stress client");
     client.set_default_client_config(
