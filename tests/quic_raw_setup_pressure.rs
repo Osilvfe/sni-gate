@@ -19,7 +19,6 @@ const FLOOD_SNI: &str = "flood.raw-pressure.test";
 const HEALTHY_SNI: &str = "healthy.raw-pressure.test";
 const FLOOD_ATTEMPTS: usize = 1024;
 const MAX_PENDING_RAW_CONNECTS: usize = 64;
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 const FLOOD_WINDOW: Duration = Duration::from_secs(1);
 
 #[test]
