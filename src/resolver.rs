@@ -650,7 +650,7 @@ impl ResolvesServerCert for DynamicResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certscope::{CertScope, Forwarding};
+    use crate::certscope::{CertScope, Forwarding, UpstreamIdentity};
     use crate::config::{AddressFamily, RouteType, SniPolicy};
     use crate::router::Escape;
 
@@ -659,12 +659,14 @@ mod tests {
             1,
             &Forwarding {
                 route_type: RouteType::Http,
-                host: Some("127.0.0.1".into()),
+                upstream: UpstreamIdentity::Direct {
+                    host: Some("127.0.0.1".into()),
+                    family: AddressFamily::Dual,
+                    nat64: None,
+                    addr_resolver: "system".into(),
+                },
                 port,
                 sni: SniPolicy::Reflect,
-                family: AddressFamily::Dual,
-                nat64: None,
-                addr_resolver: "system".into(),
                 ech: None,
             },
         )
@@ -686,7 +688,14 @@ mod tests {
         store: Option<CertStore>,
     ) -> DynamicResolver {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let dir = std::env::temp_dir().join(format!("sni-gate-test-{}", std::process::id()));
+        // A per-call directory, not a per-process one. Tests in this module run on
+        // parallel threads *within one process*, so keying only on the pid gave
+        // every test the same `ca.crt`: one thread would read it while another was
+        // still writing, failing with "no certificate found in CA PEM". Same
+        // pid+counter scheme the integration helpers use for the same reason.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sni-gate-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ca = crate::ca::CertificateAuthority::load_or_generate(crate::ca::CaParams {
             cert_path: &dir.join("ca.crt"),

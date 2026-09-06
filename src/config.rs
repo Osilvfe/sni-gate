@@ -60,6 +60,12 @@ pub struct Config {
     #[serde(default)]
     pub templates: HashMap<String, Template>,
 
+    /// Named upstream pools. A `[pools.<name>]` table declares a set of
+    /// endpoints with background health probing and adaptive selection, and is
+    /// referenced by `upstream = "@<name>"`. See [`PoolDef`].
+    #[serde(default)]
+    pub pools: HashMap<String, PoolDef>,
+
     /// Named DNS resolvers. A `[resolvers.<name>]` table declares a resolver
     /// endpoint together with the same transport controls a route gets —
     /// `upstream`, `override_sni`, an `[ech]` block, `address_family`,
@@ -287,6 +293,17 @@ pub struct Route {
     #[serde(default)]
     pub key_file: Option<PathBuf>,
 
+    /// Which pool candidates this route ranks, when `upstream` names a pool.
+    ///
+    /// Entries are unioned (OR): an integer matches a target index, a string
+    /// matches a candidate tag. Omitted ranks every candidate. Meaningless — and
+    /// rejected at load time — unless `upstream` is a `@pool` reference.
+    ///
+    /// There is deliberately no AND or negation syntax; for control beyond what
+    /// the automatic tags give, label a target with a custom tag and select that.
+    #[serde(default)]
+    pub select: Option<Vec<Selector>>,
+
     /// Overridable knobs; inherit from listener then global.
     #[serde(flatten)]
     pub common: CommonOpts,
@@ -438,6 +455,11 @@ pub struct Template {
     /// HTTP/2 settings; merged field-by-field into the HTTP/2 ladder here.
     #[serde(default)]
     pub http2: Option<Http2Config>,
+
+    /// Pool candidate filter (see [`Route::select`]). Route scope only, like
+    /// `upstream` itself: a listener has no upstream to select candidates for.
+    #[serde(default)]
+    pub select: Option<Vec<Selector>>,
 
     /// Overridable knobs; inserted into the fallback ladder at this scope.
     #[serde(flatten)]
@@ -787,6 +809,259 @@ impl ResolverDef {
 }
 
 // ---------------------------------------------------------------------------
+// Pools: adaptive upstream endpoint selection
+// ---------------------------------------------------------------------------
+
+/// A named set of upstream endpoints with background health probing and
+/// adaptive selection, declared as `[pools.<name>]` and referenced by
+/// `upstream = "@<name>"`.
+///
+/// # The two-layer model
+///
+/// A pool has **targets** and **candidates**, and keeping them distinct is what
+/// makes every index in this table well-defined:
+///
+/// * A **target** is one entry in `targets`. It has a stable zero-based index,
+///   and that index is the *only* addressing unit in the configuration:
+///   `fallback`, `nat64.from` and `select` all name targets.
+/// * A **candidate** is one probed endpoint. A single target yields any number
+///   of them — a domain yields one per A/AAAA record, a CIDR yields one per
+///   sampled address — and each carries its own address, tags, RTT and health.
+///
+/// Conflating the two is not a cosmetic error. Tags are a property of a
+/// *candidate* (a domain's A record is `ipv4`, its AAAA record is `ipv6`), and
+/// they are only known after DNS resolution, so any load-time rule phrased over
+/// "the tags of target N" cannot be evaluated at load time at all. Indices
+/// therefore address targets, and tags match candidates. A target's whole set of
+/// candidates is selected or rejected together by index; tags then discriminate
+/// within it.
+///
+/// # What a probe measures
+///
+/// `sni` and `port` belong to the pool, not to any consuming route. A pool may
+/// be referenced by twenty routes with different names, but the probe measures
+/// *link quality to the edge node* — not the response for one specific host. The
+/// pool declares one representative endpoint for probing, and the data path
+/// applies each consumer's own port to the address the pool chose.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolDef {
+    /// The endpoints this pool draws from. Non-empty. Each entry's zero-based
+    /// index is what `fallback`, `nat64.from` and `select` refer to.
+    pub targets: Vec<TargetDef>,
+
+    /// Index into `targets` used as the safety net: before the first probe cycle
+    /// has produced a healthy candidate, and whenever every selected candidate
+    /// is degraded. Retired the moment one recovers.
+    ///
+    /// The fallback candidate is drawn from that target under the *consumer's
+    /// own* selection, so a `select = ["nat64"]` route falls back to a NAT64
+    /// address rather than to a bare IPv4 its host may not be able to reach.
+    #[serde(default)]
+    pub fallback: Option<usize>,
+
+    /// How candidates are health-checked. Required: a pool without probing is a
+    /// static list, which `upstream` already expresses.
+    pub probe: ProbeDef,
+
+    /// NAT64 projection of this pool's IPv4 candidates. Not a separate pool —
+    /// an address-family projection of this one.
+    #[serde(default)]
+    pub nat64: Option<PoolNat64Def>,
+
+    /// Resolver used to resolve this pool's domain targets. A `@name` reference
+    /// or an inline spec; omitted means the OS resolver.
+    ///
+    /// A pool gets the same resolver vocabulary a route does for the same reason
+    /// [`ResolverDef`] does: nothing makes a pool's domain target less subject to
+    /// DNS interference than a route's upstream.
+    #[serde(default)]
+    pub resolver: Option<String>,
+}
+
+/// One `targets` entry: a bare address string, or a table when custom tags are
+/// wanted.
+///
+/// The string form infers the kind, which keeps the common case to one token:
+/// contains `/` → CIDR, parses as an IP → bare IP, otherwise → domain name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TargetDef {
+    /// `"104.16.0.0/12[4]"`, `"1.2.3.4"`, `"cf.example.com"`.
+    Addr(String),
+    /// `{ addr = "2606:4700::/32[4]", tags = ["edge-v6"] }`
+    Tagged(TaggedTarget),
+}
+
+/// The table form of a target, carrying operator-supplied tags alongside the
+/// address.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaggedTarget {
+    /// Same syntax as the string shorthand.
+    pub addr: String,
+    /// Extra labels for `select`. These *append to* the automatic tags
+    /// (`ipv4` / `ipv6` / `nat64`); they never override or remove them.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl TargetDef {
+    /// The address specification, whichever form was written.
+    pub fn addr(&self) -> &str {
+        match self {
+            TargetDef::Addr(s) => s,
+            TargetDef::Tagged(t) => &t.addr,
+        }
+    }
+
+    /// Operator-supplied tags; empty for the string shorthand.
+    pub fn tags(&self) -> &[String] {
+        match self {
+            TargetDef::Addr(_) => &[],
+            TargetDef::Tagged(t) => &t.tags,
+        }
+    }
+}
+
+/// What a probe actually does to a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMode {
+    /// TCP connect. RTT is measured to connect completion.
+    Tcp,
+    /// TCP + TLS handshake. RTT is measured to handshake completion. Needs `sni`.
+    Tls,
+    /// TCP + TLS + an HTTP `GET`. RTT is measured to the first response byte.
+    /// Needs `sni`, `path` and `status`.
+    Http,
+}
+
+/// How a pool's candidates are health-checked. All tuning lives here; the pool
+/// table itself carries only identity (`targets`, `fallback`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeDef {
+    pub mode: ProbeMode,
+
+    /// Port probed on every candidate. Default 443.
+    ///
+    /// Deliberately the pool's own property rather than the consuming route's: a
+    /// probe measures the link to an edge node, and two routes reaching that
+    /// edge on different service ports must not each re-rank it. When a route
+    /// dials `@pool:8443` while the pool probes 443, the ranking still describes
+    /// the path to that host — which is what selection is for.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// TLS server name for `tls` / `http` probes.
+    #[serde(default)]
+    pub sni: Option<String>,
+
+    /// Request path for `http` probes.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Response status codes accepted by an `http` probe, listed explicitly.
+    /// Required for `http`, rejected otherwise.
+    #[serde(default)]
+    pub status: Vec<u16>,
+
+    /// Per-candidate probe deadline. Default 3s.
+    #[serde(default, with = "humantime_serde::option")]
+    pub timeout: Option<Duration>,
+
+    /// Probe cycle for healthy candidates. Default 5m.
+    #[serde(default, with = "humantime_serde::option")]
+    pub interval: Option<Duration>,
+
+    /// First retry delay for a degraded candidate, doubling on each further
+    /// failure up to `interval`. Default 30s.
+    ///
+    /// Per-candidate rather than a second pool-wide cadence: candidates sampled
+    /// out of a CIDR routinely include an address that never answers, and one
+    /// permanently dead candidate must not pin the whole pool to the fast cycle
+    /// forever.
+    #[serde(default, with = "humantime_serde::option")]
+    pub degraded_interval: Option<Duration>,
+
+    /// Consecutive failures before a candidate is marked degraded. Default 2.
+    #[serde(default)]
+    pub fail_threshold: Option<u32>,
+}
+
+/// NAT64 projection of a pool's IPv4 candidates (RFC 6052).
+///
+/// For each participating IPv4 candidate × each prefix, one synthesized IPv6
+/// candidate is generated and probed independently. Synthesized candidates are
+/// ranked separately from their IPv4 originals: a slow NAT64 gateway must not
+/// demote the native IPv4 path, nor the reverse.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolNat64Def {
+    /// One or more NAT64 `/96` prefixes. Non-empty.
+    pub prefixes: Vec<String>,
+
+    /// Target indices whose IPv4 candidates participate. Omitted = every target.
+    #[serde(default)]
+    pub from: Option<Vec<usize>>,
+
+    /// Probe deadline override for synthesized candidates only. A NAT64 path
+    /// carries an extra hop, so it can legitimately need a looser bound than the
+    /// native one without the whole pool being loosened.
+    #[serde(default, with = "humantime_serde::option")]
+    pub timeout: Option<Duration>,
+}
+
+/// One `select` entry: a target index, or a tag matched against candidates.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Selector {
+    /// Exact target index. Selects every candidate derived from that target.
+    Index(usize),
+    /// Matches a candidate carrying this tag, automatic or custom.
+    Tag(String),
+}
+
+/// The fully-resolved probe settings for one pool, defaults applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProbe {
+    pub mode: ProbeMode,
+    pub port: u16,
+    pub sni: Option<String>,
+    pub path: Option<String>,
+    pub status: Vec<u16>,
+    pub timeout: Duration,
+    pub interval: Duration,
+    pub degraded_interval: Duration,
+    pub fail_threshold: u32,
+}
+
+impl ProbeDef {
+    /// Flatten this probe table, applying defaults.
+    ///
+    /// Nothing here can fail: the fallible parts (a mode missing its required
+    /// fields, a nonsensical interval) are checked by
+    /// [`Config::validate_pools`], which reads *this* result rather than the raw
+    /// table so validation and runtime never disagree.
+    pub fn effective(&self) -> EffectiveProbe {
+        EffectiveProbe {
+            mode: self.mode,
+            port: self.port.unwrap_or(443),
+            sni: self.sni.clone(),
+            path: self.path.clone(),
+            status: self.status.clone(),
+            timeout: self.timeout.unwrap_or_else(default_probe_timeout),
+            interval: self.interval.unwrap_or_else(default_pool_interval),
+            degraded_interval: self
+                .degraded_interval
+                .unwrap_or_else(default_pool_degraded_interval),
+            fail_threshold: self.fail_threshold.unwrap_or(2),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Overridable common options (the fallback ladder)
 // ---------------------------------------------------------------------------
 
@@ -1126,6 +1401,271 @@ impl Config {
         self.regex_def(name)
     }
 
+    /// Look up a declared pool by name (without the `@` prefix).
+    pub fn pool_def(&self, name: &str) -> Result<&PoolDef, ConfigError> {
+        self.pools.get(name).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "unknown pool {name:?} (no matching [pools.{name}])"
+            ))
+        })
+    }
+
+    /// Validate the `[pools]` table.
+    ///
+    /// Everything checkable without I/O is checked here, and nothing that needs
+    /// I/O is *claimed* to be checked. In particular a target's tags are a
+    /// property of its resolved candidates — a domain's A record is `ipv4`, its
+    /// AAAA record is `ipv6` — so no rule here can require that an index
+    /// "references an `ipv4` candidate". Indices are checked for bounds; tag
+    /// agreement is a runtime observation, reported by the pool as a warning.
+    fn validate_pools(&self) -> Result<(), ConfigError> {
+        for (name, pool) in &self.pools {
+            if pool.targets.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[pools.{name}]: `targets` must not be empty"
+                )));
+            }
+
+            // Every target must parse, and a CIDR must not silently expand into
+            // an unbounded candidate set.
+            for (i, t) in pool.targets.iter().enumerate() {
+                crate::pool::TargetSpec::parse(t.addr()).map_err(|e| {
+                    ConfigError::Invalid(format!("[pools.{name}]: targets[{i}]: {e}"))
+                })?;
+                for tag in t.tags() {
+                    if tag.trim().is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}]: targets[{i}] has an empty tag"
+                        )));
+                    }
+                }
+            }
+
+            if let Some(f) = pool.fallback {
+                if f >= pool.targets.len() {
+                    return Err(ConfigError::Invalid(format!(
+                        "[pools.{name}]: fallback = {f} is out of bounds (targets has {} \
+                         entries, so valid indices are 0..={})",
+                        pool.targets.len(),
+                        pool.targets.len() - 1
+                    )));
+                }
+            }
+
+            let probe = pool.probe.effective();
+            match probe.mode {
+                ProbeMode::Tcp => {
+                    if probe.sni.is_some() || probe.path.is_some() || !probe.status.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.probe]: mode = \"tcp\" tests only a TCP connect, so \
+                             `sni`, `path` and `status` are meaningless here; remove them or \
+                             choose mode = \"tls\" / \"http\""
+                        )));
+                    }
+                }
+                ProbeMode::Tls => {
+                    if probe.sni.is_none() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.probe]: mode = \"tls\" requires `sni` (the name \
+                             presented on the probe handshake)"
+                        )));
+                    }
+                    if probe.path.is_some() || !probe.status.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.probe]: mode = \"tls\" stops after the handshake, so \
+                             `path` and `status` are meaningless here; use mode = \"http\" to \
+                             send a request"
+                        )));
+                    }
+                }
+                ProbeMode::Http => {
+                    if probe.sni.is_none() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.probe]: mode = \"http\" requires `sni`"
+                        )));
+                    }
+                    match &probe.path {
+                        None => {
+                            return Err(ConfigError::Invalid(format!(
+                                "[pools.{name}.probe]: mode = \"http\" requires `path`"
+                            )))
+                        }
+                        Some(p) if !p.starts_with('/') => {
+                            return Err(ConfigError::Invalid(format!(
+                                "[pools.{name}.probe]: path {p:?} must start with '/'"
+                            )))
+                        }
+                        Some(_) => {}
+                    }
+                    if probe.status.is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.probe]: mode = \"http\" requires `status` (the \
+                             accepted response codes, e.g. status = [200])"
+                        )));
+                    }
+                    for s in &probe.status {
+                        if !(100..=599).contains(s) {
+                            return Err(ConfigError::Invalid(format!(
+                                "[pools.{name}.probe]: status {s} is not an HTTP status code"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            if probe.timeout.is_zero() {
+                return Err(ConfigError::Invalid(format!(
+                    "[pools.{name}.probe]: timeout must be greater than zero"
+                )));
+            }
+            if probe.interval.is_zero() || probe.degraded_interval.is_zero() {
+                return Err(ConfigError::Invalid(format!(
+                    "[pools.{name}.probe]: interval and degraded_interval must be greater \
+                     than zero"
+                )));
+            }
+            if probe.fail_threshold == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "[pools.{name}.probe]: fail_threshold must be at least 1 (0 would degrade \
+                     a candidate that never failed)"
+                )));
+            }
+
+            if let Some(n) = &pool.nat64 {
+                if n.prefixes.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "[pools.{name}.nat64]: `prefixes` must not be empty"
+                    )));
+                }
+                for p in &n.prefixes {
+                    p.parse::<crate::nat64::Nat64Prefix>().map_err(|e| {
+                        ConfigError::Invalid(format!("[pools.{name}.nat64]: prefix {p:?}: {e}"))
+                    })?;
+                }
+                for i in n.from.iter().flatten() {
+                    if *i >= pool.targets.len() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.nat64]: from index {i} is out of bounds (targets \
+                             has {} entries)",
+                            pool.targets.len()
+                        )));
+                    }
+                }
+                if let Some(t) = n.timeout {
+                    if t.is_zero() {
+                        return Err(ConfigError::Invalid(format!(
+                            "[pools.{name}.nat64]: timeout must be greater than zero"
+                        )));
+                    }
+                }
+            }
+
+            if let Some(spec) = &pool.resolver {
+                if Self::is_resolver_ref(spec) {
+                    self.resolve_resolver_ref(spec)
+                        .map_err(|e| ConfigError::Invalid(format!("[pools.{name}]: {e}")))?;
+                }
+            }
+        }
+
+        // Route-side checks: every `@pool` reference resolves, and `select` is
+        // only written where it can take effect.
+        for l in &self.listeners {
+            let port = l.addr.port();
+            for r in l.routes.iter().chain(l.default_route.iter()) {
+                let tpl = self.template_for(&r.use_template)?;
+                self.validate_route_pool(r, tpl, port)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One route's pool-related checks: reference existence, `select` bounds, and
+    /// the fields a pool makes inoperative.
+    fn validate_route_pool(
+        &self,
+        route: &Route,
+        tpl: Option<&Template>,
+        listener_port: u16,
+    ) -> Result<(), ConfigError> {
+        let spec = route.upstream_spec(tpl);
+        let resolved = resolved_upstream_from(spec, listener_port).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "route {}: invalid upstream {:?}",
+                route.label(),
+                spec.unwrap_or_default()
+            ))
+        })?;
+
+        let select = route.select_for(tpl);
+
+        let pool_name = match &resolved.host {
+            UpstreamHost::Pool(n) => n,
+            _ => {
+                // `select` ranks pool candidates; on any other upstream it is
+                // inert. Silently ignoring it would leave the operator believing
+                // a filter is applied.
+                if select.is_some() {
+                    return Err(ConfigError::Invalid(format!(
+                        "route {}: `select` filters pool candidates, but this route's upstream \
+                         is not a pool reference; remove `select`, or point `upstream` at a \
+                         @pool",
+                        route.label()
+                    )));
+                }
+                return Ok(());
+            }
+        };
+
+        let pool = self
+            .pool_def(pool_name)
+            .map_err(|e| ConfigError::Invalid(format!("route {}: {e}", route.label())))?;
+
+        // Indices address targets, so bounds are against `targets`, not against
+        // the candidate set (which does not exist until DNS has answered).
+        for sel in select.into_iter().flatten() {
+            if let Selector::Index(i) = sel {
+                if *i >= pool.targets.len() {
+                    return Err(ConfigError::Invalid(format!(
+                        "route {}: select index {i} is out of bounds for pool @{pool_name} \
+                         (targets has {} entries)",
+                        route.label(),
+                        pool.targets.len()
+                    )));
+                }
+            }
+        }
+
+        // A pool owns its own address family, NAT64 projection and resolver.
+        // Writing those at route scope alongside a pool upstream can only be a
+        // misunderstanding, so it is rejected rather than ignored — the same
+        // treatment `http2.enabled` gets on a `raw` route, and for the same
+        // reason. Values merely *inherited* from a broader scope stay harmless.
+        let explicit_conflict = [
+            route.common.address_family.map(|_| "address_family"),
+            route.common.nat64_prefix.as_ref().map(|_| "nat64_prefix"),
+            route.common.addr_resolver.as_ref().map(|_| "addr_resolver"),
+            tpl.and_then(|t| t.common.address_family)
+                .map(|_| "address_family"),
+            tpl.and_then(|t| t.common.nat64_prefix.as_ref())
+                .map(|_| "nat64_prefix"),
+            tpl.and_then(|t| t.common.addr_resolver.as_ref())
+                .map(|_| "addr_resolver"),
+        ]
+        .into_iter()
+        .flatten()
+        .next();
+        if let Some(field) = explicit_conflict {
+            return Err(ConfigError::Invalid(format!(
+                "route {}: `{field}` has no effect when upstream is a pool (@{pool_name} \
+                 resolves its own targets, decides its own address families, and applies its \
+                 own NAT64 projection). Set it on [pools.{pool_name}] instead, or drop it here",
+                route.label()
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether `spec` is a `[resolvers.<name>]` reference rather than an inline
     /// endpoint spec.
     ///
@@ -1459,6 +1999,7 @@ impl Config {
         }
         self.validate_resolvers()?;
         self.validate_regexes()?;
+        self.validate_pools()?;
         Ok(())
     }
 
@@ -1821,10 +2362,19 @@ impl Route {
     /// The upstream spec this route dials, taking the route's own value first
     /// and otherwise the value from its template (route scope only — `upstream`
     /// is not a listener/global setting).
-    fn upstream_spec<'a>(&'a self, tpl: Option<&'a Template>) -> Option<&'a str> {
+    pub fn upstream_spec<'a>(&'a self, tpl: Option<&'a Template>) -> Option<&'a str> {
         self.upstream
             .as_deref()
             .or_else(|| tpl.and_then(|t| t.upstream.as_deref()))
+    }
+
+    /// The pool candidate filter for this route: its own `select` first, else its
+    /// template's. Resolved on presence, so a route may widen its template's
+    /// filter to "everything" by writing `select = []`.
+    pub fn select_for<'a>(&'a self, tpl: Option<&'a Template>) -> Option<&'a [Selector]> {
+        self.select
+            .as_deref()
+            .or_else(|| tpl.and_then(|t| t.select.as_deref()))
     }
 
     /// The pinned cert/key pair for local termination, resolved atomically from
@@ -1942,21 +2492,46 @@ pub fn split_host_port(s: &str) -> Option<(String, u16)> {
     }
 }
 
-/// A parsed `upstream` value with independently-optional host and port.
+/// Where an `upstream` sends a connection, before the port is resolved.
 ///
-/// `host = None` means "use the matched source SNI/Host"; `port = None` means
-/// "use the parent listener's port". The two are resolved by
+/// Three cases rather than an `Option<String>`, because "reflect the source
+/// name", "dial this fixed host" and "ask this pool which endpoint is best" are
+/// three different things and collapsing any two of them into one would make a
+/// `@pool` reference indistinguishable from a host literally named `@pool`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamHost {
+    /// Use the matched source SNI/Host (the port-stripped routing key), resolved
+    /// per connection.
+    Reflect,
+    /// Dial this fixed host.
+    Fixed(String),
+    /// Take the address from this pool's current ranking.
+    Pool(String),
+}
+
+/// A parsed `upstream` value with an independently-optional port.
+///
+/// `port = None` means "use the parent listener's port"; it is resolved by
 /// [`resolved_upstream_from`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamSpec {
-    pub host: Option<String>,
+    pub host: UpstreamHost,
     pub port: Option<u16>,
+}
+
+/// A fully-resolved `upstream`: where to go, and on which port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedUpstream {
+    pub host: UpstreamHost,
+    pub port: u16,
 }
 
 /// Parse a non-empty `upstream` value into an [`UpstreamSpec`].
 ///
 /// Accepted forms (after trimming):
-///   * `"8443"`        — a bare port (all digits): host defaulted, port fixed.
+///   * `"@pool"`       — a pool reference: port defaulted.
+///   * `"@pool:8443"`  — a pool reference on an explicit port.
+///   * `"8443"`        — a bare port (all digits): host reflected, port fixed.
 ///   * `"host:port"`   — a DNS name or IPv4 with a port.
 ///   * `"[v6]:port"`   — an IPv6 literal in brackets with a port.
 ///   * `"host"`        — a bare host with no port: port defaulted.
@@ -1964,16 +2539,38 @@ pub struct UpstreamSpec {
 /// A bare, unbracketed IPv6 literal is rejected (ambiguous — must use `[v6]`),
 /// as are malformed ports. Returns `None` on any unrecognized input. The empty
 /// string is *not* a valid spec here; omit the field to default both parts.
+///
+/// The `@` prefix is checked first and is unambiguous: a DNS name never starts
+/// with `@`, which is the same reason it marks a reference in `resolver` and
+/// `match_sni`. `@pool:port` exists because a pool's targets carry no port —
+/// without it, serving one edge on two ports would mean duplicating the pool.
 pub fn parse_upstream(s: &str) -> Option<UpstreamSpec> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    // A bare port (all digits) defaults the host. Checked first because a value
-    // like "443" is both a valid u16 and a colon-free "host".
+    // A pool reference, optionally with an explicit port. Checked before
+    // anything else so a pool name can never be mistaken for a hostname.
+    if let Some(rest) = s.strip_prefix('@') {
+        let (name, port) = match rest.rsplit_once(':') {
+            Some((n, p)) => (n, Some(p.parse().ok()?)),
+            None => (rest, None),
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(UpstreamSpec {
+            host: UpstreamHost::Pool(name.to_string()),
+            port,
+        });
+    }
+    // A bare port (all digits) reflects the source name. Checked before the
+    // colon rule because a value like "443" is both a valid u16 and a colon-free
+    // "host".
     if s.bytes().all(|b| b.is_ascii_digit()) {
         return Some(UpstreamSpec {
-            host: None,
+            host: UpstreamHost::Reflect,
             port: Some(s.parse().ok()?),
         });
     }
@@ -1982,35 +2579,39 @@ pub fn parse_upstream(s: &str) -> Option<UpstreamSpec> {
     if s.contains(':') {
         let (host, port) = split_host_port(s)?;
         return Some(UpstreamSpec {
-            host: Some(host),
+            host: UpstreamHost::Fixed(host),
             port: Some(port),
         });
     }
     // Otherwise a bare host with no port; the port defaults to the listener's.
     Some(UpstreamSpec {
-        host: Some(s.to_string()),
+        host: UpstreamHost::Fixed(s.to_string()),
         port: None,
     })
 }
 
 /// Resolve an (already scope-picked) upstream spec against `listener_port`,
-/// filling in the defaulted pieces. Returns `(host, port)` where `host` is
-/// `None` when it should be taken from the matched source SNI/Host at connection
-/// time (dynamic). Returns `None` only when a present spec fails to parse.
+/// filling in the defaulted port. Returns `None` only when a present spec fails
+/// to parse.
 ///
-///   * `None` spec       → `(None, listener_port)`   (omitted: reflect + inherit)
-///   * `"8443"`          → `(None, 8443)`
-///   * `"host"`          → `(Some(host), listener_port)`
-///   * `"host:port"`     → `(Some(host), port)`
-pub fn resolved_upstream_from(
-    spec: Option<&str>,
-    listener_port: u16,
-) -> Option<(Option<String>, u16)> {
+///   * `None` spec       → reflect + listener_port   (omitted: default both)
+///   * `"8443"`          → reflect + 8443
+///   * `"host"`          → fixed host + listener_port
+///   * `"host:port"`     → fixed host + port
+///   * `"@pool"`         → pool + listener_port
+///   * `"@pool:8443"`    → pool + 8443
+pub fn resolved_upstream_from(spec: Option<&str>, listener_port: u16) -> Option<ResolvedUpstream> {
     let Some(spec) = spec else {
-        return Some((None, listener_port));
+        return Some(ResolvedUpstream {
+            host: UpstreamHost::Reflect,
+            port: listener_port,
+        });
     };
     let parsed = parse_upstream(spec)?;
-    Some((parsed.host, parsed.port.unwrap_or(listener_port)))
+    Some(ResolvedUpstream {
+        host: parsed.host,
+        port: parsed.port.unwrap_or(listener_port),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2286,6 +2887,19 @@ fn default_probe_timeout() -> Duration {
     // backend is unreachable.
     Duration::from_secs(3)
 }
+fn default_pool_interval() -> Duration {
+    // A healthy edge node's RTT ranking is stable over minutes, and every cycle
+    // costs one probe per candidate. 5 minutes keeps the ranking current without
+    // making the pool a traffic source in its own right.
+    Duration::from_secs(300)
+}
+fn default_pool_degraded_interval() -> Duration {
+    // The *first* retry delay for a degraded candidate, doubling from here up to
+    // `interval`. Short enough that a brief outage is noticed quickly, while the
+    // backoff keeps a permanently dead candidate from probing forever at this
+    // rate.
+    Duration::from_secs(30)
+}
 fn default_psl_path() -> PathBuf {
     PathBuf::from("cache/public_suffix_list.dat")
 }
@@ -2337,33 +2951,36 @@ mod tests {
 
     #[test]
     fn parse_upstream_variants() {
-        let spec = |host: Option<&str>, port: Option<u16>| {
+        let fixed = |host: &str, port: Option<u16>| {
             Some(UpstreamSpec {
-                host: host.map(str::to_string),
+                host: UpstreamHost::Fixed(host.to_string()),
                 port,
             })
         };
-        // Bare port: host defaulted, port fixed.
-        assert_eq!(parse_upstream("8443"), spec(None, Some(8443)));
-        assert_eq!(parse_upstream("443"), spec(None, Some(443)));
+        let reflect = |port: Option<u16>| {
+            Some(UpstreamSpec {
+                host: UpstreamHost::Reflect,
+                port,
+            })
+        };
+        // Bare port: host reflected, port fixed.
+        assert_eq!(parse_upstream("8443"), reflect(Some(8443)));
+        assert_eq!(parse_upstream("443"), reflect(Some(443)));
         // Bare host: port defaulted.
         assert_eq!(
             parse_upstream("cdn.example.com"),
-            spec(Some("cdn.example.com"), None)
+            fixed("cdn.example.com", None)
         );
         // host:port and IPv4:port.
-        assert_eq!(parse_upstream("a.com:443"), spec(Some("a.com"), Some(443)));
-        assert_eq!(
-            parse_upstream("1.2.3.4:8443"),
-            spec(Some("1.2.3.4"), Some(8443))
-        );
+        assert_eq!(parse_upstream("a.com:443"), fixed("a.com", Some(443)));
+        assert_eq!(parse_upstream("1.2.3.4:8443"), fixed("1.2.3.4", Some(8443)));
         // Bracketed IPv6 with a port.
         assert_eq!(
             parse_upstream("[2a01:4f8::1]:443"),
-            spec(Some("2a01:4f8::1"), Some(443))
+            fixed("2a01:4f8::1", Some(443))
         );
         // Surrounding whitespace is tolerated.
-        assert_eq!(parse_upstream("  9000  "), spec(None, Some(9000)));
+        assert_eq!(parse_upstream("  9000  "), reflect(Some(9000)));
         // Rejected: empty, bare v6, bad port, port overflow, bracketed non-v6.
         assert_eq!(parse_upstream(""), None);
         assert_eq!(parse_upstream("   "), None);
@@ -2373,27 +2990,81 @@ mod tests {
         assert_eq!(parse_upstream("[not-v6]:443"), None);
     }
 
+    /// A pool reference must never read as a hostname — that was the whole reason
+    /// `@` is checked before every other rule.
+    #[test]
+    fn parse_upstream_pool_references() {
+        let pool = |name: &str, port: Option<u16>| {
+            Some(UpstreamSpec {
+                host: UpstreamHost::Pool(name.to_string()),
+                port,
+            })
+        };
+        assert_eq!(parse_upstream("@cf"), pool("cf", None));
+        assert_eq!(parse_upstream("  @cf  "), pool("cf", None));
+        // An explicit port: a pool's targets carry none, so this is how one pool
+        // serves two ports without being duplicated.
+        assert_eq!(parse_upstream("@cf:8443"), pool("cf", Some(8443)));
+        assert_eq!(parse_upstream("@my-pool:443"), pool("my-pool", Some(443)));
+        // Rejected: bare '@', empty name, unparseable port.
+        assert_eq!(parse_upstream("@"), None);
+        assert_eq!(parse_upstream("@:443"), None);
+        assert_eq!(parse_upstream("@cf:bad"), None);
+        assert_eq!(parse_upstream("@cf:99999"), None);
+    }
+
     #[test]
     fn resolved_upstream_defaults() {
-        // Omitted: dynamic host, listener port.
-        assert_eq!(resolved_upstream_from(None, 8443), Some((None, 8443)));
-        // Port-only: dynamic host, explicit port.
+        let got = |spec: Option<&str>, port: u16| resolved_upstream_from(spec, port);
+        // Omitted: reflect, listener port.
         assert_eq!(
-            resolved_upstream_from(Some("9001"), 443),
-            Some((None, 9001))
+            got(None, 8443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Reflect,
+                port: 8443
+            })
+        );
+        // Port-only: reflect, explicit port.
+        assert_eq!(
+            got(Some("9001"), 443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Reflect,
+                port: 9001
+            })
         );
         // Bare host: fixed host, listener port.
         assert_eq!(
-            resolved_upstream_from(Some("cdn.x"), 443),
-            Some((Some("cdn.x".into()), 443))
+            got(Some("cdn.x"), 443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Fixed("cdn.x".into()),
+                port: 443
+            })
         );
         // host:port: both fixed.
         assert_eq!(
-            resolved_upstream_from(Some("cdn.x:8080"), 443),
-            Some((Some("cdn.x".into()), 8080))
+            got(Some("cdn.x:8080"), 443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Fixed("cdn.x".into()),
+                port: 8080
+            })
+        );
+        // A pool inherits the listener's port unless it names one.
+        assert_eq!(
+            got(Some("@cf"), 443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Pool("cf".into()),
+                port: 443
+            })
+        );
+        assert_eq!(
+            got(Some("@cf:8443"), 443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Pool("cf".into()),
+                port: 8443
+            })
         );
         // A present-but-unparseable spec is an error (None).
-        assert_eq!(resolved_upstream_from(Some("a.com:bad"), 443), None);
+        assert_eq!(got(Some("a.com:bad"), 443), None);
     }
 
     #[test]
@@ -2602,7 +3273,10 @@ addr = "0.0.0.0:443"
             .or(rt.and_then(|t| t.upstream.as_deref()));
         assert_eq!(
             resolved_upstream_from(spec, 443),
-            Some((Some("cdn.example".into()), 443))
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Fixed("cdn.example".into()),
+                port: 443
+            })
         );
         let e = cfg.effective_ech(l, r, rt, None);
         assert_eq!(e.mode, EchMode::Static);
@@ -2737,7 +3411,13 @@ use = "ltpl"
             .upstream
             .as_deref()
             .or(rt.and_then(|t| t.upstream.as_deref()));
-        assert_eq!(resolved_upstream_from(spec, 8443), Some((None, 8443)));
+        assert_eq!(
+            resolved_upstream_from(spec, 8443),
+            Some(ResolvedUpstream {
+                host: UpstreamHost::Reflect,
+                port: 8443
+            })
+        );
     }
 
     #[test]
@@ -3434,5 +4114,461 @@ addr = "0.0.0.0:443"
         assert!(cfg.resolve_regex_ref("@nonexistent").is_err());
         assert!(cfg.resolve_regex_ref("not-a-ref").is_err());
         assert!(cfg.resolve_regex_ref("@").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Pools
+    // -----------------------------------------------------------------------
+
+    /// A minimal valid pool plus a route consuming it, with `extra` spliced into
+    /// the pool table and `route_extra` into the route.
+    fn pool_cfg(pool_extra: &str, route_extra: &str) -> String {
+        format!(
+            r#"
+[pools.cf]
+targets = ["cf.example.com", "104.16.0.0/12[4]"]
+{pool_extra}
+
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+  {route_extra}
+"#
+        )
+    }
+
+    fn validate_pool(pool_extra: &str, route_extra: &str) -> Result<(), ConfigError> {
+        parse(&pool_cfg(pool_extra, route_extra)).validate()
+    }
+
+    /// Validate a one-target pool whose `[pools.p.probe]` body is `probe_body`,
+    /// consumed by one route. The probe table is what most pool validation is
+    /// about, so this keeps each case to the lines it actually varies.
+    fn validate_probe(probe_body: &str) -> Result<(), ConfigError> {
+        parse(&format!(
+            r#"
+[pools.p]
+targets = ["1.2.3.4"]
+
+[pools.p.probe]
+{probe_body}
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@p"
+"#
+        ))
+        .validate()
+    }
+
+    #[test]
+    fn a_minimal_pool_validates() {
+        validate_pool("", "").unwrap();
+    }
+
+    #[test]
+    fn pool_reference_must_resolve() {
+        let err = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@nope"
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown pool"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn empty_targets_is_rejected() {
+        let err = parse(
+            r#"
+[pools.cf]
+targets = []
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must not be empty"), "unhelpful: {err}");
+    }
+
+    /// Indices address *targets*, so bounds are against `targets` — the only unit
+    /// that exists before DNS has answered.
+    #[test]
+    fn out_of_bounds_indices_are_rejected() {
+        let err = validate_pool("fallback = 5", "").unwrap_err().to_string();
+        assert!(err.contains("out of bounds"), "unhelpful: {err}");
+
+        let err = validate_pool("", "select = [7]").unwrap_err().to_string();
+        assert!(
+            err.contains("select index 7") && err.contains("out of bounds"),
+            "unhelpful: {err}"
+        );
+
+        // In-bounds is fine, including a tag mixed with an index.
+        validate_pool("fallback = 0", "select = [0, \"ipv4\"]").unwrap();
+    }
+
+    /// A tag is not pre-validated: whether a target yields an `ipv4` candidate is
+    /// only knowable after resolution, so an unmatched tag is a runtime warning,
+    /// never a load-time error.
+    #[test]
+    fn unknown_tags_are_not_rejected_at_load() {
+        validate_pool("", r#"select = ["no-such-tag"]"#).unwrap();
+    }
+
+    #[test]
+    fn probe_modes_require_their_own_fields() {
+        const SNI: &str = r#"sni = "x.example""#;
+        const PATH: &str = r#"path = "/cdn-cgi/trace""#;
+        const STATUS: &str = "status = [200]";
+
+        // A `tcp` probe needs nothing else.
+        validate_probe(r#"mode = "tcp""#).unwrap();
+
+        // `tls` needs an sni.
+        let err = validate_probe(r#"mode = "tls""#).unwrap_err().to_string();
+        assert!(err.contains("requires `sni`"), "unhelpful: {err}");
+        validate_probe(&format!("mode = \"tls\"\n{SNI}")).unwrap();
+
+        // `http` needs sni + path + status.
+        let http =
+            |fields: &[&str]| validate_probe(&format!("mode = \"http\"\n{}", fields.join("\n")));
+        assert!(http(&[PATH, STATUS]).is_err(), "missing sni accepted");
+        assert!(http(&[SNI, STATUS]).is_err(), "missing path accepted");
+        let err = http(&[SNI, PATH]).unwrap_err().to_string();
+        assert!(err.contains("requires `status`"), "unhelpful: {err}");
+        // Complete.
+        http(&[SNI, PATH, STATUS]).unwrap();
+        // A path must be a path.
+        assert!(http(&[SNI, r#"path = "cdn-cgi/trace""#, STATUS]).is_err());
+        // A status must be an HTTP status code.
+        assert!(http(&[SNI, PATH, "status = [999]"]).is_err());
+    }
+
+    /// A field a mode cannot use is a mistake, not a harmless extra: silently
+    /// ignoring it would leave the operator believing the probe checks content.
+    #[test]
+    fn fields_meaningless_for_a_mode_are_rejected() {
+        // `sni` on a tcp probe: nothing presents it.
+        let err = validate_probe("mode = \"tcp\"\nsni = \"x.example\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("meaningless"), "unhelpful: {err}");
+
+        // `path` / `status` on a tls probe: it stops at the handshake.
+        let err = validate_probe("mode = \"tls\"\nsni = \"x.example\"\npath = \"/x\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("meaningless"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn zero_timings_are_rejected() {
+        for bad in ["timeout", "interval", "degraded_interval"] {
+            let err = validate_probe(&format!("mode = \"tcp\"\n{bad} = \"0s\""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("greater than zero"), "{bad}: unhelpful: {err}");
+        }
+        // A zero threshold would degrade a candidate that never failed.
+        let err = validate_probe("mode = \"tcp\"\nfail_threshold = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 1"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn nat64_projection_is_validated() {
+        // Empty prefixes.
+        assert!(validate_pool("[pools.cf.nat64]\nprefixes = []", "").is_err());
+        // Bad prefix.
+        assert!(validate_pool("[pools.cf.nat64]\nprefixes = [\"not-a-prefix\"]", "").is_err());
+        // from index out of bounds.
+        let err = validate_pool(
+            "[pools.cf.nat64]\nprefixes = [\"64:ff9b::\"]\nfrom = [9]",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("out of bounds"), "unhelpful: {err}");
+        // Valid, including a from list and a timeout override.
+        validate_pool(
+            "[pools.cf.nat64]\nprefixes = [\"64:ff9b::\"]\nfrom = [1]\ntimeout = \"5s\"",
+            "",
+        )
+        .unwrap();
+    }
+
+    /// `select` on a non-pool upstream is inert; rejecting it beats letting the
+    /// operator believe a filter applies.
+    #[test]
+    fn select_without_a_pool_upstream_is_rejected() {
+        let err = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "cdn.example"
+  select = ["ipv4"]
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a pool reference"), "unhelpful: {err}");
+    }
+
+    /// A pool owns its resolution; writing those knobs beside it can only be a
+    /// misunderstanding, so it is an error rather than a silent no-op — and an
+    /// error, unlike a warning, cannot be missed.
+    #[test]
+    fn route_scope_resolution_knobs_conflict_with_a_pool() {
+        for field in [
+            r#"address_family = "ipv4""#,
+            r#"nat64_prefix = "64:ff9b::""#,
+            r#"addr_resolver = "1.1.1.1""#,
+        ] {
+            let err = validate_pool("", field).unwrap_err().to_string();
+            assert!(
+                err.contains("no effect when upstream is a pool"),
+                "{field}: unhelpful: {err}"
+            );
+        }
+    }
+
+    /// The same knobs *inherited* from a broader scope stay harmless: a global
+    /// default must not become unusable just because one route uses a pool.
+    #[test]
+    fn inherited_resolution_knobs_coexist_with_a_pool() {
+        parse(
+            r#"
+[global]
+address_family = "ipv4"
+nat64_prefix = "64:ff9b::"
+addr_resolver = "1.1.1.1"
+
+[pools.cf]
+targets = ["cf.example.com"]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+"#,
+        )
+        .validate()
+        .unwrap();
+    }
+
+    /// A template carrying `select` reaches the route that uses it, and the same
+    /// conflict rule applies at template scope.
+    #[test]
+    fn select_and_conflicts_resolve_through_a_template() {
+        parse(
+            r#"
+[templates.cf-v4]
+upstream = "@cf"
+select = ["ipv4"]
+
+[pools.cf]
+targets = ["cf.example.com"]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  use = "cf-v4"
+"#,
+        )
+        .validate()
+        .unwrap();
+
+        // A template-scope conflicting knob is caught too.
+        let err = parse(
+            r#"
+[templates.bad]
+upstream = "@cf"
+address_family = "ipv4"
+
+[pools.cf]
+targets = ["cf.example.com"]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  use = "bad"
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no effect when upstream is a pool"),
+            "unhelpful: {err}"
+        );
+    }
+
+    #[test]
+    fn pool_resolver_reference_must_resolve() {
+        let err = validate_pool(r#"resolver = "@nope""#, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown resolver"), "unhelpful: {err}");
+
+        // A declared resolver, and an inline spec, both work.
+        parse(
+            r#"
+[resolvers.fast]
+endpoint = "1.1.1.1"
+
+[pools.cf]
+targets = ["cf.example.com"]
+resolver = "@fast"
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+"#,
+        )
+        .validate()
+        .unwrap();
+        validate_pool(r#"resolver = "1.1.1.1""#, "").unwrap();
+    }
+
+    /// The tagged target form coexists with the shorthand, and an empty tag is a
+    /// typo rather than an unnamed label.
+    #[test]
+    fn tagged_targets_are_accepted_and_empty_tags_rejected() {
+        parse(
+            r#"
+[pools.cf]
+targets = [
+    "cf.example.com",
+    { addr = "2606:4700::/32[4]", tags = ["native-v6"] },
+]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+  select = ["native-v6"]
+"#,
+        )
+        .validate()
+        .unwrap();
+
+        let err = parse(
+            r#"
+[pools.cf]
+targets = [{ addr = "1.2.3.4", tags = ["  "] }]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("empty tag"), "unhelpful: {err}");
+    }
+
+    /// The load-time guard a documentation note cannot provide.
+    #[test]
+    fn unbounded_cidr_target_is_rejected_at_load() {
+        let err = parse(
+            r#"
+[pools.cf]
+targets = ["104.16.0.0/12"]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf"
+"#,
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sample count"), "unhelpful: {err}");
+    }
+
+    /// `@pool:port` is how one pool serves two ports without duplication.
+    #[test]
+    fn pool_reference_with_an_explicit_port_validates() {
+        validate_pool("", "").unwrap();
+        parse(
+            r#"
+[pools.cf]
+targets = ["cf.example.com"]
+[pools.cf.probe]
+mode = "tcp"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  type = "tls"
+  match_sni = [".a.com"]
+  upstream = "@cf:8443"
+"#,
+        )
+        .validate()
+        .unwrap();
     }
 }

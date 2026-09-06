@@ -544,6 +544,140 @@ Concurrent rebuilds are idempotent via generation counters.
   `ipv6` mode. You can also write a literal IPv6 upstream in bracket form,
   e.g. `upstream = "[2a01:4f8:c2c:123f:64:5:203:405]:443"`.
 
+## Upstream pools
+
+A **pool** is a set of endpoints that all serve the same role. sni-gate probes
+them in the background and routes each connection to the lowest-RTT healthy one,
+failing over when it degrades and recovering without intervention. Reference one
+with an `@` prefix, exactly like a named resolver or regex:
+
+```toml
+[pools.cf]
+targets = ["cf.example.com", "104.16.0.0/12[4]", "172.64.0.0/13[4]"]
+fallback = 0
+
+[pools.cf.probe]
+mode = "http"
+sni = "cloudflare.com"
+path = "/cdn-cgi/trace"
+status = [200]
+
+[[listener.route]]
+type = "ech"
+match_sni = [".x.com"]
+upstream = "@cf"
+select = ["ipv4"]
+```
+
+### Targets and candidates
+
+Two layers, and the distinction is what makes every index unambiguous:
+
+- A **target** is one `targets` entry. It has a stable zero-based index, and that
+  index is the *only* addressing unit in the config — `fallback`, `nat64.from`
+  and `select` all name targets.
+- A **candidate** is one probed address. One target yields several: a domain
+  yields one per A/AAAA record, a CIDR one per sampled address, and the NAT64
+  projection adds one per (IPv4 candidate × prefix).
+
+Tags belong to candidates, because that is where they are knowable: whether a
+domain contributes an `ipv4` or an `ipv6` endpoint is a fact about its DNS answer.
+So an integer in `select` matches a **target** (selecting all its candidates)
+while a string matches a **candidate tag**. For the same reason, indices are
+bounds-checked at load time but tags are not — an unmatched tag simply yields no
+candidates, and cannot be told apart at load from one that will match once DNS
+answers.
+
+| Target form | Type | Yields |
+|---|---|---|
+| `"cf.example.com"` | domain | one candidate per A/AAAA record |
+| `"1.2.3.4"`, `"2606:4700::1"` | literal | one candidate |
+| `"104.16.0.0/12[4]"` | CIDR, sampled | 4 candidates |
+| `{ addr = "...", tags = ["edge"] }` | any of the above | custom tags appended |
+
+`[N]` draws N random addresses. Omitting it expands the range and is **refused
+above 64 addresses** — a `/12` holds a million. Samples are drawn once at startup
+so RTT measurements survive; a sample that never answers is eventually replaced.
+
+### Probing
+
+| Mode | Tests | RTT measured to | Requires |
+|---|---|---|---|
+| `tcp` | TCP connect | connect completion | — |
+| `tls` | + TLS handshake | handshake completion | `sni` |
+| `http` | + HTTP GET | first response byte | `sni`, `path`, `status` |
+
+`sni` and `port` belong to the **pool**, not to any consuming route: the probe
+measures link quality to an edge node, not the response for one specific host. A
+route then applies its own port to the address the pool chose, which is why
+`upstream = "@cf:8443"` needs no second pool. A field a mode cannot use (`sni` on
+a `tcp` probe) is rejected rather than ignored.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `timeout` | `3s` | per-candidate deadline |
+| `interval` | `5m` | cycle for a healthy candidate |
+| `degraded_interval` | `30s` | **first** retry delay, doubling up to `interval` |
+| `fail_threshold` | `2` | consecutive failures before degradation |
+
+### How selection stays stable
+
+- **RTT is a moving average**, not the last sample, so one unlucky measurement
+  never hands the top of the ranking to a worse endpoint.
+- **Switching requires a margin** of 20% or 5ms, whichever is larger. Two
+  endpoints a millisecond apart would otherwise trade places every cycle, moving
+  traffic for no gain and invalidating the mirrored-certificate cache each time.
+- **Backoff is per-candidate and exponential.** Sampling a CIDR routinely draws
+  an address nothing answers on; a single pool-wide "degraded cadence" would let
+  one dead candidate pin the whole pool to the fast cycle forever.
+- **The data path never probes.** `select` is resolved when routes are built, so
+  serving a connection is one lock-free read of a published ranking — no
+  filtering, no DNS, no I/O. A traffic burst cannot become a probe burst.
+
+### NAT64 projection
+
+```toml
+[pools.cf.nat64]
+prefixes = ["64:ff9b::"]
+from = [1, 2]        # target indices; omit for all
+timeout = "8s"       # optional: NAT64 carries an extra hop
+```
+
+Not a separate pool — an address-family projection of the same one. Synthesized
+addresses are tagged `nat64` + `ipv6` and ranked **independently** of their IPv4
+originals, since a slow NAT64 gateway says nothing about the native path.
+
+### Fallback
+
+`fallback` is a target index, used before anything is healthy and whenever
+everything matching a consumer's `select` is degraded, then retired the moment one
+recovers. It is drawn under the consumer's own filter, so a `select = ["nat64"]`
+route falls back to a synthesized address rather than a bare IPv4 its host may not
+be able to reach.
+
+With no fallback and nothing healthy, the route's `fail` policy applies. A pool
+never invents a destination.
+
+### What a pool takes over
+
+A pool resolves its own targets, so `address_family`, `nat64_prefix` and
+`addr_resolver` are **rejected** on a route whose upstream is a pool — set them on
+the pool (which has its own `resolver`) instead. Values merely *inherited* from a
+broader scope are ignored rather than an error, so a global default stays usable.
+`select` is likewise rejected on a non-pool upstream, where it would silently do
+nothing.
+
+Two consequences worth knowing:
+
+- **The h2c probe is skipped** for pool upstreams. A pool has no settled address
+  at startup and its choice changes afterwards, so validating one candidate would
+  attest to something the data path may never dial.
+- **`tls`/`ech` routes need a name.** A pool selects an address, and no hostname
+  describes it, so the upstream certificate is verified against the route's SNI
+  (`override_sni`, or the reflected inbound name). If neither exists the
+  connection is refused with an error naming `override_sni` — verification is
+  never skipped.
+
 ## ECH
 
 For `type = "ech"` routes, the ECHConfigList is sourced by an `[ech]` block. Its

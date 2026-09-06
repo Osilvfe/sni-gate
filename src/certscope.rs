@@ -68,6 +68,41 @@ use std::sync::Arc;
 
 use crate::config::{AddressFamily, EchMode, RouteType, SniPolicy};
 
+/// Where a route sends a connection, and how that destination is determined.
+///
+/// A sum type rather than a host string plus resolution knobs, because the two
+/// cases are settled by different machinery and carry different fields. A direct
+/// upstream is resolved per connection by this route's own resolver, family and
+/// NAT64 prefix, so all three are part of its identity. A pool resolves, probes
+/// and ranks its own endpoints, so those fields are not merely unused — they do
+/// not exist for it, and including them would make editing an inoperative value
+/// rename every scope directory and re-sign every certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamIdentity {
+    /// A fixed host, or the reflected routing key.
+    Direct {
+        /// Fixed dial host, or `None` when the route reflects the routing key.
+        host: Option<String>,
+        /// Address family used to resolve the dial host.
+        family: AddressFamily,
+        /// NAT64 prefix as written in the configuration, if any.
+        nat64: Option<String>,
+        /// Resolver spec used for upstream A/AAAA.
+        addr_resolver: String,
+    },
+    /// A named pool's current best endpoint.
+    ///
+    /// `select` is deliberately **not** part of this identity. Two routes reading
+    /// different views of one pool still reach the same origin — a pool's targets
+    /// are alternative paths to one service, which is the premise that makes
+    /// probing them interchangeably meaningful — so the coverage an upstream
+    /// certificate grants is the same either way, and splitting the scope by view
+    /// would fragment certificates without excluding any name. What the invariant
+    /// requires is that no *other* destination share the partition, and the pool
+    /// name establishes that.
+    Pool { name: String },
+}
+
 /// Everything about a route that determines how a connection is forwarded.
 ///
 /// Two routes with equal `Forwarding` send a connection for a given name to the
@@ -79,19 +114,13 @@ use crate::config::{AddressFamily, EchMode, RouteType, SniPolicy};
 pub struct Forwarding {
     /// Upstream protocol handling.
     pub route_type: RouteType,
-    /// Fixed dial host, or `None` when the route reflects the routing key.
-    pub host: Option<String>,
+    /// Where the connection goes, and what decides that.
+    pub upstream: UpstreamIdentity,
     /// Upstream port.
     pub port: u16,
     /// SNI presented upstream. Distinguishes two routes to the same socket that
     /// would ask it for different virtual hosts.
     pub sni: SniPolicy,
-    /// Address family used to resolve the dial host.
-    pub family: AddressFamily,
-    /// NAT64 prefix as written in the configuration, if any.
-    pub nat64: Option<String>,
-    /// Resolver spec used for upstream A/AAAA.
-    pub addr_resolver: String,
     /// ECH source identity; `Some` only for `ech` routes.
     pub ech: Option<EchIdentity>,
 }
@@ -133,7 +162,10 @@ impl CertScope {
     /// trade is eight more characters against a failure mode that cannot be
     /// detected at runtime.
     pub fn new(router_fp: u64, f: &Forwarding) -> Self {
-        let host = f.host.as_deref().unwrap_or(REFLECT);
+        let host = match &f.upstream {
+            UpstreamIdentity::Direct { host, .. } => host.as_deref().unwrap_or(REFLECT).to_string(),
+            UpstreamIdentity::Pool { name } => format!("pool.{name}"),
+        };
         let readable = sanitize(&format!(
             "{}_{}_{}",
             route_type_str(f.route_type),
@@ -221,12 +253,26 @@ fn canonical(router_fp: u64, f: &Forwarding) -> String {
     let mut s = String::with_capacity(192);
     s.push_str(&format!("router={router_fp:016x};"));
     s.push_str(&format!("type={};", route_type_str(f.route_type)));
-    s.push_str(&format!("host={};", f.host.as_deref().unwrap_or(REFLECT)));
+    match &f.upstream {
+        UpstreamIdentity::Direct {
+            host,
+            family,
+            nat64,
+            addr_resolver,
+        } => {
+            s.push_str(&format!("host={};", host.as_deref().unwrap_or(REFLECT)));
+            s.push_str(&format!("family={family:?};"));
+            s.push_str(&format!("nat64={};", nat64.as_deref().unwrap_or("-")));
+            s.push_str(&format!("addr_resolver={addr_resolver};"));
+        }
+        // A pool's own definition governs its resolution, families and NAT64
+        // projection, so the name is the whole identity here. Deliberately
+        // distinct from any `host=` spelling: a pool named `x` and a host named
+        // `x` are different destinations.
+        UpstreamIdentity::Pool { name } => s.push_str(&format!("pool={name};")),
+    }
     s.push_str(&format!("port={};", f.port));
     s.push_str(&format!("sni={};", sni_str(&f.sni)));
-    s.push_str(&format!("family={:?};", f.family));
-    s.push_str(&format!("nat64={};", f.nat64.as_deref().unwrap_or("-")));
-    s.push_str(&format!("addr_resolver={};", f.addr_resolver));
     match &f.ech {
         Some(e) => s.push_str(&format!(
             "ech=mode:{:?},domain:{},resolver:{},inline:{};",
@@ -304,12 +350,14 @@ mod tests {
     fn fwd() -> Forwarding {
         Forwarding {
             route_type: RouteType::Ech,
-            host: Some("cf.0sm.com".into()),
+            upstream: UpstreamIdentity::Direct {
+                host: Some("cf.0sm.com".into()),
+                family: AddressFamily::Ipv4,
+                nat64: None,
+                addr_resolver: "dnspod-doh".into(),
+            },
             port: 443,
             sni: SniPolicy::Reflect,
-            family: AddressFamily::Ipv4,
-            nat64: None,
-            addr_resolver: "dnspod-doh".into(),
             ech: Some(EchIdentity {
                 mode: EchMode::Doh,
                 domain: Some("cloudflare-ech.com".into()),
@@ -317,6 +365,27 @@ mod tests {
                 inline_config: false,
             }),
         }
+    }
+
+    /// A `Direct` upstream, spelled out field by field so a test can vary exactly
+    /// one of them. Argument order mirrors the variant's declaration.
+    fn direct_of(
+        host: Option<&str>,
+        family: AddressFamily,
+        nat64: Option<&str>,
+        addr_resolver: &str,
+    ) -> UpstreamIdentity {
+        UpstreamIdentity::Direct {
+            host: host.map(str::to_string),
+            family,
+            nat64: nat64.map(str::to_string),
+            addr_resolver: addr_resolver.to_string(),
+        }
+    }
+
+    /// [`fwd`] with its upstream replaced.
+    fn fwd_with(upstream: UpstreamIdentity) -> Forwarding {
+        Forwarding { upstream, ..fwd() }
     }
 
     #[test]
@@ -341,12 +410,17 @@ mod tests {
         let mut f = fwd();
         f.route_type = RouteType::Tls;
         cases.push(("route_type", f));
-        let mut f = fwd();
-        f.host = None;
-        cases.push(("host->reflect", f));
-        let mut f = fwd();
-        f.host = Some("other.example".into());
-        cases.push(("host", f));
+        // Each case varies exactly one field of the baseline `Direct` upstream
+        // (host `cf.0sm.com`, family ipv4, no nat64, resolver `dnspod-doh`).
+        let v4 = AddressFamily::Ipv4;
+        cases.push((
+            "host->reflect",
+            fwd_with(direct_of(None, v4, None, "dnspod-doh")),
+        ));
+        cases.push((
+            "host",
+            fwd_with(direct_of(Some("other.example"), v4, None, "dnspod-doh")),
+        ));
         let mut f = fwd();
         f.port = 8443;
         cases.push(("port", f));
@@ -356,15 +430,28 @@ mod tests {
         let mut f = fwd();
         f.sni = SniPolicy::Fixed("x.example".into());
         cases.push(("sni fixed", f));
-        let mut f = fwd();
-        f.family = AddressFamily::Dual;
-        cases.push(("family", f));
-        let mut f = fwd();
-        f.nat64 = Some("64:ff9b::".into());
-        cases.push(("nat64", f));
-        let mut f = fwd();
-        f.addr_resolver = "system".into();
-        cases.push(("addr_resolver", f));
+        cases.push((
+            "family",
+            fwd_with(direct_of(
+                Some("cf.0sm.com"),
+                AddressFamily::Dual,
+                None,
+                "dnspod-doh",
+            )),
+        ));
+        cases.push((
+            "nat64",
+            fwd_with(direct_of(
+                Some("cf.0sm.com"),
+                v4,
+                Some("64:ff9b::"),
+                "dnspod-doh",
+            )),
+        ));
+        cases.push((
+            "addr_resolver",
+            fwd_with(direct_of(Some("cf.0sm.com"), v4, None, "system")),
+        ));
         let mut f = fwd();
         f.ech = None;
         cases.push(("ech absent", f));
@@ -380,6 +467,10 @@ mod tests {
         let mut f = fwd();
         f.ech.as_mut().unwrap().inline_config = true;
         cases.push(("ech inline", f));
+        // A pool upstream is a different destination from any direct one.
+        let mut f = fwd();
+        f.upstream = UpstreamIdentity::Pool { name: "cf".into() };
+        cases.push(("direct->pool", f));
 
         for (what, f) in cases {
             assert_ne!(
@@ -388,6 +479,30 @@ mod tests {
                 "changing {what} must change the scope"
             );
         }
+    }
+
+    /// Two pools are different partitions; the same pool is one.
+    #[test]
+    fn pool_identity_is_the_pool_name() {
+        let pool = |name: &str| {
+            CertScope::new(
+                1,
+                &fwd_with(UpstreamIdentity::Pool {
+                    name: name.to_string(),
+                }),
+            )
+        };
+        assert_eq!(pool("cf"), pool("cf"));
+        assert_ne!(pool("cf"), pool("fastly"));
+        // The readable prefix distinguishes a pool from a host of the same name,
+        // and the digest does too — `pool=x` never renders as `host=x`.
+        let host_named_cf = fwd_with(direct_of(
+            Some("cf"),
+            AddressFamily::Ipv4,
+            None,
+            "dnspod-doh",
+        ));
+        assert_ne!(pool("cf"), CertScope::new(1, &host_named_cf));
     }
 
     #[test]

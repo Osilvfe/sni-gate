@@ -175,6 +175,89 @@ fn nat64_or_v4(v4: Ipv4Addr, port: u16, nat64: Option<&Nat64Prefix>) -> SocketAd
     }
 }
 
+/// Resolve `host` to **every** address it publishes in `family`.
+///
+/// A different question from [`resolve_upstream`], which answers "where do I
+/// dial?" with one address. A pool asks "what are all the candidate endpoints?" —
+/// comparing several edges is its entire purpose, so collapsing the answer to its
+/// first record would discard exactly the alternatives it exists to rank.
+///
+/// A literal IP resolves to itself when it matches `family`. NAT64 is
+/// deliberately **not** applied here: a pool synthesizes its own projected
+/// addresses so they can be probed and ranked independently of their IPv4
+/// originals (see [`crate::pool`]).
+///
+/// With `Dual`, both families are queried and the results concatenated. One
+/// family failing is not an error as long as the other answered — a name with
+/// only A records is ordinary, and hickory reports the missing AAAA as a failed
+/// lookup rather than an empty one.
+pub async fn resolve_all_ips(
+    resolver: &TokioResolver,
+    host: &str,
+    family: AddressFamily,
+) -> Result<Vec<IpAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let usable = !matches!(
+            (ip, family),
+            (IpAddr::V4(_), AddressFamily::Ipv6) | (IpAddr::V6(_), AddressFamily::Ipv4)
+        );
+        return Ok(if usable { vec![ip] } else { Vec::new() });
+    }
+
+    let mut out: Vec<IpAddr> = Vec::new();
+    let mut last_err: Option<anyhow::Error> = None;
+
+    if family != AddressFamily::Ipv6 {
+        match lookup_all_v4(resolver, host).await {
+            Ok(v) => out.extend(v.into_iter().map(IpAddr::V4)),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if family != AddressFamily::Ipv4 {
+        match lookup_all_v6(resolver, host).await {
+            Ok(v) => out.extend(v.into_iter().map(IpAddr::V6)),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    if out.is_empty() {
+        return Err(last_err.unwrap_or_else(|| anyhow!("no A or AAAA records for {host}")));
+    }
+    Ok(out)
+}
+
+async fn lookup_all_v4(resolver: &TokioResolver, host: &str) -> Result<Vec<Ipv4Addr>> {
+    use hickory_resolver::proto::rr::RData;
+    let lookup = resolver
+        .lookup(host, RecordType::A)
+        .await
+        .with_context(|| format!("A lookup for {host}"))?;
+    Ok(lookup
+        .answers()
+        .iter()
+        .filter_map(|r| match &r.data {
+            RData::A(a) => Some(a.0),
+            _ => None,
+        })
+        .collect())
+}
+
+async fn lookup_all_v6(resolver: &TokioResolver, host: &str) -> Result<Vec<Ipv6Addr>> {
+    use hickory_resolver::proto::rr::RData;
+    let lookup = resolver
+        .lookup(host, RecordType::AAAA)
+        .await
+        .with_context(|| format!("AAAA lookup for {host}"))?;
+    Ok(lookup
+        .answers()
+        .iter()
+        .filter_map(|r| match &r.data {
+            RData::AAAA(a) => Some(a.0),
+            _ => None,
+        })
+        .collect())
+}
+
 async fn lookup_v4(resolver: &TokioResolver, host: &str) -> Result<Ipv4Addr> {
     use hickory_resolver::proto::rr::RData;
     let lookup = resolver
@@ -304,6 +387,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out6, "[2a01:4f8::1]:443".parse().unwrap());
+    }
+
+    /// A literal address needs no lookup, and the family filter still applies —
+    /// so a `select = ["ipv6"]` consumer never receives a v4 literal.
+    #[tokio::test]
+    async fn resolve_all_handles_literals_and_filters_by_family() {
+        let r = ResolverSpec::System.build(AddressFamily::Dual).unwrap();
+        let v4: IpAddr = "1.2.3.4".parse().unwrap();
+        let v6: IpAddr = "2606:4700::1".parse().unwrap();
+
+        // Matching or unconstrained: returned as-is.
+        for family in [AddressFamily::Dual, AddressFamily::Ipv4] {
+            assert_eq!(
+                resolve_all_ips(&r, "1.2.3.4", family).await.unwrap(),
+                vec![v4]
+            );
+        }
+        for family in [AddressFamily::Dual, AddressFamily::Ipv6] {
+            assert_eq!(
+                resolve_all_ips(&r, "2606:4700::1", family).await.unwrap(),
+                vec![v6]
+            );
+        }
+
+        // Mismatched: no candidates rather than a wrong-family one.
+        assert!(resolve_all_ips(&r, "1.2.3.4", AddressFamily::Ipv6)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(resolve_all_ips(&r, "2606:4700::1", AddressFamily::Ipv4)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // NAT64 is deliberately not applied here: a pool synthesizes its own
+        // projected addresses so they can be ranked independently.
+        assert_eq!(
+            resolve_all_ips(&r, "1.2.3.4", AddressFamily::Dual)
+                .await
+                .unwrap(),
+            vec![v4],
+            "resolve_all_ips must not synthesize NAT64 addresses"
+        );
     }
 
     #[test]

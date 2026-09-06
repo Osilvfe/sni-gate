@@ -14,6 +14,7 @@ mod ech;
 mod error;
 mod nat64;
 mod peek;
+mod pool;
 mod probe;
 mod proxy;
 mod psl;
@@ -36,12 +37,13 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::ca::{CaParams, CertificateAuthority};
-use crate::certscope::{CertScope, EchIdentity, Forwarding};
+use crate::certscope::{CertScope, EchIdentity, Forwarding, UpstreamIdentity};
 use crate::config::{Config, Listener, Route, RouteType};
 use crate::dns::ResolverSpec;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
-use crate::proxy::{ListenerState, RouteRuntime, ServerConfigs};
+use crate::pool::{Pool, PoolBuilder};
+use crate::proxy::{ListenerState, RouteRuntime, ServerConfigs, Upstream};
 use crate::resolver::{DynamicResolver, Issuer, IssuerParams};
 use crate::router::Router;
 use crate::store::CertStore;
@@ -224,6 +226,9 @@ async fn run(cfg: Config) -> Result<()> {
     // --- Build named resolvers in dependency order ---
     let named_resolvers = build_named_resolvers(&cfg, &mut resolver_cache).await?;
 
+    // --- Build and start pools, before any route can read one ---
+    let pools = build_pools(&cfg, &named_resolvers, &mut resolver_cache, &root_store)?;
+
     let mut probe_targets: Vec<ProbeTarget> = Vec::new();
 
     // --- Build every listener ---
@@ -237,6 +242,7 @@ async fn run(cfg: Config) -> Result<()> {
             &named_resolvers,
             &mut resolver_cache,
             &mut probe_targets,
+            &pools,
         )?;
         listener_states.push(Arc::new(state));
     }
@@ -268,7 +274,91 @@ async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
+/// Build every declared pool and start its probe loop.
+///
+/// Two passes, because the two halves of a pool's identity come from opposite
+/// ends of the config: the pool table says what to probe, and the *routes* say
+/// which candidate subsets anyone cares about. Registering every view before
+/// spawning means the probe task publishes a finished, ordered answer for each
+/// one from its very first cycle — so `select` is never evaluated on the data
+/// path, and no view is ever registered against a running pool.
+///
+/// A declared-but-unreferenced pool is not built at all: probing endpoints no
+/// route can reach is pure background traffic. It is worth saying so, since an
+/// unused pool is usually a typo in an `upstream`.
+fn build_pools(
+    cfg: &Config,
+    named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
+    resolver_cache: &mut ResolverCache,
+    root_store: &Arc<RootCertStore>,
+) -> Result<HashMap<String, Arc<Pool>>> {
+    if cfg.pools.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Deterministic order: a HashMap iterates differently per process, and pool
+    // startup logs that reshuffle run to run are a poor diagnostic.
+    let mut names: Vec<&String> = cfg.pools.keys().collect();
+    names.sort_unstable();
+
+    let mut builders: HashMap<&str, PoolBuilder> = HashMap::new();
+    for name in names {
+        let def = cfg.pool_def(name)?;
+        // A pool resolves its own domain targets: which resolver reaches them is
+        // as much a property of the pool as the endpoints themselves.
+        let spec = def.resolver.clone().unwrap_or_else(|| "system".to_string());
+        let resolver = get_resolver(
+            named_resolvers,
+            resolver_cache,
+            &spec,
+            config::AddressFamily::Dual,
+        )
+        .with_context(|| format!("[pools.{name}]: resolver"))?;
+        builders.insert(
+            name.as_str(),
+            PoolBuilder::new(name, def, resolver, root_store.clone())
+                .with_context(|| format!("[pools.{name}]"))?,
+        );
+    }
+
+    // Pass 1: every route that references a pool registers its filter.
+    for listener in &cfg.listeners {
+        let port = listener.addr.port();
+        for route in listener.routes.iter().chain(listener.default_route.iter()) {
+            let tpl = cfg.template_for(&route.use_template)?;
+            let spec = route.upstream_spec(tpl);
+            let Some(resolved) = config::resolved_upstream_from(spec, port) else {
+                continue; // malformed upstreams are already rejected at load
+            };
+            if let config::UpstreamHost::Pool(name) = &resolved.host {
+                let builder = builders.get_mut(name.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("route {}: unknown pool @{name}", route.label())
+                })?;
+                builder.register_view(route.select_for(tpl));
+            }
+        }
+    }
+
+    // Pass 2: spawn the pools anyone actually reads.
+    let mut out = HashMap::new();
+    for (name, builder) in builders {
+        if !builder.is_used() {
+            tracing::warn!(
+                pool = name,
+                "pool is declared but no route references it, so it is not probed. \
+                 Point an `upstream = \"@{name}\"` at it, or remove it"
+            );
+            continue;
+        }
+        let pool = builder.spawn().with_context(|| format!("[pools.{name}]"))?;
+        info!(pool = name, "started pool");
+        out.insert(name.to_string(), pool);
+    }
+    Ok(out)
+}
+
 /// Assemble one listener's router + route runtimes from config.
+#[allow(clippy::too_many_arguments)]
 fn build_listener(
     cfg: &Config,
     listener: &Listener,
@@ -277,6 +367,7 @@ fn build_listener(
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
     probe_targets: &mut Vec<ProbeTarget>,
+    pools: &HashMap<String, Arc<Pool>>,
 ) -> Result<ListenerState> {
     let mut runtimes: Vec<Arc<RouteRuntime>> = Vec::new();
     let mut patterns: Vec<Vec<String>> = Vec::new();
@@ -291,6 +382,7 @@ fn build_listener(
             named_resolvers,
             resolver_cache,
             probe_targets,
+            pools,
         )?;
         runtimes.push(Arc::new(built.runtime));
         forwardings.push(built.forwarding);
@@ -307,6 +399,7 @@ fn build_listener(
             named_resolvers,
             resolver_cache,
             probe_targets,
+            pools,
         )?;
         runtimes.push(Arc::new(built.runtime));
         forwardings.push(built.forwarding);
@@ -472,6 +565,7 @@ struct BuiltRoute {
 
 /// Build one route's runtime, flattening effective settings and building (or
 /// reusing) its resolvers and ECH provider.
+#[allow(clippy::too_many_arguments)]
 fn build_route(
     cfg: &Config,
     listener: &Listener,
@@ -480,6 +574,7 @@ fn build_route(
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
     probe_targets: &mut Vec<ProbeTarget>,
+    pools: &HashMap<String, Arc<Pool>>,
 ) -> Result<BuiltRoute> {
     // Templates were validated at load, so name lookups cannot fail here.
     let rt_tpl = cfg.template_for(&route.use_template)?;
@@ -494,12 +589,16 @@ fn build_route(
     // Upstream comes from the route or its template (route scope only). Defaulted
     // parts resolve against this listener's port; a `None` host reflects the
     // matched source SNI/Host per connection.
-    let upstream_spec = route
-        .upstream
-        .as_deref()
-        .or_else(|| rt_tpl.and_then(|t| t.upstream.as_deref()));
-    let (host, port) = config::resolved_upstream_from(upstream_spec, listener.addr.port())
+    let upstream_spec = route.upstream_spec(rt_tpl);
+    let resolved = config::resolved_upstream_from(upstream_spec, listener.addr.port())
         .ok_or_else(|| anyhow::anyhow!("route {}: invalid upstream", route.label()))?;
+    let port = resolved.port;
+    // The fixed dial host, when there is one. `None` covers both a reflecting
+    // route and a pool (which selects an address, not a name).
+    let fixed_host = match &resolved.host {
+        config::UpstreamHost::Fixed(h) => Some(h.clone()),
+        config::UpstreamHost::Reflect | config::UpstreamHost::Pool(_) => None,
+    };
 
     // SNI presented upstream: route → template (deeper wins). A present-but-blank
     // value means "send no SNI extension" rather than "inherit".
@@ -516,12 +615,56 @@ fn build_route(
     };
 
     let addr_spec = eff.addr_resolver.clone().unwrap_or_default();
-    let addr_resolver = get_resolver(
-        named_resolvers,
-        resolver_cache,
-        &addr_spec,
-        eff.address_family,
-    )?;
+
+    // Where this route sends connections, and what turns that into an address.
+    //
+    // A pool owns its resolution, address families and NAT64 projection, so this
+    // route's own copies of those are neither built nor recorded: writing them
+    // explicitly alongside a pool upstream is a load-time error, and a value
+    // merely *inherited* from a broader scope must not silently fragment the
+    // certificate scope (see `certscope::UpstreamIdentity`).
+    let (upstream, upstream_identity) = match &resolved.host {
+        config::UpstreamHost::Pool(name) => {
+            let pool = pools
+                .get(name.as_str())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("route {}: unknown pool @{name}", route.label()))?;
+            // Registered in `build_pools`' first pass, so this is a lookup.
+            let view = pool.view_for(route.select_for(rt_tpl)).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "route {}: pool @{name} has no view for this route's `select` \
+                     (internal inconsistency between view registration and route build)",
+                    route.label()
+                )
+            })?;
+            (
+                Upstream::Pool(PoolBuilder::handle(pool, view)),
+                UpstreamIdentity::Pool { name: name.clone() },
+            )
+        }
+        _ => {
+            let resolver = get_resolver(
+                named_resolvers,
+                resolver_cache,
+                &addr_spec,
+                eff.address_family,
+            )?;
+            (
+                Upstream::Direct {
+                    host: fixed_host.clone(),
+                    family: eff.address_family,
+                    nat64,
+                    resolver,
+                },
+                UpstreamIdentity::Direct {
+                    host: fixed_host.clone(),
+                    family: eff.address_family,
+                    nat64: eff.nat64_prefix.clone(),
+                    addr_resolver: addr_spec.clone(),
+                },
+            )
+        }
+    };
 
     let eff_ech = cfg.effective_ech(listener, route, rt_tpl, ln_tpl);
     // Which ECHConfigList source this route uses, for the certificate scope: two
@@ -569,21 +712,32 @@ fn build_route(
     // ALPN choice and so cannot be wrong about it.
     if eff_http2.enabled && route_type == RouteType::Http && eff_http2.probe != config::H2Probe::Off
     {
-        match &host {
-            Some(h) => probe_targets.push(ProbeTarget {
+        match (&upstream, &fixed_host) {
+            (Upstream::Direct { resolver, .. }, Some(h)) => probe_targets.push(ProbeTarget {
                 route: route.label(),
                 host: h.clone(),
                 port,
                 policy: eff_http2.probe,
                 budget: eff_http2.probe_timeout,
-                resolver: addr_resolver.clone(),
+                resolver: resolver.clone(),
                 family: eff.address_family,
                 nat64,
             }),
+            // A pool has no settled address at startup: its first probe cycle
+            // has not run, and the endpoint it will choose can change afterwards
+            // anyway. Probing one candidate would validate something the data
+            // path may never dial, which is worse than not probing — the h2c
+            // probe exists to catch a *fixed* misconfigured backend.
+            (Upstream::Pool(handle), _) => debug!(
+                route = %route.label(),
+                pool = handle.name(),
+                "skipping h2c probe: the upstream is a pool, so it has no fixed \
+                 backend to validate at startup"
+            ),
             // A reflecting route has no fixed upstream host at startup — the
             // target is whichever name each connection carries — so there is
             // nothing to probe.
-            None => debug!(
+            (Upstream::Direct { .. }, None) => debug!(
                 route = %route.label(),
                 "skipping h2c probe: the route reflects the source SNI/Host, so \
                  it has no fixed upstream to probe at startup"
@@ -598,12 +752,9 @@ fn build_route(
     // fragment scopes without buying any safety.
     let forwarding = Forwarding {
         route_type,
-        host: host.clone(),
+        upstream: upstream_identity,
         port,
         sni: sni_policy.clone(),
-        family: eff.address_family,
-        nat64: eff.nat64_prefix.clone(),
-        addr_resolver: addr_spec.clone(),
         ech: ech_identity,
     };
 
@@ -611,7 +762,7 @@ fn build_route(
         runtime: RouteRuntime {
             name: route.label(),
             route_type,
-            upstream_host: host,
+            upstream,
             upstream_port: port,
             sni_policy,
             http2: eff_http2.enabled,
@@ -619,10 +770,7 @@ fn build_route(
             max_retries: eff_ech.max_retries,
             connect_timeout: eff.connect_timeout,
             idle_timeout: eff.idle_timeout,
-            address_family: eff.address_family,
-            nat64,
             fail: eff.fail,
-            addr_resolver,
             ech,
             root_store: root_store.clone(),
         },
@@ -798,10 +946,27 @@ async fn build_named_resolvers(
 
         // Dial host and port after upstream override.
         let endpoint_host = endpoint.host().unwrap_or_default().to_string();
-        let (up_host, port) =
-            config::resolved_upstream_from(eff.upstream.as_deref(), endpoint.port()).unwrap();
-        let dial_host = up_host.unwrap_or_else(|| endpoint_host.clone());
-        let dial_port = port;
+        let resolved = config::resolved_upstream_from(eff.upstream.as_deref(), endpoint.port())
+            .ok_or_else(|| anyhow::anyhow!("[resolvers.{name}]: invalid upstream"))?;
+        let dial_host = match &resolved.host {
+            config::UpstreamHost::Fixed(h) => h.clone(),
+            // No inbound connection to reflect: a resolver's `upstream` omits the
+            // host to mean "keep the endpoint's own", not "reflect".
+            config::UpstreamHost::Reflect => endpoint_host.clone(),
+            // A pool ranks its targets by probing them, and reaching those
+            // targets needs a resolver — so a resolver dialing *through* a pool
+            // would be a build cycle with no base case. Rejected here rather than
+            // deadlocking startup, in the same spirit as the `bootstrap` cycle
+            // check.
+            config::UpstreamHost::Pool(pool) => {
+                return Err(anyhow::anyhow!(
+                    "[resolvers.{name}]: upstream = \"@{pool}\" is not supported — a pool must \
+                     resolve its own targets through a resolver, so a resolver cannot dial \
+                     through a pool. Give this resolver a literal host, or a `bootstrap`"
+                ))
+            }
+        };
+        let dial_port = resolved.port;
 
         // For Plain endpoints (IP addresses), we don't need to resolve the dial_host
         // through bootstrap - it's already an IP that will be used directly in dns_resolvers::build.

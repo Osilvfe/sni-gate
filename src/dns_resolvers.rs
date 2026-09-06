@@ -402,12 +402,44 @@ impl DnsResolver {
         family: AddressFamily,
         nat64: Option<&Nat64Prefix>,
     ) -> Result<SocketAddr> {
+        self.with_ech_retry(|resolver| async move {
+            dns::resolve_upstream(&resolver, host, port, family, nat64).await
+        })
+        .await
+    }
+
+    /// Resolve `host` to **every** address it publishes in `family`, with the same
+    /// reactive ECH rebuild-and-retry as [`Self::lookup_addr`].
+    ///
+    /// Used by pools, which rank alternatives and so need all of them; the data
+    /// path dials one address and uses [`Self::lookup_addr`].
+    pub async fn resolve_all(&self, host: &str, family: AddressFamily) -> Result<Vec<IpAddr>> {
+        self.with_ech_retry(|resolver| async move {
+            dns::resolve_all_ips(&resolver, host, family).await
+        })
+        .await
+    }
+
+    /// Run `op` against the live resolver, rebuilding from a fresh ECHConfig and
+    /// retrying when the endpoint rejects ECH.
+    ///
+    /// Factored out because all three lookup entry points need exactly this
+    /// behaviour, and three copies of a retry loop would be three chances for them
+    /// to drift apart on the one thing that must stay identical: how many attempts
+    /// a rejection is worth, and which generation the rebuild is racing against.
+    async fn with_ech_retry<T, F, Fut>(&self, mut op: F) -> Result<T>
+    where
+        F: FnMut(Arc<TokioResolver>) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
         let max_retries = self.plan.as_ref().map_or(0, |p| p.max_retries());
         let mut attempt = 0u32;
         loop {
+            // Recorded *before* the attempt, so a concurrent rebuild for the same
+            // rotation is detected and this task retries against theirs.
             let seen = self.generation();
             let resolver = self.snapshot();
-            match dns::resolve_upstream(&resolver, host, port, family, nat64).await {
+            match op(resolver).await {
                 Err(e) if attempt < max_retries && ech::is_ech_reject_chain(&e) => {
                     warn!(
                         resolver = %self.label,
@@ -428,29 +460,14 @@ impl DnsResolver {
     /// Used for HTTPS/`ech=` lookups, which is how one resolver fetches
     /// another's ECHConfigList.
     pub async fn lookup(&self, name: &str, rtype: RecordType) -> Result<Lookup> {
-        let max_retries = self.plan.as_ref().map_or(0, |p| p.max_retries());
-        let mut attempt = 0u32;
-        loop {
-            let seen = self.generation();
-            let resolver = self.snapshot();
-            let out = resolver
+        self.with_ech_retry(|resolver| async move {
+            resolver
                 .lookup(name, rtype)
                 .await
                 .map_err(anyhow::Error::new)
-                .with_context(|| format!("{rtype} lookup for {name}"));
-            match out {
-                Err(e) if attempt < max_retries && ech::is_ech_reject_chain(&e) => {
-                    warn!(
-                        resolver = %self.label,
-                        attempt = attempt + 1,
-                        "resolver endpoint rejected ECH; rebuilding from a fresh ECHConfig"
-                    );
-                    self.rebuild(seen, RebuildCause::Rejected).await;
-                    attempt += 1;
-                }
-                other => return other,
-            }
-        }
+                .with_context(|| format!("{rtype} lookup for {name}"))
+        })
+        .await
     }
 
     /// Rebuild and swap, unless another task already did it for this generation.
@@ -995,9 +1012,14 @@ mod tests {
         override_sni: Option<&str>,
     ) -> (String, u16, Option<String>) {
         let endpoint_host = endpoint.host().unwrap_or_default().to_string();
-        let (up_host, port) =
-            crate::config::resolved_upstream_from(upstream, endpoint.port()).unwrap();
-        let dial_host = up_host.unwrap_or_else(|| endpoint_host.clone());
+        let resolved = crate::config::resolved_upstream_from(upstream, endpoint.port()).unwrap();
+        let port = resolved.port;
+        let dial_host = match &resolved.host {
+            crate::config::UpstreamHost::Fixed(h) => h.clone(),
+            // A resolver has no inbound connection to reflect, so an omitted host
+            // keeps the endpoint's own. A pool is rejected before reaching here.
+            _ => endpoint_host.clone(),
+        };
         let name = match SniPolicy::resolve(override_sni) {
             SniPolicy::Reflect | SniPolicy::Omit => endpoint.host().map(str::to_string),
             SniPolicy::Fixed(n) => Some(n),

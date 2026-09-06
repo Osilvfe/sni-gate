@@ -285,3 +285,84 @@ connect_timeout = "5s"
 #   require_ech = true
 #   ech_resolver = "@cloudflare"     # Cloudflare fetches secure's ECH config
 
+# ---------------------------------------------------------------------------
+# Upstream pools (adaptive endpoint selection)
+# ---------------------------------------------------------------------------
+# A pool is a set of endpoints that all serve the same role. sni-gate probes
+# them in the background and routes to the lowest-RTT healthy one, failing over
+# automatically. Reference one with @ prefix: upstream = "@cf"
+#
+# TARGETS AND CANDIDATES. A *target* is one `targets` entry and has a stable
+# index; that index is what `fallback`, `nat64.from` and `select` refer to. A
+# *candidate* is one probed address, and one target yields several: a domain
+# yields one per A/AAAA record, a CIDR one per sampled address. Tags belong to
+# candidates (a domain's A record is `ipv4`, its AAAA record is `ipv6`), which is
+# why an index addresses a target while a tag matches a candidate.
+#
+# [pools.cf]
+# targets = [
+#     "cf.example.com",                                     # [0] domain
+#     "104.16.0.0/12[4]",                                   # [1] CIDR, sample 4
+#     "172.64.0.0/13[4]",                                   # [2] CIDR, sample 4
+#     { addr = "2606:4700::/32[4]", tags = ["native-v6"] },  # [3] custom tag
+# ]
+# fallback = 0                       # target index used until something is healthy
+# resolver = "@cloudflare"           # who resolves this pool's domain targets
+#
+# `[N]` samples N random addresses from a CIDR. Omitting it expands the range,
+# which is refused above 64 addresses — a /12 holds a million. Samples are drawn
+# once at startup so RTT measurements survive; one that never answers is
+# eventually replaced.
+#
+#   [pools.cf.probe]
+#   mode = "http"                    # tcp | tls | http
+#   port = 443                       # probed port (default 443), the pool's own
+#   sni = "cloudflare.com"           # required for tls/http
+#   path = "/cdn-cgi/trace"          # required for http
+#   status = [200]                   # required for http; accepted response codes
+#   timeout = "5s"                   # per-candidate deadline (default 3s)
+#   interval = "5m"                  # cycle for a healthy candidate
+#   degraded_interval = "30s"        # FIRST retry delay, doubling up to interval
+#   fail_threshold = 2               # consecutive failures before degradation
+#
+# `sni` and `port` belong to the pool, not to any route: the probe measures link
+# quality to an edge node, not the response for one host. A route applies its own
+# port to the chosen address, so `upstream = "@cf:8443"` needs no second pool.
+#
+# RTT is a moving average, and switching requires a 20%/5ms margin, so a single
+# slow sample never moves traffic. A degraded candidate backs off exponentially,
+# so one permanently dead endpoint cannot pin the pool to the fast cycle.
+#
+#   [pools.cf.nat64]                 # address-family projection, not a new pool
+#   prefixes = ["64:ff9b::"]         # each IPv4 candidate x each prefix
+#   from = [1, 2]                    # target indices; omit for all
+#   timeout = "8s"                   # NAT64 carries an extra hop
+#
+# Synthesized addresses are probed and ranked independently of their IPv4
+# originals, and are tagged `nat64` + `ipv6`.
+#
+# SELECTING CANDIDATES. `select` on a route or template filters which candidates
+# that consumer ranks. Strings match tags, integers match target indices, and all
+# entries are unioned (OR):
+#
+# [templates.cf-v4]
+# upstream = "@cf"
+# select = ["ipv4"]                  # IPv4 only
+#
+# [templates.cf-nat64]
+# upstream = "@cf"
+# select = ["nat64"]                 # NAT64-synthesized only
+#
+# [templates.cf-native-v6]
+# upstream = "@cf"
+# select = ["native-v6"]             # custom tag: native IPv6, excluding NAT64
+#
+# [templates.cf-best]
+# upstream = "@cf"                   # every candidate; best RTT wins
+#
+# A pool resolves its own targets, so `address_family`, `nat64_prefix` and
+# `addr_resolver` are rejected on a route whose upstream is a pool — set them on
+# the pool instead. Values merely inherited from [global] are ignored, not an
+# error. `select` is likewise rejected on a non-pool upstream, where it would do
+# nothing.
+

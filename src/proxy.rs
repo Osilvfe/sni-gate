@@ -48,18 +48,85 @@ use crate::config::{AddressFamily, FailPolicy, RouteType, SniPolicy};
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::peek::{classify, Inbound};
+use crate::pool::PoolHandle;
 use crate::resolver::{observed_dns_sans, DynamicResolver};
 use crate::router::Router;
 
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
+/// Where a route's connections go, and what turns that into an address.
+///
+/// The two cases are settled by different machinery, so they carry different
+/// data: a direct upstream is resolved per connection through this route's own
+/// resolver, family and NAT64 prefix, while a pool has already resolved, probed
+/// and ranked its endpoints and simply hands over the current best one.
+pub enum Upstream {
+    Direct {
+        /// Fixed upstream host, or `None` to reflect the matched source SNI/Host
+        /// (the port-stripped routing key) per connection.
+        host: Option<String>,
+        family: AddressFamily,
+        nat64: Option<Nat64Prefix>,
+        /// DNS resolver for upstream A/AAAA.
+        resolver: Arc<crate::dns_resolvers::DnsResolver>,
+    },
+    /// A pool's current best endpoint for this route's view.
+    Pool(PoolHandle),
+}
+
+impl Upstream {
+    /// The host name for this connection: the dial target for a direct upstream,
+    /// and in both cases the name an upstream certificate is verified against
+    /// when no `override_sni` supplies one.
+    ///
+    /// `None` for a pool: a pool selects an *address*, and no hostname describes
+    /// it. A `tls`/`ech` route over a pool therefore takes its verification name
+    /// from the inbound SNI or from `override_sni`, never from the upstream.
+    fn dial_host(&self, key: Option<&str>) -> Option<String> {
+        match self {
+            Upstream::Direct { host, .. } => match host.as_deref() {
+                Some(fixed) => Some(fixed.to_string()),
+                None => key.map(strip_port),
+            },
+            Upstream::Pool(_) => None,
+        }
+    }
+
+    /// The address to dial on `port`.
+    async fn resolve(&self, port: u16, dial_host: Option<&str>, route: &str) -> Result<SocketAddr> {
+        match self {
+            Upstream::Direct {
+                family,
+                nat64,
+                resolver,
+                ..
+            } => {
+                let host = dial_host.ok_or_else(|| {
+                    anyhow!(
+                        "route {route} reflects the source SNI/Host upstream, but the \
+                         connection presented none"
+                    )
+                })?;
+                resolver
+                    .lookup_addr(host, port, *family, nat64.as_ref())
+                    .await
+                    .with_context(|| format!("resolving upstream {host}"))
+            }
+            // No I/O and no DNS: the probe task already decided. A failure here
+            // means every candidate is degraded and no fallback is usable, which
+            // the route's fail policy then handles.
+            Upstream::Pool(handle) => handle
+                .pick(port)
+                .with_context(|| format!("route {route}: selecting a pool endpoint")),
+        }
+    }
+}
+
 /// Everything a single route needs at runtime.
 pub struct RouteRuntime {
     pub name: String,
     pub route_type: RouteType,
-    /// Fixed upstream host, or `None` to reflect the matched source SNI/Host
-    /// (the port-stripped routing key) per connection.
-    pub upstream_host: Option<String>,
+    pub upstream: Upstream,
     pub upstream_port: u16,
     /// What SNI to present upstream: reflect the inbound name, force a fixed
     /// one, or send no `server_name` extension at all.
@@ -70,11 +137,7 @@ pub struct RouteRuntime {
     pub max_retries: u32,
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
-    pub address_family: AddressFamily,
-    pub nat64: Option<Nat64Prefix>,
     pub fail: FailPolicy,
-    /// DNS resolver for upstream A/AAAA.
-    pub addr_resolver: Arc<crate::dns_resolvers::DnsResolver>,
     /// ECH provider (only for `ech` routes).
     pub ech: Option<EchProvider>,
     /// Verified web-PKI roots for upstream TLS (`ech`/`tls`).
@@ -174,12 +237,10 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, state: &ListenerState) ->
     };
 
     // Effective dial host: the fixed upstream host, else the matched source
-    // SNI/Host (port-stripped). `None` here means the route reflects but the
-    // connection carried no SNI/Host — handled at dial time per route type.
-    let dial_host = match rt.upstream_host.as_deref() {
-        Some(fixed) => Some(fixed.to_string()),
-        None => key.map(strip_port),
-    };
+    // SNI/Host (port-stripped). `None` here means either the route reflects but
+    // the connection carried no SNI/Host, or the upstream is a pool (which picks
+    // an address, not a name) — both handled at dial time per route type.
+    let dial_host = rt.upstream.dial_host(key);
 
     debug!(%peer, route = %rt.name, key = key.unwrap_or("<none>"), tls = inbound.is_tls(), "routed");
 
@@ -379,28 +440,15 @@ async fn serve_mirrored(
     // What the client is willing to speak, narrowed to what we can splice.
     let client_offer = negotiable_alpn(start.client_hello().alpn().map(Iterator::collect));
 
-    let host = dial_host.ok_or_else(|| {
-        anyhow!(
-            "route {} reflects the source SNI/Host upstream, but the connection \
-             presented none",
-            rt.name
-        )
-    })?;
     let upstream_addr = rt
-        .addr_resolver
-        .lookup_addr(
-            &host,
-            rt.upstream_port,
-            rt.address_family,
-            rt.nat64.as_ref(),
-        )
-        .await
-        .with_context(|| format!("resolving upstream {host}"))?;
+        .upstream
+        .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
+        .await?;
 
     // Dial first, so the upstream's choice can drive the inbound handshake.
     let up = match rt.route_type {
         RouteType::Tls => {
-            let name = sni.clone().unwrap_or_else(|| host.clone());
+            let name = tls_verification_name(rt, &sni, dial_host.as_deref())?;
             dial_tls(upstream_addr, &name, rt, &client_offer).await?
         }
         RouteType::Ech => {
@@ -468,27 +516,10 @@ async fn forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Concrete host to dial: the fixed upstream host, or the reflected source
-    // SNI/Host. Absent only when the route reflects and the connection carried
-    // no SNI/Host to reflect.
-    let host = dial_host.ok_or_else(|| {
-        anyhow!(
-            "route {} reflects the source SNI/Host upstream, but the connection \
-             presented none",
-            rt.name
-        )
-    })?;
-
     let upstream_addr = rt
-        .addr_resolver
-        .lookup_addr(
-            &host,
-            rt.upstream_port,
-            rt.address_family,
-            rt.nat64.as_ref(),
-        )
-        .await
-        .with_context(|| format!("resolving upstream {host}"))?;
+        .upstream
+        .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
+        .await?;
 
     match rt.route_type {
         RouteType::Http => {
@@ -499,7 +530,7 @@ where
         // where inbound was negotiated as http/1.1 — so offer nothing upstream
         // and let it default to HTTP/1.1 too, exactly as before.
         RouteType::Tls => {
-            let name = sni.clone().unwrap_or_else(|| host.clone());
+            let name = tls_verification_name(rt, &sni, dial_host.as_deref())?;
             let up = dial_tls(upstream_addr, &name, rt, &[]).await?;
             // HTTP/2 is off for this connection, so it cannot coalesce — but a
             // later connection for the same name can, and this is a free look at
@@ -523,6 +554,39 @@ where
         }
         RouteType::Raw => unreachable!("raw handled before termination"),
     }
+}
+
+/// The name a `tls` route verifies the upstream certificate against.
+///
+/// Order: the route's effective SNI (a fixed `override_sni`, or the reflected
+/// inbound name), else the dial host. A direct upstream always has one of the
+/// two, so this only fails for a pool — which selects an *address*, and no
+/// hostname describes it — on a connection that carried no SNI/Host and whose
+/// route pins no name.
+///
+/// That case is an error rather than a fallback to the address, because the only
+/// certificate an IP-named verification could accept is one with an IP SAN, which
+/// no CDN edge serves. Reporting it names the fix (`override_sni`) instead of
+/// failing later inside the handshake with a name-mismatch nobody can act on.
+/// Verification is never skipped: suppressing SNI changes what is *transmitted*,
+/// not what is *trusted*.
+fn tls_verification_name(
+    rt: &RouteRuntime,
+    sni: &Option<String>,
+    dial_host: Option<&str>,
+) -> Result<String> {
+    if let Some(name) = sni {
+        return Ok(name.clone());
+    }
+    if let Some(host) = dial_host {
+        return Ok(host.to_string());
+    }
+    Err(anyhow!(
+        "tls route {}: no name to verify the upstream certificate against — the \
+         connection carried no SNI/Host, and an upstream pool selects an address \
+         rather than a name. Set `override_sni` on this route",
+        rt.name
+    ))
 }
 
 /// Plain TCP dial with a timeout.
@@ -717,21 +781,9 @@ async fn raw_passthrough(
     dial_host: Option<String>,
 ) -> Result<()> {
     let dialed = async {
-        let host = dial_host.ok_or_else(|| {
-            anyhow!(
-                "route {} reflects the source SNI/Host upstream, but the \
-                 connection presented none",
-                rt.name
-            )
-        })?;
         let upstream_addr = rt
-            .addr_resolver
-            .lookup_addr(
-                &host,
-                rt.upstream_port,
-                rt.address_family,
-                rt.nat64.as_ref(),
-            )
+            .upstream
+            .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
             .await?;
         dial(upstream_addr, rt.connect_timeout).await
     }
