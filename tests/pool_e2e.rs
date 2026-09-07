@@ -330,6 +330,58 @@ addr = "127.0.0.1:{listen}"
     );
 }
 
+/// Two targets may legitimately resolve to the same address. The endpoint is
+/// probed once, but both target-index and custom-tag identities must survive.
+#[test]
+fn same_address_keeps_each_targets_selection_identity() {
+    let dir = tempdir();
+    let (backend, _b) = spawn_mock_backend();
+    let listen = free_port();
+
+    let config = format!(
+        r#"{}
+[pools.edge]
+targets = [
+  {{ addr = "127.0.0.1", tags = ["first"] }},
+  {{ addr = "127.0.0.1", tags = ["second"] }},
+]
+
+[pools.edge.probe]
+mode = "tcp"
+port = {backend}
+timeout = "1s"
+interval = "5s"
+
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "by-index"
+  type = "http"
+  match_sni = [".index.test"]
+  upstream = "@edge:{backend}"
+  select = [1]
+
+  [[listener.route]]
+  name = "by-tag"
+  type = "http"
+  match_sni = [".tag.test"]
+  upstream = "@edge:{backend}"
+  select = ["second"]
+"#,
+        preamble()
+    );
+
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+    for host in ["a.index.test", "a.tag.test"] {
+        let resp = get_via_gateway(listen, host);
+        assert!(
+            resp.contains("200 OK"),
+            "{host} lost the shared address's target/tag provenance: {resp:?}"
+        );
+    }
+}
+
 /// Two routes reading different views of one pool both work, which is what
 /// `register_view` deduplication and per-view publishing exist to support.
 #[test]
