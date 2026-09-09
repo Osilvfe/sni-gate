@@ -380,34 +380,44 @@ fn normalize_scope_suffix(scope: &str) -> String {
     }
 }
 
-/// Check if a scope pattern matches a given parent domain.
+/// Whether a regex route's declared `scope` could match some host that the
+/// wildcard `*.parent` would cover.
 ///
-/// This determines whether a wildcard `*.parent` would conflict with a regex
-/// route that declares `scope` as one of its scope suffixes.
+/// # The question this asks
 ///
-/// * `scope = "*.domain.com"` matches `parent = "domain.com"` (and only that)
-/// * `scope = ".domain.com"` matches `parent = "domain.com"` and any ancestor
-///   (e.g., `"a.domain.com"`, `"sub.a.domain.com"`)
-/// * `scope = "domain.com"` never matches (exact scopes don't overlap with wildcards)
+/// A wildcard `*.P` covers exactly `W(P) = { L.P : L is one label }`. A scope
+/// declaration covers its own set of hosts `S(scope)`. The wildcard conflicts
+/// with the regex precisely when those two sets **intersect** — when some single
+/// host is both covered by the wildcard and matchable by the regex.
+///
+/// Asking instead whether the scope covers `parent` *itself* is a different
+/// question with a different answer, and getting them confused is unsound in the
+/// permissive direction: `*.site.test` covers `a.site.test`, so a regex scoped to
+/// `a.site.test` conflicts even though it says nothing about `site.test`.
+///
+/// # The three forms, worked out
+///
+/// * **`*.d`** — `S = { L.d }`. Intersects `W(P)` only when `d == P`: a host one
+///   label above `d` is one label above `P` only if they are the same domain.
+/// * **`.d`** — `S = { d } ∪ { x.d : any x }`. Intersects when `d` is `P` or
+///   below it (`x.d` can then be spelled `L.P`), and *also* when `d` is exactly
+///   one label above `P` (then `d` itself is in `W(P)`).
+/// * **`d`** — `S = { d }`. Intersects when `d` is exactly one label above `P`.
+///   Not "never": that would only be right if `W(P)` contained `P`, which is the
+///   apex a single-level wildcard famously does not cover.
 ///
 /// The scope must already be normalized via [`normalize_scope_suffix`].
 fn match_scope_pattern(scope: &str, parent: &str) -> bool {
     if let Some(suffix) = scope.strip_prefix("*.") {
-        // Wildcard scope: "*.domain.com"
-        // Matches only when parent is exactly the suffix
-        // e.g., scope "*.akamaized.net" matches parent "akamaized.net"
+        // `L.suffix` is one label above `parent` only when they name one domain.
         parent == suffix
     } else if let Some(suffix) = scope.strip_prefix('.') {
-        // Suffix scope: ".domain.com"
-        // Matches parent if parent is the suffix or any subdomain of it
-        // e.g., scope ".example.com" matches "example.com", "a.example.com", etc.
-        is_suffix_of_or_equal(parent, suffix)
+        // Either the scope reaches down into the wildcard's names, or the scope's
+        // own apex is one of them.
+        is_suffix_of_or_equal(parent, suffix) || one_label_above(suffix, parent).is_some()
     } else {
-        // Exact scope: "domain.com"
-        // Wildcard *.parent does not include parent itself, so exact scopes
-        // never conflict with wildcards in the context of wildcard_confined.
-        // They would only matter for name_confined (checking exact names).
-        false
+        // A single host: it conflicts exactly when the wildcard covers it.
+        one_label_above(scope, parent).is_some()
     }
 }
 
@@ -694,27 +704,104 @@ mod tests {
         );
     }
 
-    #[test]
-    fn regex_with_exact_scope_never_blocks_wildcards() {
-        // Regex declares scope "example.com" (exact, no prefix)
-        // This should never block *.example.com because exact doesn't overlap with wildcards
+    /// Three routes that reach the regex tier for `*.site.test`: an out-of-scope
+    /// regex, an in-scope exact route that is not one label above `site.test`, and
+    /// an in-scope default. The wildcard and suffix tiers deliberately miss, so
+    /// the verdict is decided by the scope overlap rule and nothing else.
+    fn regex_tier_router(scope: &str) -> Router {
         let mut regexes = HashMap::new();
         regexes.insert(
-            "apex-only".to_string(),
-            make_regex_def("^example\\.com$", vec!["example.com"]),
+            "r".to_string(),
+            make_regex_def("^[a-z]+\\.site\\.test$", vec![scope]),
         );
-
-        let r = router_with_regexes(
+        router_with_regexes(
             &[
-                vec!["@apex-only".into()],    // route 0: regex (apex only)
-                vec!["*.example.com".into()], // route 1: wildcard
+                vec!["@r".into()],         // route 0: regex, out of scope
+                vec!["other.test".into()], // route 1: the wildcard's owner
+                vec![],                    // route 2: default, in scope
             ],
-            None,
+            Some(2),
+            &regexes,
+        )
+    }
+
+    /// Scope overlap is an *intersection* test between the hosts a wildcard covers
+    /// and the hosts a regex may match — not a test of whether the scope covers the
+    /// wildcard's parent.
+    ///
+    /// `*.site.test` covers `a.site.test`, so every spelling of a scope that can
+    /// match `a.site.test` conflicts with it. Two of these three were admitted
+    /// before: an exact scope was treated as never conflicting, and a suffix scope
+    /// was only compared downward from `parent`. Both let a certificate carry a
+    /// wildcard covering a name this listener routes to the regex instead — exactly
+    /// the coalescing escape `wildcard_confined` exists to refuse.
+    #[test]
+    fn a_regex_scoped_one_label_above_the_parent_blocks_the_wildcard() {
+        let in_scope = |id: RouteId| id == 1 || id == 2;
+        for scope in ["a.site.test", ".a.site.test", "*.site.test"] {
+            let r = regex_tier_router(scope);
+            // The premise, asserted through the real matcher rather than assumed:
+            // a host the wildcard covers really does route to the regex.
+            assert_eq!(
+                r.match_host("a.site.test"),
+                Some(0),
+                "premise failed for scope {scope:?}"
+            );
+            assert_eq!(
+                r.wildcard_confined("site.test", &in_scope),
+                Err(Escape::RegexTier { route: 0 }),
+                "scope {scope:?} can match a.site.test, so *.site.test must be refused"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a single-level wildcard never covers the
+    /// apex it names, so a regex confined to that apex cannot be reached through
+    /// the wildcard and must not withhold it. Over-refusing here would cost
+    /// connection reuse for no safety.
+    #[test]
+    fn a_regex_scoped_to_the_apex_does_not_block_the_wildcard_over_it() {
+        let in_scope = |id: RouteId| id == 1 || id == 2;
+        // This case needs a regex that really can match the apex, so it gets its
+        // own pattern rather than the shared `^[a-z]+\.site\.test$` helper.
+        let mut regexes = HashMap::new();
+        regexes.insert(
+            "apex".to_string(),
+            make_regex_def("^site\\.test$", vec!["site.test"]),
+        );
+        let r = router_with_regexes(
+            &[vec!["@apex".into()], vec!["other.test".into()], vec![]],
+            Some(2),
             &regexes,
         );
+        // The premise: the apex itself does route to the out-of-scope regex …
+        assert_eq!(r.match_host("site.test"), Some(0), "premise");
+        // … and yet `*.site.test`, which never covers the apex, stays allowed.
+        assert_eq!(r.wildcard_confined("site.test", &in_scope), Ok(()));
+    }
 
-        // *.example.com should be allowed: exact scope "example.com" doesn't overlap
-        assert_eq!(r.wildcard_confined("example.com", &only(1)), Ok(()));
+    /// A scope far from the wildcard stays irrelevant: the fix must not turn every
+    /// out-of-scope regex into a blanket refusal.
+    #[test]
+    fn an_unrelated_regex_scope_still_allows_the_wildcard() {
+        let in_scope = |id: RouteId| id == 1 || id == 2;
+        for scope in ["*.elsewhere.test", ".elsewhere.test", "elsewhere.test"] {
+            let r = regex_tier_router(scope);
+            assert_eq!(
+                r.wildcard_confined("site.test", &in_scope),
+                Ok(()),
+                "scope {scope:?} cannot match any L.site.test"
+            );
+        }
+    }
+
+    /// A deeper scope is not one label above the parent, so it does not conflict:
+    /// `*.site.test` covers `a.site.test` but never `b.a.site.test`.
+    #[test]
+    fn a_regex_scoped_two_labels_above_the_parent_allows_the_wildcard() {
+        let in_scope = |id: RouteId| id == 1 || id == 2;
+        let r = regex_tier_router("b.a.site.test");
+        assert_eq!(r.wildcard_confined("site.test", &in_scope), Ok(()));
     }
 
     #[test]
@@ -806,9 +893,28 @@ mod tests {
 
     #[test]
     fn match_scope_pattern_exact() {
-        // "example.com" (no prefix) never matches in wildcard context
+        // An exact scope names one host, so it overlaps `*.parent` exactly when
+        // that host is one label above `parent` — the case `*.a.com` covers.
+        assert!(match_scope_pattern("sub.example.com", "example.com"));
+        // The apex is not covered by a single-level wildcard over it, and a
+        // deeper host is two labels away; neither overlaps.
         assert!(!match_scope_pattern("example.com", "example.com"));
+        assert!(!match_scope_pattern("a.sub.example.com", "example.com"));
         assert!(!match_scope_pattern("example.com", "sub.example.com"));
+        // A shared tail is not a label boundary.
+        assert!(!match_scope_pattern("xexample.com", "example.com"));
+    }
+
+    /// The suffix form overlaps in two independent ways, and both must be caught.
+    #[test]
+    fn match_scope_pattern_suffix_overlaps_downward_and_at_its_own_apex() {
+        // Downward: `.example.com` reaches `L.example.com`.
+        assert!(match_scope_pattern(".example.com", "example.com"));
+        // At its own apex: `.sub.example.com` contains `sub.example.com`, which is
+        // itself one of the hosts `*.example.com` covers.
+        assert!(match_scope_pattern(".sub.example.com", "example.com"));
+        // Two labels above is neither.
+        assert!(!match_scope_pattern(".a.sub.example.com", "example.com"));
     }
 
     #[test]
