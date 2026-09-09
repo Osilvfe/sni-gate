@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 /// Internally the full 128-bit value is stored, but only the top 96 bits are
 /// significant; the low 32 bits are always zero and are the slot into which an
 /// IPv4 address is embedded during synthesis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Nat64Prefix {
     /// The 128-bit prefix. The low 32 bits are guaranteed to be zero.
     prefix: u128,

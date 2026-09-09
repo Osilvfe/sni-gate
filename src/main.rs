@@ -778,64 +778,155 @@ fn build_route(
     })
 }
 
+/// Everything that decides what a probe connects to.
+///
+/// Two routes agreeing on all of it would dial the same address, so they share
+/// one probe. `(host, port)` alone is not enough: the same name resolves
+/// differently under a different resolver, address family or NAT64 prefix, and
+/// merging those would validate a backend the data path never reaches.
+///
+/// The resolver is identified by its label — a named resolver's name, or the
+/// inline spec — together with the family, which is exactly the pair
+/// [`get_resolver`] caches inline specs on. Same label and family therefore means
+/// the same underlying resolver, which `Arc` identity would miss because an
+/// inline spec is wrapped afresh per call.
+#[derive(PartialEq, Eq, Hash)]
+struct ProbeKey {
+    host: String,
+    port: u16,
+    family: config::AddressFamily,
+    nat64: Option<Nat64Prefix>,
+    resolver: String,
+}
+
+/// The routes sharing one backend, and the policy their probe answers to.
+struct ProbeGroup {
+    /// Every route that named this backend, so a verdict can name them all.
+    routes: Vec<String>,
+    policy: config::H2Probe,
+    budget: Duration,
+    resolver: Arc<dns_resolvers::DnsResolver>,
+}
+
+/// The stricter of two probe policies.
+///
+/// `require` wins. When one route insists a shared backend speaks h2c, another
+/// route's willingness to merely warn about the same backend cannot weaken that —
+/// the strictness is a property of the demand, not of which task finished first.
+///
+/// Written out rather than derived, so the answer does not depend on the order the
+/// variants happen to be declared in.
+fn stricter(a: config::H2Probe, b: config::H2Probe) -> config::H2Probe {
+    use config::H2Probe::{Off, Require, Warn};
+    match (a, b) {
+        (Require, _) | (_, Require) => Require,
+        (Warn, _) | (_, Warn) => Warn,
+        (Off, Off) => Off,
+    }
+}
+
+/// Merge targets that would dial the same backend into one group each.
+///
+/// Merging happens *before* probing, which is the whole point: deduplicating the
+/// results instead left one task spawned per route — so N routes on one backend
+/// opened N sockets, despite the documented claim of one probe — and let whichever
+/// task finished first decide for the entire group. With a `require` and a `warn`
+/// route sharing a backend, a `warn` arriving first discarded the `require`
+/// failure and startup wrongly succeeded, non-deterministically.
+///
+/// A group takes the strictest policy any member asked for and the most generous
+/// budget, so sharing a probe can neither weaken a demand nor impose a tighter
+/// deadline than a route agreed to.
+fn group_probe_targets(targets: Vec<ProbeTarget>) -> HashMap<ProbeKey, ProbeGroup> {
+    let mut groups: HashMap<ProbeKey, ProbeGroup> = HashMap::new();
+    for t in targets {
+        let ProbeTarget {
+            route,
+            host,
+            port,
+            policy,
+            budget,
+            resolver,
+            family,
+            nat64,
+        } = t;
+        let key = ProbeKey {
+            host,
+            port,
+            family,
+            nat64,
+            resolver: resolver.label().to_string(),
+        };
+        let group = groups.entry(key).or_insert_with(|| ProbeGroup {
+            routes: Vec::new(),
+            policy: config::H2Probe::Off,
+            budget: Duration::ZERO,
+            resolver,
+        });
+        group.routes.push(route);
+        group.policy = stricter(group.policy, policy);
+        group.budget = group.budget.max(budget);
+    }
+    groups
+}
+
 /// Resolve and probe every collected h2c target concurrently, then apply each
 /// one's policy.
 ///
-/// Backends are deduplicated by resolved address, so several routes pointing at
-/// the same upstream cost one probe. A `require` failure aborts startup; a `warn`
-/// failure is logged loudly and startup continues with HTTP/2 still enabled — the
-/// probe validates, it never decides (see [`probe`]).
+/// Routes that would dial the same backend are merged into one probe **before**
+/// probing (see [`group_probe_targets`]), and the merged group answers to the
+/// strictest policy any of them asked for. A `require` failure aborts startup; a
+/// `warn` failure is logged loudly and startup continues with HTTP/2 still enabled
+/// — the probe validates, it never decides (see [`probe`]).
 async fn run_probes(targets: Vec<ProbeTarget>) -> Result<()> {
     if targets.is_empty() {
         return Ok(());
     }
 
+    let groups = group_probe_targets(targets);
+
     let mut set = tokio::task::JoinSet::new();
-    for t in targets {
+    for (key, group) in groups {
         set.spawn(async move {
-            // Resolution shares the route's own resolver/family/NAT64 settings so
+            // Resolution shares the routes' own resolver/family/NAT64 settings so
             // the probe reaches exactly the address the data path would dial.
-            let resolved = t
+            let resolved = group
                 .resolver
-                .lookup_addr(&t.host, t.port, t.family, t.nat64.as_ref())
+                .lookup_addr(&key.host, key.port, key.family, key.nat64.as_ref())
                 .await
-                .with_context(|| format!("resolving h2c probe target {}:{}", t.host, t.port));
+                .with_context(|| format!("resolving h2c probe target {}:{}", key.host, key.port));
             let outcome = match resolved {
-                Ok(addr) => probe::probe_h2c(addr, t.budget).await,
+                Ok(addr) => probe::probe_h2c(addr, group.budget).await,
                 Err(e) => Err(e),
             };
-            (t.route, t.host, t.port, t.policy, outcome)
+            (group.routes, key.host, key.port, group.policy, outcome)
         });
     }
 
-    // Deduplicate by (host, port): routes sharing a backend need only one verdict.
-    let mut seen: std::collections::HashSet<(String, u16)> = std::collections::HashSet::new();
     let mut failures: Vec<String> = Vec::new();
 
     while let Some(joined) = set.join_next().await {
-        let (route, host, port, policy, outcome) = joined.context("h2c probe task panicked")?;
-        if !seen.insert((host.clone(), port)) {
-            continue;
-        }
+        let (routes, host, port, policy, outcome) = joined.context("h2c probe task panicked")?;
+        let upstream = format!("{host}:{port}");
         match outcome {
-            Ok(()) => info!(route = %route, upstream = %format!("{host}:{port}"), "h2c probe ok"),
+            Ok(()) => info!(routes = ?routes, upstream = %upstream, "h2c probe ok"),
             Err(e) => {
                 let detail = format!("{e:#}");
                 match policy {
                     config::H2Probe::Require => failures.push(format!(
-                        "route {route}: upstream {host}:{port} failed the h2c probe: {detail}"
+                        "routes {routes:?}: upstream {upstream} failed the h2c probe: {detail}"
                     )),
                     // Keep HTTP/2 enabled: the config says the backend speaks it,
                     // and a transient failure at boot (backend not up yet) must
                     // not silently reshape the running configuration.
                     config::H2Probe::Warn => tracing::warn!(
-                        route = %route,
-                        upstream = %format!("{host}:{port}"),
+                        routes = ?routes,
+                        upstream = %upstream,
                         error = %detail,
-                        "h2c probe failed; HTTP/2 stays enabled for this route as configured. \
+                        "h2c probe failed; HTTP/2 stays enabled for these routes as configured. \
                          If the backend really cannot do h2c, either enable HTTP/2 on it or set \
-                         http2.enabled = false for this route. If it simply had not started yet, \
-                         this warning is harmless."
+                         http2.enabled = false for these routes. If it simply had not started \
+                         yet, this warning is harmless."
                     ),
                     config::H2Probe::Off => unreachable!("off targets are never collected"),
                 }
@@ -1109,5 +1200,186 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod probe_grouping_tests {
+    use super::*;
+
+    /// A resolver handle labelled `label`. `System` performs no I/O to build, so
+    /// this needs no network — and the label is what grouping keys on.
+    fn resolver(label: &str) -> Arc<dns_resolvers::DnsResolver> {
+        let built = ResolverSpec::System
+            .build(config::AddressFamily::Dual)
+            .unwrap();
+        dns_resolvers::DnsResolver::new(label.to_string(), built, None, None)
+    }
+
+    struct Target {
+        route: &'static str,
+        host: &'static str,
+        policy: config::H2Probe,
+        family: config::AddressFamily,
+        nat64: Option<&'static str>,
+        resolver: &'static str,
+        budget_secs: u64,
+    }
+
+    impl Default for Target {
+        fn default() -> Self {
+            Self {
+                route: "r",
+                host: "backend.test",
+                policy: config::H2Probe::Warn,
+                family: config::AddressFamily::Dual,
+                nat64: None,
+                resolver: "system",
+                budget_secs: 3,
+            }
+        }
+    }
+
+    impl Target {
+        fn build(self) -> ProbeTarget {
+            ProbeTarget {
+                route: self.route.to_string(),
+                host: self.host.to_string(),
+                port: 8080,
+                policy: self.policy,
+                budget: Duration::from_secs(self.budget_secs),
+                resolver: resolver(self.resolver),
+                family: self.family,
+                nat64: self.nat64.map(|p| p.parse::<Nat64Prefix>().unwrap()),
+            }
+        }
+    }
+
+    fn group(targets: Vec<Target>) -> Vec<ProbeGroup> {
+        let mut out: Vec<ProbeGroup> =
+            group_probe_targets(targets.into_iter().map(Target::build).collect())
+                .into_values()
+                .collect();
+        // Deterministic order for assertions; grouping itself is order-free.
+        out.sort_by(|a, b| a.routes.cmp(&b.routes));
+        out
+    }
+
+    /// The reported defect: a `require` route and a `warn` route sharing one
+    /// backend must probe once, under `require`.
+    ///
+    /// Deduplicating results instead let whichever task finished first speak for
+    /// the group, so a `warn` arriving before the `require` silently discarded the
+    /// failure and startup succeeded — depending on `join_next` ordering, which is
+    /// not deterministic. Asserted in both input orders for exactly that reason.
+    #[test]
+    fn a_require_route_is_not_weakened_by_a_warn_route_on_the_same_backend() {
+        for (a, b) in [
+            (config::H2Probe::Require, config::H2Probe::Warn),
+            (config::H2Probe::Warn, config::H2Probe::Require),
+        ] {
+            let groups = group(vec![
+                Target {
+                    route: "first",
+                    policy: a,
+                    ..Default::default()
+                },
+                Target {
+                    route: "second",
+                    policy: b,
+                    ..Default::default()
+                },
+            ]);
+            assert_eq!(groups.len(), 1, "one backend must mean one probe");
+            assert_eq!(groups[0].policy, config::H2Probe::Require);
+            assert_eq!(groups[0].routes.len(), 2, "both routes must be reported");
+        }
+    }
+
+    /// The merged probe must not impose a deadline tighter than any member agreed
+    /// to, so the group takes the most generous budget.
+    #[test]
+    fn a_merged_group_keeps_the_most_generous_budget() {
+        let groups = group(vec![
+            Target {
+                route: "quick",
+                budget_secs: 1,
+                ..Default::default()
+            },
+            Target {
+                route: "patient",
+                budget_secs: 30,
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].budget, Duration::from_secs(30));
+    }
+
+    /// `(host, port)` is not the identity of a backend: the same name resolves
+    /// elsewhere under a different family, NAT64 prefix or resolver, so merging
+    /// those would validate an address the data path never dials.
+    #[test]
+    fn targets_reaching_different_addresses_are_not_merged() {
+        let base = || Target {
+            route: "a",
+            ..Default::default()
+        };
+        let variants = [
+            Target {
+                route: "family",
+                family: config::AddressFamily::Ipv4,
+                ..Default::default()
+            },
+            Target {
+                route: "nat64",
+                nat64: Some("64:ff9b::"),
+                ..Default::default()
+            },
+            Target {
+                route: "resolver",
+                resolver: "@other-doh",
+                ..Default::default()
+            },
+            Target {
+                route: "host",
+                host: "elsewhere.test",
+                ..Default::default()
+            },
+        ];
+        for v in variants {
+            let what = v.route;
+            assert_eq!(
+                group(vec![base(), v]).len(),
+                2,
+                "differing {what} must not share a probe"
+            );
+        }
+    }
+
+    /// Identical targets across many routes still cost exactly one probe — the
+    /// property the old code documented but did not have.
+    #[test]
+    fn many_routes_on_one_backend_cost_one_probe() {
+        let groups = group((0..5).map(|_| Target::default()).collect());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].routes.len(), 5);
+    }
+
+    /// Strictness is a property of the demand, not of argument order.
+    #[test]
+    fn stricter_is_symmetric_and_ordered() {
+        use config::H2Probe::{Off, Require, Warn};
+        for (a, b, want) in [
+            (Require, Warn, Require),
+            (Require, Off, Require),
+            (Warn, Off, Warn),
+            (Off, Off, Off),
+            (Warn, Warn, Warn),
+            (Require, Require, Require),
+        ] {
+            assert_eq!(stricter(a, b), want, "{a:?} vs {b:?}");
+            assert_eq!(stricter(b, a), want, "{b:?} vs {a:?} (reversed)");
+        }
     }
 }
