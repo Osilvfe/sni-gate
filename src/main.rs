@@ -372,6 +372,7 @@ fn build_listener(
     let mut runtimes: Vec<Arc<RouteRuntime>> = Vec::new();
     let mut patterns: Vec<Vec<String>> = Vec::new();
     let mut forwardings: Vec<Forwarding> = Vec::new();
+    let mut pinned: Vec<Option<Arc<rustls::sign::CertifiedKey>>> = Vec::new();
 
     for route in &listener.routes {
         let built = build_route(
@@ -386,6 +387,7 @@ fn build_listener(
         )?;
         runtimes.push(Arc::new(built.runtime));
         forwardings.push(built.forwarding);
+        pinned.push(built.pinned);
         patterns.push(route.match_sni.clone());
     }
 
@@ -403,6 +405,7 @@ fn build_listener(
         )?;
         runtimes.push(Arc::new(built.runtime));
         forwardings.push(built.forwarding);
+        pinned.push(built.pinned);
         patterns.push(Vec::new());
         Some(id)
     } else {
@@ -426,7 +429,12 @@ fn build_listener(
 
     // This listener's certificate resolver: the shared issuer bound to this
     // routing table.
-    let cert_resolver = Arc::new(DynamicResolver::new(issuer, router.clone(), scopes.clone()));
+    let cert_resolver = Arc::new(DynamicResolver::new(
+        issuer,
+        router.clone(),
+        scopes.clone(),
+        pinned.into(),
+    ));
 
     warn_on_raw_overlap(listener, &runtimes, &patterns, cfg);
 
@@ -561,6 +569,9 @@ fn warn_on_raw_overlap(
 struct BuiltRoute {
     runtime: RouteRuntime,
     forwarding: Forwarding,
+    /// The operator-pinned certificate for this route, when it sets
+    /// `cert_file`/`key_file`. `None` means dynamic issuance.
+    pinned: Option<Arc<rustls::sign::CertifiedKey>>,
 }
 
 /// Build one route's runtime, flattening effective settings and building (or
@@ -745,6 +756,25 @@ fn build_route(
         }
     }
 
+    // An operator-pinned certificate, loaded here so a bad path or key fails
+    // startup rather than a handshake. Validation guarantees both halves are
+    // present or neither, and rejects the pair on a `raw` route.
+    let pinned = match route.cert_key(rt_tpl) {
+        (Some(cert), Some(key)) => {
+            let certified = resolver::load_pinned_certificate(cert, key)
+                .with_context(|| format!("route {}", route.label()))?;
+            info!(
+                route = %route.label(),
+                cert = %cert.display(),
+                sans = ?resolver::certificate_dns_sans(&certified),
+                "pinned certificate loaded; this route does not issue from the CA"
+            );
+            Some(certified)
+        }
+        // Validation rejects a half-set pair, so this is the dynamic-issuance case.
+        _ => None,
+    };
+
     // The forwarding identity that decides which names may share this route's
     // certificates. Everything here can change where a connection goes or under
     // what name it is presented; nothing that cannot (timeouts, the fail policy,
@@ -775,6 +805,7 @@ fn build_route(
             root_store: root_store.clone(),
         },
         forwarding,
+        pinned,
     })
 }
 

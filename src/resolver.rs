@@ -164,6 +164,12 @@ pub struct DynamicResolver {
     router: Arc<Router>,
     /// The certificate scope of each route id, indexed by id.
     scopes: Arc<[CertScope]>,
+    /// The operator-pinned certificate of each route id, indexed by id.
+    ///
+    /// `Some` only for a route that set `cert_file`/`key_file`. Such a route opts
+    /// out of dynamic issuance entirely: the pinned pair is served verbatim, and
+    /// nothing about it is mirrored, clipped or cached.
+    pinned: Arc<[Option<Arc<CertifiedKey>>]>,
 }
 
 impl std::fmt::Debug for DynamicResolver {
@@ -203,12 +209,24 @@ enum Drop {
 
 impl DynamicResolver {
     /// Bind `issuer` to one listener's routing table. `scopes[i]` is the
-    /// certificate scope of route id `i`.
-    pub fn new(issuer: Arc<Issuer>, router: Arc<Router>, scopes: Arc<[CertScope]>) -> Self {
+    /// certificate scope of route id `i`, and `pinned[i]` is that route's
+    /// operator-supplied certificate, if it set one.
+    pub fn new(
+        issuer: Arc<Issuer>,
+        router: Arc<Router>,
+        scopes: Arc<[CertScope]>,
+        pinned: Arc<[Option<Arc<CertifiedKey>>]>,
+    ) -> Self {
+        debug_assert_eq!(
+            scopes.len(),
+            pinned.len(),
+            "both are indexed by route id, so they must describe the same routes"
+        );
         Self {
             issuer,
             router,
             scopes,
+            pinned,
         }
     }
 
@@ -217,6 +235,49 @@ impl DynamicResolver {
         // Indices come from this listener's own router, whose ids are built from
         // the same route vector as `scopes`.
         &self.scopes[id]
+    }
+
+    /// The certificate this route pins, if it pins one.
+    ///
+    /// A pinned route is outside the mirroring machinery entirely: the operator
+    /// supplied the exact chain to serve, so there is nothing to learn from the
+    /// upstream and nothing to clip. Both the issuance path and the observation
+    /// path check this first.
+    fn pinned_for(&self, id: RouteId) -> Option<&Arc<CertifiedKey>> {
+        self.pinned.get(id).and_then(Option::as_ref)
+    }
+
+    /// The certificate to serve for `sni_host` on route `owner`: the pinned one if
+    /// this route has one, else a dynamically issued one.
+    ///
+    /// The whole body of [`ResolvesServerCert::resolve`] past route matching, so a
+    /// test can assert what is actually served without constructing a `ClientHello`
+    /// (which is not publicly constructible). Keeping the precedence here rather
+    /// than in the trait impl is what stops a test from asserting a copy of the
+    /// rule that production could drift away from.
+    fn certificate_for(&self, sni_host: &str, owner: RouteId) -> anyhow::Result<Arc<CertifiedKey>> {
+        // An operator-pinned certificate wins outright: it was loaded at startup,
+        // so this costs one `Arc` clone and never touches the CA, the cache or the
+        // store.
+        if let Some(pinned) = self.pinned_for(owner) {
+            tracing::debug!(host = sni_host, "serving the route's pinned certificate");
+            return Ok(pinned.clone());
+        }
+
+        // `ResolvesServerCert` is a synchronous trait called from inside rustls's
+        // handshake, which runs on a tokio worker thread. On a cache miss the work
+        // below blocks: a keygen and signature, and — the dominant cost by roughly
+        // 40x, measured — two file writes plus renames. Blocking a worker on file
+        // I/O stalls every other task queued on it, so hand it to the blocking pool
+        // instead of the async worker.
+        //
+        // `block_in_place` rather than `spawn_blocking`: this thread must produce a
+        // value before returning, and the certificate must be persisted before it
+        // is served, so the work cannot be detached. Moving the save out of the
+        // single-flight lock would decouple it, but two successive issuances for one
+        // key could then land out of order and persist the stale certificate.
+        // Correct ordering is worth more than the few milliseconds.
+        in_blocking_context(|| self.get_or_issue(sni_host, owner))
     }
 
     /// Clip an observed upstream SAN set down to the names this listener may
@@ -416,6 +477,11 @@ impl DynamicResolver {
             // nothing out of date either.
             return true;
         };
+        if self.pinned_for(owner).is_some() {
+            // A pinned route serves what the operator supplied; the upstream's
+            // coverage is not consulted, so it can never be out of date.
+            return true;
+        }
         let key = CacheKey {
             scope: self.scope_of(owner).clone(),
             sni_host: normalize_host(sni_host),
@@ -442,6 +508,11 @@ impl DynamicResolver {
         let Some(owner) = self.router.match_host(sni_host) else {
             return;
         };
+        if self.pinned_for(owner).is_some() {
+            // Nothing to mirror onto: this route serves the operator's own
+            // certificate, and re-signing it is not this program's decision.
+            return;
+        }
         let host = normalize_host(sni_host);
         let scope = self.scope_of(owner).clone();
         let key = CacheKey {
@@ -545,6 +616,66 @@ impl DynamicResolver {
     }
 }
 
+/// Load an operator-pinned certificate chain and key from disk.
+///
+/// Used for a route that sets `cert_file`/`key_file`, which opts that route out of
+/// dynamic issuance: the pair is served exactly as supplied.
+///
+/// Unlike the keys this program issues itself — always ECDSA, hence
+/// [`any_ecdsa_type`] on that path — a pinned key is whatever the operator has.
+/// [`any_supported_type`](rustls::crypto::aws_lc_rs::sign::any_supported_type)
+/// accepts RSA and ECDSA alike, so pinning a certificate from an existing PKI does
+/// not require re-keying it.
+///
+/// Failures are returned rather than logged: a route that names a certificate it
+/// cannot serve is a configuration error, and startup is the moment to say so.
+/// Discovering it inside a handshake instead would surface as an unexplained
+/// connection failure.
+pub fn load_pinned_certificate(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<Arc<CertifiedKey>> {
+    use anyhow::Context as _;
+
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("reading pinned certificate {}", cert_path.display()))?;
+    let key_pem = std::fs::read(key_path)
+        .with_context(|| format!("reading pinned key {}", key_path.display()))?;
+
+    let chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("parsing pinned certificate {}", cert_path.display()))?;
+    anyhow::ensure!(
+        !chain.is_empty(),
+        "pinned certificate {} contains no certificate",
+        cert_path.display()
+    );
+
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .with_context(|| format!("parsing pinned key {}", key_path.display()))?
+        .with_context(|| format!("pinned key {} contains no private key", key_path.display()))?;
+
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).map_err(|e| {
+        anyhow::anyhow!(
+            "pinned key {} is not a supported key type: {e}",
+            key_path.display()
+        )
+    })?;
+
+    Ok(Arc::new(CertifiedKey::new(chain, signing_key)))
+}
+
+/// The DNS names a certificate carries, for diagnostics about pinned material.
+pub fn certificate_dns_sans(certified: &CertifiedKey) -> Vec<String> {
+    certified
+        .cert
+        .first()
+        .map(std::slice::from_ref)
+        .map(observed_dns_sans)
+        .unwrap_or_default()
+}
+
 /// Normalize an SNI host the way coverage checks expect: lowercase, no trailing
 /// dot. Ports never appear in a TLS SNI, so none is stripped here.
 fn normalize_host(host: &str) -> String {
@@ -624,20 +755,7 @@ impl ResolvesServerCert for DynamicResolver {
             return None;
         };
 
-        // `ResolvesServerCert` is a synchronous trait called from inside rustls's
-        // handshake, which runs on a tokio worker thread. On a cache miss the work
-        // below blocks: a keygen and signature, and — the dominant cost by roughly
-        // 40x, measured — two file writes plus renames. Blocking a worker on file
-        // I/O stalls every other task queued on it, so hand it to the blocking pool
-        // instead of the async worker.
-        //
-        // `block_in_place` rather than `spawn_blocking`: this thread must produce a
-        // value before returning, and the certificate must be persisted before it
-        // is served, so the work cannot be detached. Moving the save out of the
-        // single-flight lock would decouple it, but two successive issuances for one
-        // key could then land out of order and persist the stale certificate.
-        // Correct ordering is worth more than the few milliseconds.
-        match in_blocking_context(|| self.get_or_issue(host, owner)) {
+        match self.certificate_for(host, owner) {
             Ok(key) => Some(key),
             Err(err) => {
                 tracing::error!(host, error = %format!("{err:#}"), "certificate issuance failed");
@@ -715,7 +833,56 @@ mod tests {
         }));
         let router =
             Arc::new(Router::build(patterns, default, &std::collections::HashMap::new()).unwrap());
-        DynamicResolver::new(issuer, router, scopes.to_vec().into())
+        // No route pins a certificate: these tests exercise dynamic issuance.
+        let pinned: Vec<Option<Arc<CertifiedKey>>> = vec![None; scopes.len()];
+        DynamicResolver::new(issuer, router, scopes.to_vec().into(), pinned.into())
+    }
+
+    /// A resolver whose route ids carry the given pinned certificates.
+    fn resolver_with_pinned(
+        patterns: &[Vec<String>],
+        scopes: &[CertScope],
+        pinned: Vec<Option<Arc<CertifiedKey>>>,
+    ) -> DynamicResolver {
+        let base = resolver(patterns, None, scopes);
+        DynamicResolver::new(base.issuer, base.router, base.scopes, pinned.into())
+    }
+
+    /// A scratch directory unique to this call, on the same pid+counter scheme the
+    /// other helpers here use to stay safe across parallel test threads.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sni-gate-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a real certificate/key PEM pair covering `sans`, standing in for what
+    /// an operator would supply. Signed by a throwaway CA, since what matters is
+    /// that the files parse and carry those names.
+    fn write_pinned_pair(
+        dir: &std::path::Path,
+        sans: &[&str],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = crate::ca::CertificateAuthority::load_or_generate(crate::ca::CaParams {
+            cert_path: &dir.join("pin-ca.crt"),
+            key_path: &dir.join("pin-ca.key"),
+            common_name: "Pin CA",
+            organization: "",
+            country: "",
+            leaf_validity_days: 30,
+        })
+        .unwrap();
+        let names: Vec<String> = sans.iter().map(|s| (*s).to_string()).collect();
+        let issued = ca.issue(sans[0], &names).unwrap();
+        let cert = dir.join("pinned.crt");
+        let key = dir.join("pinned.key");
+        std::fs::write(&cert, &issued.chain_pem).unwrap();
+        std::fs::write(&key, &issued.key_pem).unwrap();
+        (cert, key)
     }
 
     fn sans(names: &[&str]) -> Vec<String> {
@@ -1100,6 +1267,183 @@ mod tests {
             .unwrap();
         assert!(plan.dropped.is_empty(), "got {:?}", plan.dropped);
         assert!(plan.kept.iter().any(|s| s == "*.site.test"));
+    }
+
+    // -- Operator-pinned certificates ---------------------------------------
+
+    /// A route that pins a certificate serves exactly that certificate.
+    ///
+    /// `cert_file`/`key_file` were parsed, resolved as a unit and validated, and
+    /// documented in the README as a supported per-route setting — but nothing
+    /// outside `config.rs` ever read them, so every route issued from the CA
+    /// regardless. An operator pinning a certificate got no error, no warning, and
+    /// silently none of the behaviour they configured.
+    #[test]
+    fn a_pinned_route_serves_the_operators_certificate() {
+        let dir = scratch_dir("pin-serve");
+        let (cert, key) = write_pinned_pair(&dir, &["site.test", "*.site.test"]);
+        let loaded = load_pinned_certificate(&cert, &key).unwrap();
+
+        let scopes = [scope(443)];
+        let r = resolver_with_pinned(
+            &[vec![".site.test".into()]],
+            &scopes,
+            vec![Some(loaded.clone())],
+        );
+
+        let served = r.certificate_for("a.site.test", 0).unwrap();
+        assert!(
+            Arc::ptr_eq(&served, &loaded),
+            "the pinned certificate itself must be served, not a re-issued one"
+        );
+        // And it is the operator's coverage, not the exact-name coverage the CA
+        // path would have minted.
+        assert_eq!(
+            issued_sans(&served),
+            vec!["site.test", "*.site.test"],
+            "pinned coverage must be served verbatim"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinning opts a route out of mirroring entirely. The upstream's certificate
+    /// is not this program's to re-sign, so an observation must neither replace the
+    /// pinned material nor schedule work claiming it is stale.
+    #[test]
+    fn a_pinned_route_is_never_remirrored() {
+        let dir = scratch_dir("pin-mirror");
+        let (cert, key) = write_pinned_pair(&dir, &["site.test"]);
+        let loaded = load_pinned_certificate(&cert, &key).unwrap();
+
+        let scopes = [scope(443)];
+        let r = resolver_with_pinned(
+            &[vec![".site.test".into()]],
+            &scopes,
+            vec![Some(loaded.clone())],
+        );
+
+        // The data path's cheap pre-check must report "nothing to do", so no
+        // blocking re-issue is ever handed off.
+        assert!(
+            r.mirror_is_current("a.site.test", &sans(&["*.site.test", "other.test"])),
+            "a pinned route has no mirror to bring up to date"
+        );
+
+        // And even if recording is reached, it must not displace the pinned cert.
+        r.record_upstream_sans("a.site.test", &sans(&["*.site.test", "other.test"]));
+        let after = r.certificate_for("a.site.test", 0).unwrap();
+        assert!(
+            Arc::ptr_eq(&after, &loaded),
+            "an upstream observation must not replace pinned material"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinning is per route, so an unpinned sibling keeps dynamic issuance.
+    #[test]
+    fn an_unpinned_route_still_issues_dynamically() {
+        let dir = scratch_dir("pin-mixed");
+        let (cert, key) = write_pinned_pair(&dir, &["pinned.test"]);
+        let loaded = load_pinned_certificate(&cert, &key).unwrap();
+
+        let scopes = [scope(443), scope(8443)];
+        let r = resolver_with_pinned(
+            &[vec![".pinned.test".into()], vec![".dynamic.test".into()]],
+            &scopes,
+            vec![Some(loaded), None],
+        );
+
+        let dynamic = r.certificate_for("a.dynamic.test", 1).unwrap();
+        assert_eq!(
+            issued_sans(&dynamic),
+            vec!["a.dynamic.test"],
+            "the unpinned route must still get an exact issued certificate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loader is not restricted to the key type this program issues.
+    ///
+    /// Issuance is always ECDSA, so the dynamic path uses `any_ecdsa_type`; a
+    /// pinned key is whatever the operator's existing PKI produced, so this path
+    /// uses `any_supported_type` instead. Asserted at the type level rather than by
+    /// planting an RSA key: nothing in the dependency set generates one, and a
+    /// hard-coded private key in the tree is worse than the coverage is worth.
+    #[test]
+    fn the_pinned_loader_accepts_more_than_the_issued_key_type() {
+        let dir = scratch_dir("pin-keytype");
+        let (cert, key) = write_pinned_pair(&dir, &["site.test"]);
+        let key_pem = std::fs::read(&key).unwrap();
+        let parsed = rustls_pemfile::private_key(&mut key_pem.as_slice())
+            .unwrap()
+            .unwrap();
+
+        // The loader's own key path accepts it …
+        assert!(load_pinned_certificate(&cert, &key).is_ok());
+        // … through the same entry point that accepts RSA, which `any_ecdsa_type`
+        // would reject. If this path is ever narrowed to ECDSA, this fails.
+        assert!(rustls::crypto::aws_lc_rs::sign::any_supported_type(&parsed).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed key is reported rather than silently accepted.
+    #[test]
+    fn a_malformed_pinned_key_is_rejected() {
+        let dir = scratch_dir("pin-badkey");
+        let (cert, _) = write_pinned_pair(&dir, &["site.test"]);
+        let bad = dir.join("bad.key");
+        std::fs::write(
+            &bad,
+            "-----BEGIN PRIVATE KEY-----\nnot base64\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        assert!(load_pinned_certificate(&cert, &bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loading reports the specific failure, because these are configuration
+    /// errors surfaced at startup rather than inside a handshake.
+    #[test]
+    fn pinned_loading_failures_are_reported() {
+        let dir = scratch_dir("pin-errors");
+        let (cert, key) = write_pinned_pair(&dir, &["site.test"]);
+
+        // Missing files.
+        let missing = dir.join("nope.pem");
+        let err = load_pinned_certificate(&missing, &key).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pinned certificate"),
+            "unhelpful message: {err:#}"
+        );
+        let err = load_pinned_certificate(&cert, &missing).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pinned key"),
+            "unhelpful message: {err:#}"
+        );
+
+        // A certificate file with no certificate in it.
+        let empty = dir.join("empty.crt");
+        std::fs::write(&empty, "# nothing here\n").unwrap();
+        let err = load_pinned_certificate(&empty, &key).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no certificate"),
+            "unhelpful message: {err:#}"
+        );
+
+        // A key file with no key in it.
+        let no_key = dir.join("empty.key");
+        std::fs::write(&no_key, "# nothing here\n").unwrap();
+        let err = load_pinned_certificate(&cert, &no_key).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no private key"),
+            "unhelpful message: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

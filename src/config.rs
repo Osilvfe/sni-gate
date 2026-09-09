@@ -2379,7 +2379,14 @@ impl Route {
 
     /// The pinned cert/key pair for local termination, resolved atomically from
     /// the first scope (route → route-template) that sets *either*.
-    fn cert_key<'a>(&'a self, tpl: Option<&'a Template>) -> (Option<&'a Path>, Option<&'a Path>) {
+    ///
+    /// Atomic on purpose: a route that sets only `cert_file` must not silently
+    /// pair it with its template's `key_file`. Validation then requires both, so a
+    /// caller sees either two paths or none.
+    pub fn cert_key<'a>(
+        &'a self,
+        tpl: Option<&'a Template>,
+    ) -> (Option<&'a Path>, Option<&'a Path>) {
         if self.cert_file.is_some() || self.key_file.is_some() {
             return (self.cert_file.as_deref(), self.key_file.as_deref());
         }
@@ -2436,6 +2443,20 @@ impl Route {
         if cert.is_some() != key.is_some() {
             return Err(ConfigError::Invalid(format!(
                 "route {}: cert_file and key_file must be set together",
+                self.label()
+            )));
+        }
+
+        // A `raw` route never terminates TLS, so it has no handshake to present a
+        // certificate on: the client sees the upstream's own. Pinning one here can
+        // only be a misunderstanding, so it is rejected rather than silently
+        // ignored — the same treatment `http2.enabled` gets on `raw`.
+        if cert.is_some() && Config::effective_route_type(self, tpl) == Some(RouteType::Raw) {
+            return Err(ConfigError::Invalid(format!(
+                "route {}: cert_file/key_file cannot be used on a `raw` route (raw \
+                 splices the TCP stream without terminating TLS, so the client sees \
+                 the upstream's own certificate). Use type = \"tls\", \"ech\" or \
+                 \"http\" to terminate here",
                 self.label()
             )));
         }
@@ -3702,6 +3723,130 @@ addr = "0.0.0.0:443"
 "#,
         );
         assert!(cfg.validate().is_err());
+    }
+
+    // -- Pinned certificates -------------------------------------------------
+
+    /// A `raw` route never terminates TLS, so it has no handshake on which to
+    /// present a certificate — the client sees the upstream's own. Pinning one is
+    /// therefore rejected rather than silently ignored, the same treatment
+    /// `http2.enabled` gets on `raw` and for the same reason.
+    #[test]
+    fn a_pinned_certificate_on_a_raw_route_is_an_error() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "raw"
+  match_sni = [".a.com"]
+  cert_file = "a.crt"
+  key_file = "a.key"
+"#,
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("cert_file") && err.contains("raw"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    /// The same pair reached through a template is equally inoperative.
+    #[test]
+    fn a_pinned_certificate_from_a_raw_routes_template_is_an_error() {
+        let cfg = parse(
+            r#"
+[templates.pinned]
+cert_file = "a.crt"
+key_file = "a.key"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "raw"
+  use = "pinned"
+  match_sni = [".a.com"]
+"#,
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    /// A terminating route may pin, and both paths resolve as a unit.
+    #[test]
+    fn a_pinned_certificate_on_a_terminating_route_is_accepted() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+  cert_file = "a.crt"
+  key_file = "a.key"
+"#,
+        );
+        cfg.validate().unwrap();
+        let r = &cfg.listeners[0].routes[0];
+        let (cert, key) = r.cert_key(None);
+        assert_eq!(cert.unwrap(), Path::new("a.crt"));
+        assert_eq!(key.unwrap(), Path::new("a.key"));
+    }
+
+    /// Half a pair is a mistake, in either direction: silently pairing a route's
+    /// `cert_file` with a template's `key_file` would serve material the operator
+    /// never put together.
+    #[test]
+    fn half_a_pinned_pair_is_an_error() {
+        for field in ["cert_file", "key_file"] {
+            let cfg = parse(&format!(
+                r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+  {field} = "a.pem"
+"#
+            ));
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("must be set together"),
+                "unhelpful message for {field}: {err}"
+            );
+        }
+    }
+
+    /// A route setting either half takes *both* from its own scope, so it never
+    /// inherits the missing half from its template. That resolution is what makes
+    /// the "set together" rule meaningful.
+    #[test]
+    fn a_routes_own_half_pair_does_not_borrow_from_its_template() {
+        let cfg = parse(
+            r#"
+[templates.pinned]
+cert_file = "tpl.crt"
+key_file = "tpl.key"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  use = "pinned"
+  match_sni = [".a.com"]
+  cert_file = "own.crt"
+"#,
+        );
+        // The route's own `cert_file` shadows the template's whole pair, leaving
+        // the key unset — which validation then refuses.
+        assert!(cfg.validate().is_err());
+        let r = &cfg.listeners[0].routes[0];
+        let tpl = cfg.template_for(&r.use_template).unwrap();
+        assert_eq!(r.cert_key(tpl), (Some(Path::new("own.crt")), None));
     }
 
     // -----------------------------------------------------------------------
