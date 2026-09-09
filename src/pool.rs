@@ -882,10 +882,11 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
         }
     }
 
-    // Deduplicate: two targets may legitimately resolve to one address, and
-    // probing it twice would double-count it in the ranking.
-    let mut seen: HashSet<IpAddr> = HashSet::with_capacity(out.len());
-    out.retain(|c| seen.insert(c.addr));
+    // Keep one candidate per target provenance even when several targets resolve
+    // to the same address. `select` addresses target indices and tags, so
+    // collapsing here would erase the later target's identity. Endpoint-level
+    // work below is deduplicated by address instead: health is keyed by `IpAddr`,
+    // probes run once per address, and the ranking contains each address once.
 
     // Give every new address a health entry, due immediately.
     let now = Instant::now();
@@ -925,8 +926,12 @@ fn push_candidate(out: &mut Vec<Candidate>, target: &Target, addr: IpAddr) {
 /// Probe every due candidate and fold the results into health.
 async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candidate]) {
     let now = Instant::now();
+    let mut seen = HashSet::with_capacity(candidates.len());
     let due: Vec<Candidate> = candidates
         .iter()
+        // Candidate records preserve target/tag provenance, but an address is one
+        // endpoint and must be probed only once per cycle.
+        .filter(|c| seen.insert(c.addr))
         .filter(|c| match state.health.get(&c.addr) {
             Some(h) => h.next_probe <= now,
             // A candidate with no health entry yet has never been probed, so it
@@ -1029,13 +1034,18 @@ impl PoolState {
     /// process; with it, the sample space is eventually explored while measured
     /// endpoints are never discarded.
     fn resample_dead(&mut self, pool: &Arc<Pool>, candidates: &[Candidate]) {
+        let mut reserved: HashSet<IpAddr> = self.health.keys().copied().collect();
+        reserved.extend(self.resampled.iter().copied());
+        let mut planned_keys: HashSet<(usize, IpAddr)> = HashSet::new();
+        let mut planned: Vec<(usize, IpAddr, IpAddr)> = Vec::new();
+
         for c in candidates {
             let Some(h) = self.health.get(&c.addr) else {
                 continue;
             };
-            // Only ever replace an endpoint that has *never* answered: one that
-            // worked before may simply be having an outage, and its measured RTT
-            // is worth keeping.
+            // Only replace an endpoint that has never answered. An endpoint that
+            // worked before may simply be in a temporary outage, and its RTT history
+            // remains useful when it recovers.
             if !h.degraded || h.rtt.is_some() || h.backoff < pool.probe.interval {
                 continue;
             }
@@ -1044,32 +1054,72 @@ impl PoolState {
                 continue;
             };
             if sample.is_none() {
-                continue; // fully expanded: there is nothing else to draw
+                continue;
             }
-            let fresh = draw_sample(net, Some(1));
-            let Some(&new_addr) = fresh.first() else {
+            if !planned_keys.insert((c.target, c.addr)) {
+                continue;
+            }
+            let Some(new_addr) = draw_fresh_sample(net, &reserved) else {
                 continue;
             };
-            if self.health.contains_key(&new_addr) || self.resampled.contains(&new_addr) {
-                continue;
-            }
+            reserved.insert(new_addr);
+            planned.push((c.target, c.addr, new_addr));
+        }
+
+        let mut retired = HashSet::new();
+        for (target, dead, replacement) in planned {
             info!(
                 pool = %pool.name,
-                target = c.target,
-                dead = %c.addr,
-                replacement = %new_addr,
+                target,
+                dead = %dead,
+                replacement = %replacement,
                 "replacing a CIDR sample that never answered"
             );
-            self.resampled.insert(c.addr);
-            self.health.remove(&c.addr);
-            self.replacements
-                .entry(c.target)
-                .or_default()
-                .push(new_addr);
-            // Drop the replaced address from the recorded order too, so
-            // hysteresis does not keep referring to it.
-            self.order.retain(|a| *a != c.addr);
+            replace_recorded_sample(&mut self.replacements, target, dead, replacement);
+            retired.insert(dead);
         }
+
+        // Retire shared endpoint state only after all target provenances have been
+        // inspected, so one target cannot hide another by removing health early.
+        for dead in retired {
+            self.resampled.insert(dead);
+            self.health.remove(&dead);
+            self.order.retain(|a| *a != dead);
+        }
+    }
+}
+
+/// Draw an address not already present in the pool. Starting at a random offset
+/// keeps CIDR sampling distributed; checking at most `reserved.len() + 1`
+/// consecutive addresses guarantees a free one is found whenever one exists.
+fn draw_fresh_sample(net: &IpNet, reserved: &HashSet<IpAddr>) -> Option<IpAddr> {
+    let size = network_size(net);
+    if size == 0 {
+        return None;
+    }
+    let attempts = ((reserved.len() as u128).saturating_add(1)).min(size) as usize;
+    let start = rand::random_range(0..size);
+    for step in 0..attempts {
+        let offset = start.wrapping_add(step as u128) % size;
+        let addr = offset_into(net, offset);
+        if !reserved.contains(&addr) {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+/// Rotate one active CIDR replacement in place rather than keeping a history.
+fn replace_recorded_sample(
+    replacements: &mut HashMap<usize, Vec<IpAddr>>,
+    target: usize,
+    dead: IpAddr,
+    replacement: IpAddr,
+) {
+    let active = replacements.entry(target).or_default();
+    active.retain(|addr| *addr != dead);
+    if !active.contains(&replacement) {
+        active.push(replacement);
     }
 }
 
@@ -1097,8 +1147,7 @@ fn publish(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
                 .filter(|addr| {
                     candidates
                         .iter()
-                        .find(|c| c.addr == **addr)
-                        .is_some_and(|c| c.matches(&view.selectors))
+                        .any(|c| c.addr == **addr && c.matches(&view.selectors))
                 })
                 .copied()
                 .collect();
@@ -1152,9 +1201,10 @@ fn reorder_with_hysteresis(
 
     // Append newcomers, best first, so a new endpoint enters at its measured
     // position rather than at the front.
+    let mut known: HashSet<IpAddr> = order.iter().copied().collect();
     let mut fresh: Vec<(IpAddr, Duration)> = candidates
         .iter()
-        .filter(|c| !order.contains(&c.addr))
+        .filter(|c| known.insert(c.addr))
         .filter_map(|c| healthy(&c.addr).map(|rtt| (c.addr, rtt)))
         .collect();
     fresh.sort_by_key(|(_, rtt)| *rtt);
@@ -1187,10 +1237,11 @@ fn beats(challenger: Duration, incumbent: Duration) -> bool {
 }
 
 fn log_cycle(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
-    let total = candidates.len();
-    let healthy = candidates
+    let live: HashSet<IpAddr> = candidates.iter().map(|c| c.addr).collect();
+    let total = live.len();
+    let healthy = live
         .iter()
-        .filter(|c| state.health.get(&c.addr).is_some_and(|h| !h.degraded))
+        .filter(|addr| state.health.get(*addr).is_some_and(|h| !h.degraded))
         .count();
     let snapshot = {
         let guard = pool.ranking.read().expect("pool ranking lock poisoned");
@@ -1445,6 +1496,33 @@ mod tests {
         // OR across kinds.
         assert!(c.matches(&[Selector::Tag("ipv6".into()), Selector::Index(1)]));
         assert!(!c.matches(&[Selector::Tag("ipv6".into()), Selector::Index(0)]));
+    }
+
+    #[test]
+    fn cidr_replacement_chain_keeps_only_active_addresses() {
+        let target = 3usize;
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let c: IpAddr = "192.0.2.3".parse().unwrap();
+        let d: IpAddr = "192.0.2.4".parse().unwrap();
+        let mut replacements = HashMap::from([(target, vec![a])]);
+
+        replace_recorded_sample(&mut replacements, target, a, b);
+        replace_recorded_sample(&mut replacements, target, b, c);
+        replace_recorded_sample(&mut replacements, target, c, d);
+        assert_eq!(replacements.get(&target), Some(&vec![d]));
+    }
+
+    #[test]
+    fn duplicate_address_provenance_is_ranked_once() {
+        let addr = "1.1.1.1";
+        let candidates = vec![
+            candidate(addr, 0, &["ipv4", "first"]),
+            candidate(addr, 1, &["ipv4", "second"]),
+        ];
+        let state = state_with(&[(addr, Some(20), false)]);
+        let order = reorder_with_hysteresis(&[], &state, &candidates);
+        assert_eq!(order, vec![addr.parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
