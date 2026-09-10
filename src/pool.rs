@@ -34,9 +34,10 @@
 //! # Where the work happens
 //!
 //! One task per pool does all of it: re-resolving domain targets, probing due
-//! candidates, and recomputing the ranking. The data path only reads a snapshot
-//! — see [`Pool::pick`]. Nothing on the data path can trigger a probe, so a burst
-//! of traffic cannot turn into a burst of probes.
+//! candidates, and recomputing the ranking. The data path reads a snapshot — see
+//! [`PoolHandle::candidates`] — and may send bounded passive hints, but it never
+//! performs probe work itself. A live connect failure only asks the background
+//! task to verify that endpoint sooner; traffic volume never decides health.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -78,6 +79,11 @@ const MAX_CIDR_EXPANSION: usize = 64;
 /// Upper bound on concurrent probes within one pool, so a large pool cannot open
 /// hundreds of sockets in one cycle.
 const MAX_CONCURRENT_PROBES: usize = 16;
+
+/// Bounded passive-feedback queue. Traffic may report connection failures,
+/// but it never probes directly; the single pool task drains this queue and
+/// coalesces a burst into its normal probe cycle.
+const PASSIVE_FEEDBACK_CAPACITY: usize = 256;
 
 /// Weight of a new sample in the RTT moving average.
 ///
@@ -420,6 +426,14 @@ impl Health {
         };
         self.next_probe = Instant::now() + delay;
     }
+
+    /// Ask the background task to verify this endpoint immediately. Passive
+    /// traffic observations are deliberately not health verdicts: a consuming
+    /// route may dial a different port from the pool probe, so a route-local TCP
+    /// refusal must not globally degrade an otherwise healthy edge.
+    fn schedule_immediate_probe(&mut self) {
+        self.next_probe = Instant::now();
+    }
 }
 
 /// Blend a new RTT sample into the running average.
@@ -458,6 +472,20 @@ struct Ranking {
     per_view: Vec<ViewRanking>,
 }
 
+fn ranked_socket_candidates(vr: &ViewRanking, port: u16, limit: usize) -> Vec<SocketAddr> {
+    if !vr.ordered.is_empty() {
+        return vr
+            .ordered
+            .iter()
+            .take(limit)
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect();
+    }
+    vr.fallback
+        .map(|ip| vec![SocketAddr::new(ip, port)])
+        .unwrap_or_default()
+}
+
 impl Ranking {
     /// An empty ranking, published before the first probe cycle completes so the
     /// data path always has something well-formed to read.
@@ -471,6 +499,12 @@ impl Ranking {
                 .collect(),
         }
     }
+}
+
+/// Passive observations sent from the data path to the pool task.
+#[derive(Debug, Clone, Copy)]
+enum PoolFeedback {
+    ConnectFailure(IpAddr),
 }
 
 /// A route's handle on a pool: the pool plus which registered view it reads.
@@ -487,13 +521,19 @@ impl PoolHandle {
         &self.pool.name
     }
 
-    /// The address to dial right now, on `port`.
-    ///
-    /// Zero I/O, zero allocation, and no evaluation of `select`: one lock-free
-    /// read of a published snapshot and an index into it. The probe task writes;
-    /// this only reads.
-    pub fn pick(&self, port: u16) -> Result<SocketAddr> {
-        self.pool.pick(self.view, port)
+    /// The best currently published addresses for this route view, in rank order.
+    /// No DNS or probe work happens here; only the small requested prefix is copied.
+    pub fn candidates(&self, port: u16, limit: usize) -> Result<Vec<SocketAddr>> {
+        self.pool.candidates(self.view, port, limit)
+    }
+
+    /// Report a live TCP-connect failure without blocking the client task.
+    /// A full queue drops feedback rather than adding backpressure to traffic.
+    pub fn report_connect_failure(&self, addr: SocketAddr) {
+        let _ = self
+            .pool
+            .feedback
+            .try_send(PoolFeedback::ConnectFailure(addr.ip()));
     }
 }
 
@@ -520,6 +560,9 @@ pub struct Pool {
     /// never blocks the data path and a reader in flight keeps using the snapshot
     /// it started with. Same shape as [`crate::dns_resolvers::DnsResolver`].
     ranking: RwLock<Arc<Ranking>>,
+    /// Passive live-connection observations. Only the pool task receives them
+    /// and mutates health state.
+    feedback: tokio::sync::mpsc::Sender<PoolFeedback>,
 }
 
 /// NAT64 projection parameters, resolved at build.
@@ -541,8 +584,12 @@ impl Pool {
         self.views.iter().position(|v| v.selectors == wanted)
     }
 
-    /// The address to dial for `view`, on `port`.
-    fn pick(&self, view: usize, port: u16) -> Result<SocketAddr> {
+    /// Addresses to dial for `view`, best first. The explicit fallback keeps
+    /// its original semantics: it is used only when there is no healthy ranking.
+    fn candidates(&self, view: usize, port: u16, limit: usize) -> Result<Vec<SocketAddr>> {
+        if limit == 0 {
+            bail!("pool {}: candidate limit must be at least 1", self.name);
+        }
         let snapshot = {
             let guard = self.ranking.read().expect("pool ranking lock poisoned");
             guard.clone()
@@ -551,20 +598,14 @@ impl Pool {
             .per_view
             .get(view)
             .ok_or_else(|| anyhow!("pool {}: unregistered view {view}", self.name))?;
-
-        if let Some(ip) = vr.ordered.first() {
-            return Ok(SocketAddr::new(*ip, port));
+        let out = ranked_socket_candidates(vr, port, limit);
+        if out.is_empty() {
+            return Err(anyhow!(
+                "pool {}: no healthy candidate and no usable fallback",
+                self.name
+            ));
         }
-        if let Some(ip) = vr.fallback {
-            return Ok(SocketAddr::new(ip, port));
-        }
-        // No healthy candidate and no usable fallback. An error rather than a
-        // guess: the route's own fail policy is the right place to decide what
-        // happens to the connection.
-        Err(anyhow!(
-            "pool {}: no healthy candidate and no usable fallback",
-            self.name
-        ))
+        Ok(out)
     }
 }
 
@@ -677,6 +718,7 @@ impl PoolBuilder {
             };
 
         let view_count = self.views.len();
+        let (feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(PASSIVE_FEEDBACK_CAPACITY);
         let pool = Arc::new(Pool {
             name: self.name,
             targets: self.targets,
@@ -687,6 +729,7 @@ impl PoolBuilder {
             resolver: self.resolver,
             views: self.views,
             ranking: RwLock::new(Arc::new(Ranking::empty(view_count))),
+            feedback: feedback_tx,
         });
 
         // The task holds only a `Weak`, so it stops on its own if the pool is
@@ -694,7 +737,7 @@ impl PoolBuilder {
         // refresher in `dns_resolvers`, and the reason no cancellation-token
         // plumbing is needed to shut a pool down.
         let weak = Arc::downgrade(&pool);
-        tokio::spawn(async move { run_probe_loop(weak).await });
+        tokio::spawn(async move { run_probe_loop(weak, feedback_rx).await });
 
         Ok(pool)
     }
@@ -912,7 +955,10 @@ struct PoolState {
     resolved_at: Option<Instant>,
 }
 
-async fn run_probe_loop(weak: Weak<Pool>) {
+async fn run_probe_loop(
+    weak: Weak<Pool>,
+    mut feedback_rx: tokio::sync::mpsc::Receiver<PoolFeedback>,
+) {
     let mut state = PoolState::new();
 
     // Small startup jitter so several pools starting together do not fire their
@@ -935,7 +981,7 @@ async fn run_probe_loop(weak: Weak<Pool>) {
         // This is load-bearing, not an optimization. A cycle takes as long as its
         // candidates need: a few hundred sampled addresses probed with `mode =
         // "http"` at the concurrency cap can run for a minute or more. Without
-        // this, `pick` returns an error for that whole window — and on a
+        // this, candidate selection returns an error for that whole window — and on a
         // `tls`/`ech` route with HTTP/2 enabled the upstream is dialed *before*
         // the inbound handshake completes, so the failure surfaces to the client
         // as a broken TLS handshake rather than as an upstream error. A pool that
@@ -946,7 +992,7 @@ async fn run_probe_loop(weak: Weak<Pool>) {
         // best answer available until this cycle finishes.
         publish(&pool, &state, &candidates);
 
-        run_cycle(&pool, &mut state, &candidates).await;
+        run_cycle(&pool, &mut state, &candidates, &mut feedback_rx).await;
         recompute_order(&mut state, &candidates);
         publish(&pool, &state, &candidates);
         log_cycle(&pool, &state, &candidates);
@@ -955,7 +1001,14 @@ async fn run_probe_loop(weak: Weak<Pool>) {
         // is what lets the pool actually be dropped while idle.
         let sleep_for = next_due(&pool, &state, &candidates);
         drop(pool);
-        tokio::time::sleep(sleep_for).await;
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {}
+            feedback = feedback_rx.recv() => {
+                let Some(feedback) = feedback else { return };
+                let Some(pool) = weak.upgrade() else { return };
+                schedule_feedback_verification(&pool, &mut state, feedback, &mut feedback_rx);
+            }
+        }
     }
 }
 
@@ -1177,7 +1230,12 @@ fn push_candidate(out: &mut Vec<Candidate>, target: &Target, addr: IpAddr) {
 }
 
 /// Probe every due candidate and fold the results into health.
-async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candidate]) {
+async fn run_cycle(
+    pool: &Arc<Pool>,
+    state: &mut PoolState,
+    candidates: &[Candidate],
+    feedback_rx: &mut tokio::sync::mpsc::Receiver<PoolFeedback>,
+) {
     let now = Instant::now();
     let mut seen = HashSet::with_capacity(candidates.len());
     let due: Vec<Candidate> = candidates
@@ -1215,56 +1273,117 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
         });
     }
 
-    while let Some(joined) = set.join_next().await {
-        let Ok((addr, outcome)) = joined else {
-            warn!(pool = %pool.name, "a probe task panicked");
-            continue;
-        };
-        let Some(h) = state.health.get_mut(&addr) else {
-            continue;
-        };
-        match outcome {
-            Ok(rtt) => {
-                let was_degraded = h.degraded;
-                h.record_success(rtt, pool.timing.interval, pool.timing.degraded_interval);
-                if was_degraded {
-                    info!(
-                        pool = %pool.name,
-                        candidate = %addr,
-                        rtt_ms = rtt.as_millis(),
-                        "candidate recovered and re-entered the ranking"
-                    );
-                }
+    while !set.is_empty() {
+        tokio::select! {
+            joined = set.join_next() => {
+                let Some(joined) = joined else { break };
+                let Ok((addr, outcome)) = joined else {
+                    warn!(pool = %pool.name, "a probe task panicked");
+                    continue;
+                };
+                apply_probe_outcome(pool, state, addr, outcome);
             }
-            Err(e) => {
-                let was_degraded = h.degraded;
-                h.record_failure(
-                    pool.timing.fail_threshold,
-                    pool.timing.interval,
-                    pool.timing.degraded_interval,
-                );
-                if !was_degraded && h.degraded {
-                    warn!(
-                        pool = %pool.name,
-                        candidate = %addr,
-                        failures = h.consecutive_failures,
-                        error = %format!("{e:#}"),
-                        "candidate degraded; excluded from the ranking"
-                    );
-                } else {
-                    debug!(
-                        pool = %pool.name,
-                        candidate = %addr,
-                        failures = h.consecutive_failures,
-                        error = %format!("{e:#}"),
-                        "probe failed"
-                    );
+            feedback = feedback_rx.recv() => {
+                if let Some(feedback) = feedback {
+                    schedule_feedback_verification(pool, state, feedback, feedback_rx);
                 }
             }
         }
     }
 
     state.resample_dead(pool, candidates);
+}
+
+fn apply_probe_outcome(
+    pool: &Pool,
+    state: &mut PoolState,
+    addr: IpAddr,
+    outcome: Result<Duration>,
+) {
+    let Some(h) = state.health.get_mut(&addr) else {
+        return;
+    };
+    match outcome {
+        Ok(rtt) => {
+            let was_degraded = h.degraded;
+            h.record_success(rtt, pool.timing.interval, pool.timing.degraded_interval);
+            if was_degraded {
+                info!(
+                    pool = %pool.name,
+                    candidate = %addr,
+                    rtt_ms = rtt.as_millis(),
+                    "candidate recovered and re-entered the ranking"
+                );
+            }
+        }
+        Err(e) => {
+            let was_degraded = h.degraded;
+            h.record_failure(
+                pool.timing.fail_threshold,
+                pool.timing.interval,
+                pool.timing.degraded_interval,
+            );
+            if !was_degraded && h.degraded {
+                warn!(
+                    pool = %pool.name,
+                    candidate = %addr,
+                    failures = h.consecutive_failures,
+                    error = %format!("{e:#}"),
+                    "candidate degraded; excluded from the ranking"
+                );
+            } else {
+                debug!(
+                    pool = %pool.name,
+                    candidate = %addr,
+                    failures = h.consecutive_failures,
+                    error = %format!("{e:#}"),
+                    "probe failed"
+                );
+            }
+        }
+    }
+}
+
+fn feedback_addr(feedback: PoolFeedback) -> IpAddr {
+    let PoolFeedback::ConnectFailure(addr) = feedback;
+    addr
+}
+
+/// Collapse the currently queued burst to one verification request per address.
+/// Duplicate client failures therefore cost neither repeated state mutation nor
+/// repeated log lines, regardless of traffic volume.
+fn coalesce_feedback(
+    first: PoolFeedback,
+    feedback_rx: &mut tokio::sync::mpsc::Receiver<PoolFeedback>,
+) -> HashSet<IpAddr> {
+    let mut addrs = HashSet::new();
+    addrs.insert(feedback_addr(first));
+    while let Ok(feedback) = feedback_rx.try_recv() {
+        addrs.insert(feedback_addr(feedback));
+    }
+    addrs
+}
+
+/// Turn passive connection failures into probe scheduling only. The active probe
+/// remains the sole authority that increments failure counters or changes the
+/// published health verdict.
+fn schedule_feedback_verification(
+    pool: &Pool,
+    state: &mut PoolState,
+    first: PoolFeedback,
+    feedback_rx: &mut tokio::sync::mpsc::Receiver<PoolFeedback>,
+) {
+    for addr in coalesce_feedback(first, feedback_rx) {
+        let Some(h) = state.health.get_mut(&addr) else {
+            continue;
+        };
+        h.schedule_immediate_probe();
+        debug!(
+            pool = %pool.name,
+            candidate = %addr,
+            "live connect failure reported; scheduling immediate probe"
+        );
+    }
 }
 
 impl PoolState {
@@ -1924,6 +2043,68 @@ mod tests {
         replace_recorded_sample(&mut replacements, target, b, c);
         replace_recorded_sample(&mut replacements, target, c, d);
         assert_eq!(replacements.get(&target), Some(&vec![d]));
+    }
+
+    #[test]
+    fn published_view_exposes_ranked_alternatives_before_fallback() {
+        let vr = ViewRanking {
+            ordered: vec![
+                "1.1.1.1".parse().unwrap(),
+                "2.2.2.2".parse().unwrap(),
+                "3.3.3.3".parse().unwrap(),
+            ],
+            fallback: Some("9.9.9.9".parse().unwrap()),
+        };
+        assert_eq!(
+            ranked_socket_candidates(&vr, 443, 2),
+            vec![
+                "1.1.1.1:443".parse().unwrap(),
+                "2.2.2.2:443".parse().unwrap()
+            ]
+        );
+        let fallback = ViewRanking {
+            ordered: Vec::new(),
+            fallback: vr.fallback,
+        };
+        assert_eq!(
+            ranked_socket_candidates(&fallback, 8443, 3),
+            vec!["9.9.9.9:8443".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn passive_connect_failure_only_schedules_verification() {
+        let mut h = Health::new(
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+        h.rtt = Some(Duration::from_millis(10));
+        h.consecutive_failures = 1;
+
+        // Even a burst of route-local connection failures is only a suspicion.
+        // The pool's own active probe is what may advance the failure threshold.
+        for _ in 0..10 {
+            h.schedule_immediate_probe();
+        }
+        assert_eq!(h.consecutive_failures, 1);
+        assert!(!h.degraded);
+        assert_eq!(h.rtt, Some(Duration::from_millis(10)));
+        assert!(h.next_probe <= Instant::now());
+    }
+
+    #[test]
+    fn passive_feedback_burst_is_coalesced_by_address() {
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.try_send(PoolFeedback::ConnectFailure(a)).unwrap();
+        tx.try_send(PoolFeedback::ConnectFailure(a)).unwrap();
+        tx.try_send(PoolFeedback::ConnectFailure(b)).unwrap();
+        tx.try_send(PoolFeedback::ConnectFailure(a)).unwrap();
+
+        let first = rx.try_recv().unwrap();
+        let got = coalesce_feedback(first, &mut rx);
+        assert_eq!(got, HashSet::from([a, b]));
     }
 
     #[test]
