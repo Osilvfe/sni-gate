@@ -45,16 +45,19 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::IpNet;
+use rustls::client::EchStatus;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
+use url::Url;
 
-use crate::config::{AddressFamily, EffectiveProbe, PoolDef, ProbeMode, Selector, TargetDef};
+use crate::config::{AddressFamily, EffectiveProbeEch, PoolDef, ProbeSpec, Selector, TargetDef};
 use crate::dns_resolvers::DnsResolver;
+use crate::ech::{is_ech_reject_io, EchProvider};
 use crate::nat64::Nat64Prefix;
 
 /// The tag vocabulary. These three strings are the *only* automatic tags, and
@@ -91,6 +94,133 @@ const HYSTERESIS_FRACTION: u32 = 5; // 1/5 == 20%
 
 /// Absolute floor on that margin, for endpoints that are all fast.
 const HYSTERESIS_FLOOR: Duration = Duration::from_millis(5);
+
+// ---------------------------------------------------------------------------
+// The probe plan
+// ---------------------------------------------------------------------------
+
+/// Default probed port for `tcp` and `tls`. An `http` probe takes its port from
+/// the URL.
+const DEFAULT_PROBE_PORT: u16 = 443;
+
+/// Default per-candidate deadline for `tcp` and `tls`: a handshake still
+/// unfinished after this long is not a path worth ranking.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Default per-candidate deadline for `http`, which adds a request/response
+/// round trip on top of the handshake.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default probe cycle for a healthy candidate.
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Default first retry delay for a degraded candidate, doubling up to
+/// [`DEFAULT_INTERVAL`].
+const DEFAULT_DEGRADED_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default consecutive failures before a candidate is marked degraded.
+const DEFAULT_FAIL_THRESHOLD: u32 = 2;
+
+/// ALPN offered by an `https` probe.
+///
+/// HTTP/1.1 only, and deliberately so: the probe writes an HTTP/1.1 request onto
+/// the stream, so offering `h2` to an origin that supports it — which is most of
+/// them — would negotiate a protocol the probe cannot speak and fail every
+/// candidate. A `tls` probe offers nothing at all; it has no protocol to
+/// negotiate because it stops at the handshake.
+const HTTP_PROBE_ALPN: &[&[u8]] = &[b"http/1.1"];
+
+/// How much of an HTTP response to buffer. Enough for any status line; the probe
+/// stops reading the moment it has one.
+const STATUS_LINE_BUF: usize = 128;
+
+/// What one probe does, with every default applied and every reusable artifact
+/// built once.
+///
+/// Built at startup and then only read, so nothing on the probe path parses a
+/// URL, assembles a request or clones a root store — work that would otherwise
+/// repeat per candidate per cycle and dwarf the measurement it exists to take.
+struct ProbePlan {
+    /// The port every candidate is dialled on. For `http` it comes from the URL,
+    /// so all three modes answer this question in one place.
+    port: u16,
+    /// Per-candidate deadline.
+    timeout: Duration,
+    kind: ProbeKind,
+}
+
+/// The mode-specific half of a [`ProbePlan`].
+///
+/// Which instant stops the clock differs per variant, and each is the last
+/// moment that still says something about the path.
+enum ProbeKind {
+    /// Connect only. The clock stops at connect completion.
+    Tcp,
+
+    /// Handshake only. The clock stops at handshake completion.
+    Tls(TlsProbe),
+
+    /// Request and response. The clock stops at the first response byte: that is
+    /// when the origin demonstrably answered, and waiting for a body would
+    /// measure its size instead of the path.
+    Http {
+        /// The full request, rendered once. It never varies by candidate — a
+        /// pool probes one origin across many addresses.
+        request: String,
+        /// Response codes that count as healthy. Non-empty.
+        expect_status: Vec<u16>,
+        /// `None` for an `http://` URL.
+        tls: Option<TlsProbe>,
+    },
+}
+
+/// The TLS half of a `tls` or `https` probe.
+struct TlsProbe {
+    /// The name sent in the ClientHello — the *inner* one under ECH — and the
+    /// name the certificate is verified against.
+    sni: String,
+    config: TlsSource,
+}
+
+/// Where a probe's `ClientConfig` comes from.
+///
+/// Either way it is built once and reused. A `ClientConfig` owns the root store,
+/// so rebuilding one per probe would clone every webpki trust anchor on every
+/// cycle of every candidate.
+enum TlsSource {
+    /// No ECH: one config, with the probe's ALPN offer already baked in.
+    Plain(Arc<ClientConfig>),
+
+    /// ECH: the same provider the route and resolver paths use. It memoizes one
+    /// config per (inner name, ALPN offer) and refreshes the ECHConfigList on
+    /// the TTL of the HTTPS record, so a probe cycle costs no DoH lookup.
+    Ech {
+        provider: Arc<EchProvider>,
+        alpn: Vec<Vec<u8>>,
+        /// Fail the candidate unless ECH was actually negotiated.
+        require_ech: bool,
+        /// Retry budget for a server that rejects ECH because its published key
+        /// rotated. Each retry refetches the config first.
+        max_retries: u32,
+    },
+}
+
+/// The cadence half of a probe definition, with defaults applied.
+struct ProbeTiming {
+    interval: Duration,
+    degraded_interval: Duration,
+    fail_threshold: u32,
+}
+
+/// The ECH inputs a pool cannot resolve for itself.
+///
+/// `ech_resolver` names a `[resolvers.*]` entry, and only `main` holds the
+/// registry — the same split that keeps [`PoolBuilder::new`] free of resolver
+/// lookup for the pool's own targets.
+pub struct ProbeEchSetup {
+    pub ech: EffectiveProbeEch,
+    pub resolver: Arc<DnsResolver>,
+}
 
 // ---------------------------------------------------------------------------
 // Target specifications
@@ -375,15 +505,14 @@ impl PoolHandle {
 pub struct Pool {
     name: String,
     targets: Vec<Target>,
-    probe: EffectiveProbe,
+    probe: ProbePlan,
+    timing: ProbeTiming,
     /// NAT64 projection, if configured.
     nat64: Option<Nat64Projection>,
     /// Index into `targets` for the fallback, if configured.
     fallback: Option<usize>,
     resolver: Arc<DnsResolver>,
     views: Vec<View>,
-    /// TLS config for `tls` / `http` probes. Built once.
-    tls: Option<Arc<ClientConfig>>,
     /// The current answer for every view.
     ///
     /// `RwLock<Arc<_>>` and never a lock held across work: a reader clones the
@@ -452,32 +581,39 @@ pub struct PoolBuilder {
     name: String,
     def: PoolDef,
     targets: Vec<Target>,
-    probe: EffectiveProbe,
+    probe: ProbePlan,
+    timing: ProbeTiming,
     resolver: Arc<DnsResolver>,
-    root_store: Arc<RootCertStore>,
     views: Vec<View>,
 }
 
 impl PoolBuilder {
-    /// Parse and prepare one pool definition. Draws CIDR samples; performs no
-    /// I/O and starts nothing.
+    /// Parse and prepare one pool definition. Draws CIDR samples and builds the
+    /// probe's reusable TLS artifacts; performs no I/O and starts nothing.
+    ///
+    /// `spec` is the caller's already-validated probe reduction rather than one
+    /// taken from `def` here, because resolving `probe.ech.ech_resolver` needs
+    /// the resolver registry that only `main` holds — and reducing twice is how
+    /// the two copies would eventually come to disagree.
     pub fn new(
         name: &str,
         def: &PoolDef,
+        spec: ProbeSpec,
         resolver: Arc<DnsResolver>,
-        root_store: Arc<RootCertStore>,
+        probe_ech: Option<ProbeEchSetup>,
+        root_store: &Arc<RootCertStore>,
     ) -> Result<Self> {
         let mut targets = Vec::with_capacity(def.targets.len());
         for (index, t) in def.targets.iter().enumerate() {
-            let spec = TargetSpec::parse(t.addr())
+            let target = TargetSpec::parse(t.addr())
                 .with_context(|| format!("[pools.{name}]: targets[{index}]"))?;
-            let sampled = match &spec {
+            let sampled = match &target {
                 TargetSpec::Cidr { net, sample } => draw_sample(net, *sample),
                 _ => Vec::new(),
             };
             targets.push(Target {
                 index,
-                spec,
+                spec: target,
                 custom_tags: tags_of(t),
                 sampled,
             });
@@ -487,9 +623,16 @@ impl PoolBuilder {
             name: name.to_string(),
             def: def.clone(),
             targets,
-            probe: def.probe.effective(),
+            probe: build_probe_plan(spec, probe_ech, root_store),
+            timing: ProbeTiming {
+                interval: def.probe.interval.unwrap_or(DEFAULT_INTERVAL),
+                degraded_interval: def
+                    .probe
+                    .degraded_interval
+                    .unwrap_or(DEFAULT_DEGRADED_INTERVAL),
+                fail_threshold: def.probe.fail_threshold.unwrap_or(DEFAULT_FAIL_THRESHOLD),
+            },
             resolver,
-            root_store,
             views: Vec::new(),
         })
     }
@@ -533,29 +676,16 @@ impl PoolBuilder {
                 }
             };
 
-        let tls = match self.probe.mode {
-            ProbeMode::Tcp => None,
-            ProbeMode::Tls | ProbeMode::Http => {
-                let mut cfg = ClientConfig::builder()
-                    .with_root_certificates(self.root_store.as_ref().clone())
-                    .with_no_client_auth();
-                // A probe measures reachability and latency, not content, so it
-                // has no protocol to negotiate.
-                cfg.alpn_protocols.clear();
-                Some(Arc::new(cfg))
-            }
-        };
-
         let view_count = self.views.len();
         let pool = Arc::new(Pool {
             name: self.name,
             targets: self.targets,
             probe: self.probe,
+            timing: self.timing,
             nat64,
             fallback: self.def.fallback,
             resolver: self.resolver,
             views: self.views,
-            tls,
             ranking: RwLock::new(Arc::new(Ranking::empty(view_count))),
         });
 
@@ -573,6 +703,129 @@ impl PoolBuilder {
     pub fn handle(pool: Arc<Pool>, view: usize) -> PoolHandle {
         PoolHandle { pool, view }
     }
+}
+
+/// Apply the defaults and build everything a probe can reuse across candidates.
+fn build_probe_plan(
+    spec: ProbeSpec,
+    ech: Option<ProbeEchSetup>,
+    root_store: &Arc<RootCertStore>,
+) -> ProbePlan {
+    match spec {
+        ProbeSpec::Tcp { port, timeout } => ProbePlan {
+            port: port.unwrap_or(DEFAULT_PROBE_PORT),
+            timeout: timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT),
+            kind: ProbeKind::Tcp,
+        },
+
+        ProbeSpec::Tls {
+            port, sni, timeout, ..
+        } => {
+            let port = port.unwrap_or(DEFAULT_PROBE_PORT);
+            ProbePlan {
+                port,
+                timeout: timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT),
+                // No ALPN: a `tls` probe stops at the handshake, so it has no
+                // protocol to negotiate.
+                kind: ProbeKind::Tls(build_tls_probe(sni, &[], port, ech, root_store)),
+            }
+        }
+
+        ProbeSpec::Http {
+            url,
+            expect_status,
+            timeout,
+            ..
+        } => {
+            // `ProbeSpec::Http` guarantees an http/https URL carrying a host, so
+            // both the host and the port are known here.
+            let host = url
+                .host_str()
+                .expect("ProbeSpec::Http carries a URL with a host");
+            let port = url
+                .port_or_known_default()
+                .expect("http and https have known default ports");
+            let tls = (url.scheme() == "https")
+                .then(|| build_tls_probe(host.to_string(), HTTP_PROBE_ALPN, port, ech, root_store));
+            ProbePlan {
+                port,
+                timeout: timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
+                kind: ProbeKind::Http {
+                    request: http_request(&url, host),
+                    expect_status,
+                    tls,
+                },
+            }
+        }
+    }
+}
+
+/// Build the TLS half of a probe: one `ClientConfig`, or the ECH provider that
+/// hands out one per (inner name, ALPN offer) and keeps it fresh.
+fn build_tls_probe(
+    sni: String,
+    alpn: &[&[u8]],
+    port: u16,
+    ech: Option<ProbeEchSetup>,
+    root_store: &Arc<RootCertStore>,
+) -> TlsProbe {
+    let alpn: Vec<Vec<u8>> = alpn.iter().map(|p| p.to_vec()).collect();
+    let config = match ech {
+        Some(ProbeEchSetup { ech, resolver }) => {
+            let EffectiveProbeEch {
+                settings,
+                require_ech,
+                ech_refresh,
+                ech_resolver: _,
+            } = ech;
+            let max_retries = settings.max_retries;
+            TlsSource::Ech {
+                provider: Arc::new(EchProvider::new(
+                    settings,
+                    port,
+                    require_ech,
+                    // A probe has no `override_sni`: the inner hello always
+                    // carries the very name whose reachability is measured.
+                    true,
+                    resolver,
+                    root_store.clone(),
+                    ech_refresh,
+                )),
+                alpn,
+                require_ech,
+                max_retries,
+            }
+        }
+        None => {
+            let mut cfg = ClientConfig::builder()
+                .with_root_certificates(root_store.as_ref().clone())
+                .with_no_client_auth();
+            cfg.alpn_protocols = alpn;
+            TlsSource::Plain(Arc::new(cfg))
+        }
+    };
+    TlsProbe { sni, config }
+}
+
+/// Render the probe request once, at startup.
+///
+/// `Connection: close` so the origin does not hold the socket open waiting for a
+/// second request that will never come.
+fn http_request(url: &Url, host: &str) -> String {
+    // `Url::port` is `None` exactly when the port is the scheme's default, which
+    // is also when RFC 9110 leaves it out of `Host`.
+    let authority = match url.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    let target = match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_string(),
+    };
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: sni-gate-probe\r\n\
+         Accept: */*\r\nConnection: close\r\n\r\n"
+    )
 }
 
 /// Automatic-plus-custom tags for a target definition. Automatic tags are added
@@ -721,9 +974,9 @@ fn dns_refresh(pool: &Pool, state: &PoolState) -> Duration {
         .filter(|t| matches!(t.spec, TargetSpec::Domain(_)))
         .any(|t| !state.resolved.contains_key(&t.index));
     if missing {
-        pool.probe.degraded_interval
+        pool.timing.degraded_interval
     } else {
-        pool.probe.interval
+        pool.timing.interval
     }
 }
 
@@ -759,7 +1012,7 @@ fn next_due(pool: &Pool, state: &PoolState, candidates: &[Candidate]) -> Duratio
         // No candidates and nothing to resolve: every target is a literal or a
         // CIDR whose samples were all retired. Re-check on the healthy interval
         // rather than spinning.
-        (None, false) => pool.probe.interval,
+        (None, false) => pool.timing.interval,
     };
     // Never busy-loop, even when several deadlines are already past.
     wait.max(Duration::from_millis(50))
@@ -894,7 +1147,7 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
         state
             .health
             .entry(c.addr)
-            .or_insert_with(|| Health::new(now, pool.probe.degraded_interval));
+            .or_insert_with(|| Health::new(now, pool.timing.degraded_interval));
     }
     // Forget addresses that are no longer candidates, so a rotating domain does
     // not grow the map without bound.
@@ -973,7 +1226,7 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
         match outcome {
             Ok(rtt) => {
                 let was_degraded = h.degraded;
-                h.record_success(rtt, pool.probe.interval, pool.probe.degraded_interval);
+                h.record_success(rtt, pool.timing.interval, pool.timing.degraded_interval);
                 if was_degraded {
                     info!(
                         pool = %pool.name,
@@ -986,9 +1239,9 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
             Err(e) => {
                 let was_degraded = h.degraded;
                 h.record_failure(
-                    pool.probe.fail_threshold,
-                    pool.probe.interval,
-                    pool.probe.degraded_interval,
+                    pool.timing.fail_threshold,
+                    pool.timing.interval,
+                    pool.timing.degraded_interval,
                 );
                 if !was_degraded && h.degraded {
                     warn!(
@@ -1046,7 +1299,7 @@ impl PoolState {
             // Only replace an endpoint that has never answered. An endpoint that
             // worked before may simply be in a temporary outage, and its RTT history
             // remains useful when it recovers.
-            if !h.degraded || h.rtt.is_some() || h.backoff < pool.probe.interval {
+            if !h.degraded || h.rtt.is_some() || h.backoff < pool.timing.interval {
                 continue;
             }
             let target = &pool.targets[c.target];
@@ -1279,95 +1532,171 @@ fn log_cycle(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
 // ---------------------------------------------------------------------------
 
 /// Probe one address, returning the measured round-trip time.
-///
-/// Which instant stops the clock differs per mode, and each is the last moment
-/// that says something about the path: connect completion for `tcp`, handshake
-/// completion for `tls`, first response byte for `http`.
 async fn probe_one(pool: &Pool, addr: IpAddr, budget: Duration) -> Result<Duration> {
     let target = SocketAddr::new(addr, pool.probe.port);
-    timeout(budget, probe_exchange(pool, target))
+    timeout(budget, probe_exchange(&pool.probe.kind, target))
         .await
         .map_err(|_| anyhow!("probe timed out after {budget:?}"))?
 }
 
-async fn probe_exchange(pool: &Pool, target: SocketAddr) -> Result<Duration> {
-    let started = Instant::now();
+async fn probe_exchange(kind: &ProbeKind, target: SocketAddr) -> Result<Duration> {
+    match kind {
+        ProbeKind::Tcp => {
+            let started = Instant::now();
+            connect(target).await?;
+            Ok(started.elapsed())
+        }
+
+        ProbeKind::Tls(tls) => {
+            let (_stream, started) = tls_connect(tls, target).await?;
+            Ok(started.elapsed())
+        }
+
+        ProbeKind::Http {
+            request,
+            expect_status,
+            tls: Some(tls),
+        } => {
+            let (stream, started) = tls_connect(tls, target).await?;
+            http_exchange(stream, started, request, expect_status).await
+        }
+
+        ProbeKind::Http {
+            request,
+            expect_status,
+            tls: None,
+        } => {
+            let started = Instant::now();
+            let stream = connect(target).await?;
+            http_exchange(stream, started, request, expect_status).await
+        }
+    }
+}
+
+async fn connect(target: SocketAddr) -> Result<TcpStream> {
     let tcp = TcpStream::connect(target)
         .await
         .with_context(|| format!("connecting to {target}"))?;
     tcp.set_nodelay(true).ok();
+    Ok(tcp)
+}
 
-    if pool.probe.mode == ProbeMode::Tcp {
-        return Ok(started.elapsed());
+/// Dial and complete the TLS handshake, retrying when the server rejects ECH.
+///
+/// Returns the stream together with the instant the *successful* attempt began,
+/// so that a retry does not charge the abandoned attempt to the measured RTT —
+/// and neither does the DoH lookup that a refetch may have needed.
+async fn tls_connect(
+    tls: &TlsProbe,
+    target: SocketAddr,
+) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, Instant)> {
+    let name = ServerName::try_from(tls.sni.clone())
+        .map_err(|_| anyhow!("invalid probe sni {:?}", tls.sni))?;
+
+    let (provider, alpn, require_ech, max_retries) = match &tls.config {
+        TlsSource::Plain(config) => {
+            let connector = TlsConnector::from(config.clone());
+            let started = Instant::now();
+            let tcp = connect(target).await?;
+            let stream = connector
+                .connect(name, tcp)
+                .await
+                .context("probe TLS handshake")?;
+            return Ok((stream, started));
+        }
+        TlsSource::Ech {
+            provider,
+            alpn,
+            require_ech,
+            max_retries,
+        } => (provider, alpn, *require_ech, *max_retries),
+    };
+
+    let mut attempt = 0u32;
+    loop {
+        // Cached after the first call, and refreshed on the HTTPS record's own
+        // TTL rather than per probe.
+        let client = provider
+            .client(&tls.sni, alpn)
+            .await
+            .context("assembling the probe ECH client config")?;
+        let connector = TlsConnector::from(client.client_config);
+
+        let started = Instant::now();
+        let tcp = connect(target).await?;
+        match connector.connect(name.clone(), tcp).await {
+            Ok(stream) => {
+                // Real ECH aborts the handshake on rejection, but GREASE — what
+                // `require_ech = false` falls back to when no ECHConfig is
+                // published — completes with the SNI in the clear. Reading the
+                // status is what tells the two apart.
+                let status = stream.get_ref().1.ech_status();
+                if require_ech && status != EchStatus::Accepted {
+                    bail!("probe required ECH but the handshake status was {status:?}");
+                }
+                return Ok((stream, started));
+            }
+            Err(e) if is_ech_reject_io(&e) && attempt < max_retries => {
+                attempt += 1;
+                debug!(
+                    sni = %tls.sni,
+                    %target,
+                    attempt,
+                    "probe ECH rejected; refreshing the config and retrying"
+                );
+                // The server's published key rotated out from under the cached
+                // config; drop it so the next attempt refetches.
+                provider.invalidate(&tls.sni).await;
+            }
+            Err(e) => return Err(e).context("probe TLS handshake"),
+        }
     }
+}
 
-    let sni = pool
-        .probe
-        .sni
-        .as_deref()
-        .ok_or_else(|| anyhow!("probe mode requires an sni"))?;
-    let config = pool
-        .tls
-        .clone()
-        .ok_or_else(|| anyhow!("probe mode requires a TLS config"))?;
-    let name =
-        ServerName::try_from(sni.to_string()).map_err(|_| anyhow!("invalid probe sni {sni:?}"))?;
-
-    let mut tls = TlsConnector::from(config)
-        .connect(name, tcp)
-        .await
-        .context("probe TLS handshake")?;
-
-    if pool.probe.mode == ProbeMode::Tls {
-        return Ok(started.elapsed());
-    }
-
-    let path = pool
-        .probe
-        .path
-        .as_deref()
-        .ok_or_else(|| anyhow!("http probe requires a path"))?;
-    // `Connection: close` so the server does not hold the socket open waiting
-    // for a second request that will never come.
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: sni-gate-probe\r\n\
-         Accept: */*\r\nConnection: close\r\n\r\n"
-    );
-    tls.write_all(request.as_bytes())
+/// Send the prepared request and read exactly as far as the status line.
+async fn http_exchange<S>(
+    mut stream: S,
+    started: Instant,
+    request: &str,
+    expect_status: &[u16],
+) -> Result<Duration>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(request.as_bytes())
         .await
         .context("sending the probe request")?;
-    tls.flush().await.context("flushing the probe request")?;
+    stream.flush().await.context("flushing the probe request")?;
 
-    // Read just enough for the status line. The clock stops at the first byte:
-    // that is when the origin demonstrably answered, and waiting for a body
-    // would measure its size instead of the path.
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; STATUS_LINE_BUF];
     let mut have = 0usize;
     let mut rtt = None;
-    loop {
-        let n = tls
+    while have < buf.len() {
+        let n = stream
             .read(&mut buf[have..])
             .await
             .context("reading the probe response")?;
         if n == 0 {
             break;
         }
-        if rtt.is_none() {
-            rtt = Some(started.elapsed());
-        }
+        // The clock stops at the first byte: that is when the origin
+        // demonstrably answered, and reading on would measure the response size
+        // instead of the path.
+        rtt.get_or_insert_with(|| started.elapsed());
+        // Only the new bytes need scanning, plus the one before them in case the
+        // CR and the LF arrived in different reads.
+        let from = have.saturating_sub(1);
         have += n;
-        if buf[..have].windows(2).any(|w| w == b"\r\n") || have == buf.len() {
+        if buf[from..have].windows(2).any(|w| w == b"\r\n") {
             break;
         }
     }
-    let rtt = rtt.ok_or_else(|| anyhow!("upstream closed without sending a response"))?;
 
+    let rtt = rtt.ok_or_else(|| anyhow!("upstream closed without sending a response"))?;
     let status = parse_status(&buf[..have])?;
-    if !pool.probe.status.contains(&status) {
-        bail!(
-            "probe response status {status} is not among the accepted {:?}",
-            pool.probe.status
-        );
+    if !expect_status.contains(&status) {
+        bail!("probe response status {status} is not among the accepted {expect_status:?}");
     }
     Ok(rtt)
 }
@@ -1393,6 +1722,90 @@ fn parse_status(bytes: &[u8]) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Host` carries the port exactly when it is not the scheme's default, and
+    /// the request target carries the query. Both are rendered once at startup,
+    /// so getting them wrong here would be wrong for every candidate forever.
+    #[test]
+    fn the_probe_request_is_rendered_per_rfc_9110() {
+        let rendered = |raw: &str| {
+            let url: Url = raw.parse().unwrap();
+            let host = url.host_str().unwrap().to_string();
+            http_request(&url, &host)
+        };
+
+        // Default port for the scheme: omitted, even when written out.
+        assert!(rendered("https://x.example/p").contains("\r\nHost: x.example\r\n"));
+        assert!(rendered("https://x.example:443/p").contains("\r\nHost: x.example\r\n"));
+        assert!(rendered("http://x.example:80/p").contains("\r\nHost: x.example\r\n"));
+
+        // Non-default port: present, because the origin needs it to pick a vhost.
+        assert!(rendered("https://x.example:8443/p").contains("\r\nHost: x.example:8443\r\n"));
+        assert!(rendered("http://x.example:8080/p").contains("\r\nHost: x.example:8080\r\n"));
+
+        // The request target is the path plus the query, never the whole URL.
+        let req = rendered("https://x.example/cdn-cgi/trace?v=1");
+        assert!(
+            req.starts_with("GET /cdn-cgi/trace?v=1 HTTP/1.1\r\n"),
+            "{req:?}"
+        );
+        assert!(rendered("https://x.example").starts_with("GET / HTTP/1.1\r\n"));
+
+        // `Connection: close`, so the origin does not wait for a second request.
+        assert!(rendered("https://x.example/p").ends_with("Connection: close\r\n\r\n"));
+    }
+
+    /// The status line may arrive split across reads, including between the CR
+    /// and the LF — the incremental scan must still find it.
+    #[test]
+    fn a_status_line_split_across_reads_is_still_parsed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A duplex whose server half dribbles the response out one CRLF half
+            // at a time.
+            let (client, mut server) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                let mut sink = [0u8; 256];
+                let _ = server.read(&mut sink).await;
+                for chunk in [&b"HTTP/1.1 204 No Content\r"[..], &b"\nX: y\r\n\r\n"[..]] {
+                    server.write_all(chunk).await.unwrap();
+                    server.flush().await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            http_exchange(client, Instant::now(), "GET / HTTP/1.1\r\n\r\n", &[204])
+                .await
+                .unwrap();
+        });
+    }
+
+    /// A response the probe can read but did not ask for fails the candidate.
+    #[test]
+    fn an_unexpected_status_fails_the_probe() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client, mut server) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                let mut sink = [0u8; 256];
+                let _ = server.read(&mut sink).await;
+                server
+                    .write_all(b"HTTP/1.1 503 Unavailable\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            let err = http_exchange(client, Instant::now(), "GET / HTTP/1.1\r\n\r\n", &[200])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("503"), "unhelpful: {err}");
+        });
+    }
 
     #[test]
     fn target_kind_is_inferred() {

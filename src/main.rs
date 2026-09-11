@@ -306,17 +306,48 @@ fn build_pools(
         let def = cfg.pool_def(name)?;
         // A pool resolves its own domain targets: which resolver reaches them is
         // as much a property of the pool as the endpoints themselves.
-        let spec = def.resolver.clone().unwrap_or_else(|| "system".to_string());
+        let own = def.resolver.clone().unwrap_or_else(|| "system".to_string());
         let resolver = get_resolver(
             named_resolvers,
             resolver_cache,
-            &spec,
+            &own,
             config::AddressFamily::Dual,
         )
         .with_context(|| format!("[pools.{name}]: resolver"))?;
+
+        // The same reduction `Config::validate` already accepted, so this cannot
+        // fail here; it is redone rather than carried so that the probe's shape
+        // has exactly one definition.
+        let probe = def
+            .probe
+            .validate()
+            .map_err(|e| anyhow::anyhow!("[pools.{name}.probe]: {e}"))?;
+
+        // A probe's `[ech]` block needs its own resolver for the HTTPS record —
+        // the same dependency edge a route's `ech_resolver` names. Unset, it
+        // falls back to the pool's own resolver: nothing makes a pool's ECH
+        // lookup less subject to DNS interference than its target lookup.
+        let probe_ech = match probe.ech() {
+            None => None,
+            Some(block) => {
+                let ech = config::EffectiveProbeEch::resolve(block, &cfg.global);
+                let spec = ech.ech_resolver.clone().unwrap_or_else(|| own.clone());
+                let resolver = get_resolver(
+                    named_resolvers,
+                    resolver_cache,
+                    &spec,
+                    // HTTPS records are resolved dual-family regardless of which
+                    // families the pool itself ranks.
+                    config::AddressFamily::Dual,
+                )
+                .with_context(|| format!("[pools.{name}.probe.ech]: resolver"))?;
+                Some(pool::ProbeEchSetup { ech, resolver })
+            }
+        };
+
         builders.insert(
             name.as_str(),
-            PoolBuilder::new(name, def, resolver, root_store.clone())
+            PoolBuilder::new(name, def, probe, resolver, probe_ech, root_store)
                 .with_context(|| format!("[pools.{name}]"))?,
         );
     }

@@ -316,14 +316,31 @@ connect_timeout = "5s"
 #
 #   [pools.cf.probe]
 #   mode = "http"                    # tcp | tls | http
-#   port = 443                       # probed port (default 443), the pool's own
-#   sni = "cloudflare.com"           # required for tls/http
-#   path = "/cdn-cgi/trace"          # required for http
-#   status = [200]                   # required for http; accepted response codes
-#   timeout = "5s"                   # per-candidate deadline (default 3s)
+#   url = "https://cloudflare.com/cdn-cgi/trace"  # http: the whole request
+#   expect_status = [200]            # http: response codes counted as healthy
+#   timeout = "5s"                   # per-candidate deadline (3s tcp/tls, 5s http)
 #   interval = "5m"                  # cycle for a healthy candidate
 #   degraded_interval = "30s"        # FIRST retry delay, doubling up to interval
 #   fail_threshold = 2               # consecutive failures before degradation
+#
+# Each mode takes only the fields it can act on, and a field it cannot is an
+# error rather than a silent no-op — writing `expect_status` on a `tls` probe
+# would otherwise leave you believing the response is checked when the probe
+# stops at the handshake:
+#
+#   tcp   port (default 443), timeout
+#   tls   port (default 443), sni, timeout, [ech]
+#   http  url, expect_status, timeout, [ech] (https:// only)
+#
+# An `http` probe has no `sni` or `port` of its own: the URL already carries the
+# scheme, host, port and path, so there is one place to look and no way for them
+# to disagree. RTT stops at the first response byte, so a large body never
+# inflates the measurement.
+#
+#   [pools.cf.probe]
+#   mode = "tls"
+#   sni = "cloudflare.com"           # required for tls
+#   port = 443
 #
 # `sni` and `port` belong to the pool, not to any route: the probe measures link
 # quality to an edge node, not the response for one host. A route applies its own
@@ -332,6 +349,25 @@ connect_timeout = "5s"
 # RTT is a moving average, and switching requires a 20%/5ms margin, so a single
 # slow sample never moves traffic. A degraded candidate backs off exponentially,
 # so one permanently dead endpoint cannot pin the pool to the fast cycle.
+#
+# A `tls` or `https://` probe can hide its own SNI with ECH. The block is the
+# same one routes and resolvers use, and its fields inherit from `[global.ech]`
+# field-by-field — but its *presence* never does, so a `[global.ech]` written for
+# your routes will not silently start hiding every probe:
+#
+#     [pools.cf.probe.ech]
+#     mode = "doh"                   # static | doh | doh-with-fallback
+#     config = "AEX+DQBBkw..."       # base64 ECHConfigList; static / fallback
+#     ech_domain = "crypto.cloudflare.com"  # HTTPS record queried for `ech=`
+#     require_ech = true             # fail the candidate unless ECH was accepted
+#     max_retries = 2                # refetch-and-retry budget on ECH rejection
+#     ech_refresh = "1h"             # upper bound on the HTTPS record's own TTL
+#     ech_resolver = "@cloudflare"   # who resolves it; default: the pool's own
+#
+# The ECHConfigList is fetched once per probe SNI and refreshed on the record's
+# TTL, never per probe. `require_ech = false` falls back to GREASE when nothing
+# is published, which sends the SNI in the clear — leave it on unless you mean
+# exactly that.
 #
 #   [pools.cf.nat64]                 # address-family projection, not a new pool
 #   prefixes = ["64:ff9b::"]         # each IPv4 candidate x each prefix

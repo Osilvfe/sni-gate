@@ -558,9 +558,8 @@ fallback = 0
 
 [pools.cf.probe]
 mode = "http"
-sni = "cloudflare.com"
-path = "/cdn-cgi/trace"
-status = [200]
+url = "https://cloudflare.com/cdn-cgi/trace"
+expect_status = [200]
 
 [[listener.route]]
 type = "ech"
@@ -601,24 +600,60 @@ so RTT measurements survive; a sample that never answers is eventually replaced.
 
 ### Probing
 
-| Mode | Tests | RTT measured to | Requires |
+| Mode | Tests | RTT measured to | Takes |
 |---|---|---|---|
-| `tcp` | TCP connect | connect completion | — |
-| `tls` | + TLS handshake | handshake completion | `sni` |
-| `http` | + HTTP GET | first response byte | `sni`, `path`, `status` |
+| `tcp` | TCP connect | connect completion | `port` |
+| `tls` | + TLS handshake | handshake completion | `port`, **`sni`**, `[ech]` |
+| `http` | + HTTP GET | first response byte | **`url`**, **`expect_status`**, `[ech]` |
+
+Bold fields are required. Every mode also takes `timeout`, `interval`,
+`degraded_interval` and `fail_threshold`.
+
+A field a mode cannot act on is **rejected, not ignored** — `expect_status` on a
+`tls` probe would otherwise leave you believing the response is checked when the
+probe stops at the handshake.
+
+An `http` probe has no `sni` or `port` of its own: the `url` already carries the
+scheme, host, port and path, so there is one place to look and no way for them to
+disagree. RTT stops at the first response byte, so a large body never inflates
+the measurement.
 
 `sni` and `port` belong to the **pool**, not to any consuming route: the probe
 measures link quality to an edge node, not the response for one specific host. A
 route then applies its own port to the address the pool chose, which is why
-`upstream = "@cf:8443"` needs no second pool. A field a mode cannot use (`sni` on
-a `tcp` probe) is rejected rather than ignored.
+`upstream = "@cf:8443"` needs no second pool.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `timeout` | `3s` | per-candidate deadline |
+| `port` | `443` | probed port (`tcp` / `tls`; `http` takes it from the URL) |
+| `timeout` | `3s`, `5s` for `http` | per-candidate deadline |
 | `interval` | `5m` | cycle for a healthy candidate |
 | `degraded_interval` | `30s` | **first** retry delay, doubling up to `interval` |
 | `fail_threshold` | `2` | consecutive failures before degradation |
+
+#### Probing behind ECH
+
+A `tls` or `https://` probe can hide its own SNI, using the same `[ech]` block
+routes and resolvers use:
+
+```toml
+[pools.cf.probe.ech]
+mode = "doh"                          # static | doh | doh-with-fallback
+ech_domain = "crypto.cloudflare.com"  # HTTPS record queried for `ech=`
+ech_resolver = "@cloudflare"          # default: the pool's own resolver
+```
+
+Its fields inherit from `[global.ech]` field-by-field, but its **presence never
+does** — exactly as for a resolver, so a `[global.ech]` written for your routes
+will not silently start hiding every probe. `ech_resolver` is a dependency edge
+and is never inherited either.
+
+The ECHConfigList is fetched once per probe SNI and refreshed on the HTTPS
+record's own TTL (bounded by `ech_refresh`, default `1h`), never per probe. If
+the server rejects ECH because its published key rotated, the probe refetches and
+retries up to `max_retries` (default `2`). `require_ech` defaults to `true`; set
+to `false` and a probe with no published ECHConfig falls back to GREASE, which
+sends the SNI in the clear.
 
 ### How selection stays stable
 

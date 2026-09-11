@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use url::Url;
 
 use crate::error::ConfigError;
 
@@ -860,8 +861,7 @@ pub struct PoolDef {
     #[serde(default)]
     pub fallback: Option<usize>,
 
-    /// How candidates are health-checked. Required: a pool without probing is a
-    /// static list, which `upstream` already expresses.
+    /// How candidates are health-checked.
     pub probe: ProbeDef,
 
     /// NAT64 projection of this pool's IPv4 candidates. Not a separate pool —
@@ -924,70 +924,315 @@ impl TargetDef {
     }
 }
 
-/// What a probe actually does to a candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProbeMode {
-    /// TCP connect. RTT is measured to connect completion.
-    Tcp,
-    /// TCP + TLS handshake. RTT is measured to handshake completion. Needs `sni`.
-    Tls,
-    /// TCP + TLS + an HTTP `GET`. RTT is measured to the first response byte.
-    /// Needs `sni`, `path` and `status`.
-    Http,
-}
+// ---------------------------------------------------------------------------
+// Pool probes
+// ---------------------------------------------------------------------------
 
-/// How a pool's candidates are health-checked. All tuning lives here; the pool
-/// table itself carries only identity (`targets`, `fallback`).
+/// How a pool's candidates are health-checked, exactly as written.
+///
+/// Every mode-specific field is optional here because TOML cannot express "these
+/// fields, but only when `mode = "http"`". [`ProbeDef::validate`] is what imposes
+/// that shape, reducing this table to a [`ProbeSpec`]; nothing downstream reads
+/// the mode-specific fields off this struct, so no later code has to re-ask
+/// whether one applies to the mode in force.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeDef {
-    pub mode: ProbeMode,
+    /// `tcp` · `tls` · `http`.
+    pub mode: String,
 
-    /// Port probed on every candidate. Default 443.
-    ///
-    /// Deliberately the pool's own property rather than the consuming route's: a
-    /// probe measures the link to an edge node, and two routes reaching that
-    /// edge on different service ports must not each re-rank it. When a route
-    /// dials `@pool:8443` while the pool probes 443, the ranking still describes
-    /// the path to that host — which is what selection is for.
+    /// Probed port, for `tcp` and `tls`. Default 443. An `http` probe takes its
+    /// port from the URL instead, so that one field fully describes the request.
     #[serde(default)]
     pub port: Option<u16>,
 
-    /// TLS server name for `tls` / `http` probes.
+    /// TLS server name. Required for `tls`.
     #[serde(default)]
     pub sni: Option<String>,
 
-    /// Request path for `http` probes.
+    /// Full probe URL — `http://host[:port]/path` or the `https` equivalent.
+    /// Required for `http`.
     #[serde(default)]
-    pub path: Option<String>,
+    pub url: Option<String>,
 
-    /// Response status codes accepted by an `http` probe, listed explicitly.
-    /// Required for `http`, rejected otherwise.
+    /// Response codes that count as healthy. Required for `http`.
     #[serde(default)]
-    pub status: Vec<u16>,
+    pub expect_status: Vec<u16>,
 
-    /// Per-candidate probe deadline. Default 3s.
+    /// Per-candidate deadline. Default 3s for `tcp`/`tls`, 5s for `http`.
     #[serde(default, with = "humantime_serde::option")]
     pub timeout: Option<Duration>,
+
+    /// ECH for the probe's own handshake. Valid for `tls` and `https://` probes.
+    ///
+    /// Opt-in exactly as [`ResolverDef::ech`] is: the block's fields inherit from
+    /// `[global.ech]`, but its *presence* never does. A bare `[global.ech]` — in
+    /// any config with ECH routes — must not silently start hiding every pool
+    /// probe's SNI, nor apply a route's `ech_domain` to an unrelated edge node.
+    #[serde(default)]
+    pub ech: Option<EchConfig>,
 
     /// Probe cycle for healthy candidates. Default 5m.
     #[serde(default, with = "humantime_serde::option")]
     pub interval: Option<Duration>,
 
-    /// First retry delay for a degraded candidate, doubling on each further
-    /// failure up to `interval`. Default 30s.
-    ///
-    /// Per-candidate rather than a second pool-wide cadence: candidates sampled
-    /// out of a CIDR routinely include an address that never answers, and one
-    /// permanently dead candidate must not pin the whole pool to the fast cycle
-    /// forever.
+    /// First retry delay for degraded candidates, doubling up to `interval`.
+    /// Default 30s.
     #[serde(default, with = "humantime_serde::option")]
     pub degraded_interval: Option<Duration>,
 
-    /// Consecutive failures before a candidate is marked degraded. Default 2.
+    /// Consecutive failures before degradation. Default 2.
     #[serde(default)]
     pub fail_threshold: Option<u32>,
+}
+
+/// A probe definition reduced to the fields its own mode uses.
+///
+/// Defaults are deliberately *not* applied: the port and timeout defaults are a
+/// runtime concern that [`crate::pool`] owns, and validation must be able to
+/// report on precisely what the operator wrote. What this type does guarantee is
+/// *shape* — a `Http` variant always carries a parsed `http`/`https` URL with a
+/// host, and a non-empty list of in-range status codes — so no consumer
+/// re-checks and no consumer can read a field the mode never fills in.
+#[derive(Debug, Clone)]
+pub enum ProbeSpec {
+    /// Connect only. RTT measured to connect completion.
+    Tcp {
+        port: Option<u16>,
+        timeout: Option<Duration>,
+    },
+
+    /// Handshake only. RTT measured to handshake completion.
+    Tls {
+        port: Option<u16>,
+        sni: String,
+        timeout: Option<Duration>,
+        ech: Option<EchConfig>,
+    },
+
+    /// Request and response. RTT measured to the first response byte, which is
+    /// the last instant that still says something about the path rather than
+    /// about the size of the body.
+    Http {
+        url: Url,
+        expect_status: Vec<u16>,
+        timeout: Option<Duration>,
+        ech: Option<EchConfig>,
+    },
+}
+
+impl ProbeSpec {
+    /// The probe's ECH block, for the modes that can have one.
+    pub fn ech(&self) -> Option<&EchConfig> {
+        match self {
+            ProbeSpec::Tcp { .. } => None,
+            ProbeSpec::Tls { ech, .. } | ProbeSpec::Http { ech, .. } => ech.as_ref(),
+        }
+    }
+}
+
+/// A field the active mode cannot act on.
+///
+/// Refused by name and with the reason, never ignored: an operator who writes
+/// `expect_status` on a `tls` probe believes the probe checks the response, and
+/// silently dropping the field would leave them believing it.
+fn meaningless(field: &str, mode: &str, why: &str) -> String {
+    format!("`{field}` is meaningless for {mode} mode ({why})")
+}
+
+impl ProbeDef {
+    /// Validate one probe table and reduce it to the fields its mode uses.
+    ///
+    /// Both the config checker and the pool builder call this, so a probe that
+    /// loads is a probe that builds: there is no second reduction that could
+    /// drift from this one. The error message carries no scope prefix — every
+    /// caller knows which pool it is validating and adds its own.
+    pub fn validate(&self) -> Result<ProbeSpec, String> {
+        let spec = self.reduce()?;
+        for (name, value) in [
+            ("timeout", self.timeout),
+            ("interval", self.interval),
+            ("degraded_interval", self.degraded_interval),
+        ] {
+            if value.is_some_and(|d| d.is_zero()) {
+                return Err(format!("`{name}` must be greater than zero"));
+            }
+        }
+        if self.fail_threshold == Some(0) {
+            return Err(
+                "`fail_threshold` must be at least 1 (0 would degrade a candidate \
+                        that never failed)"
+                    .to_string(),
+            );
+        }
+        Ok(spec)
+    }
+
+    fn reduce(&self) -> Result<ProbeSpec, String> {
+        match self.mode.as_str() {
+            "tcp" => {
+                if self.sni.is_some() {
+                    return Err(meaningless("sni", "tcp", "no TLS handshake is performed"));
+                }
+                if self.url.is_some() {
+                    return Err(meaningless("url", "tcp", "no request is sent"));
+                }
+                if !self.expect_status.is_empty() {
+                    return Err(meaningless("expect_status", "tcp", "no response is read"));
+                }
+                if self.ech.is_some() {
+                    return Err(meaningless("ech", "tcp", "no TLS handshake is performed"));
+                }
+                Ok(ProbeSpec::Tcp {
+                    port: self.port,
+                    timeout: self.timeout,
+                })
+            }
+
+            "tls" => {
+                if self.url.is_some() {
+                    return Err(meaningless("url", "tls", "use `sni`; no request is sent"));
+                }
+                if !self.expect_status.is_empty() {
+                    return Err(meaningless(
+                        "expect_status",
+                        "tls",
+                        "the probe stops at the handshake",
+                    ));
+                }
+                let sni = self
+                    .sni
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("tls probe mode requires a non-empty `sni`")?;
+                Ok(ProbeSpec::Tls {
+                    port: self.port,
+                    sni: sni.to_string(),
+                    timeout: self.timeout,
+                    ech: self.ech.clone(),
+                })
+            }
+
+            "http" => {
+                if self.sni.is_some() {
+                    return Err(meaningless(
+                        "sni",
+                        "http",
+                        "the URL's host is the server name",
+                    ));
+                }
+                if self.port.is_some() {
+                    return Err(meaningless("port", "http", "put the port in the URL"));
+                }
+
+                let raw = self
+                    .url
+                    .as_deref()
+                    .ok_or("http probe mode requires a `url`")?;
+                let url: Url = raw
+                    .parse()
+                    .map_err(|e| format!("invalid `url` {raw:?}: {e}"))?;
+                let scheme = url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(format!(
+                        "`url` scheme must be http or https, not {scheme:?}"
+                    ));
+                }
+                if url.host().is_none() {
+                    return Err(format!("`url` {raw:?} has no host"));
+                }
+
+                if self.expect_status.is_empty() {
+                    return Err("http probe mode requires a non-empty `expect_status`".to_string());
+                }
+                for code in &self.expect_status {
+                    if !(100..=599).contains(code) {
+                        return Err(format!(
+                            "{code} is not an HTTP status code in `expect_status`"
+                        ));
+                    }
+                }
+
+                // ECH protects a TLS ClientHello; a cleartext probe has none, so
+                // the block would be silently inert rather than merely redundant.
+                if self.ech.is_some() && scheme != "https" {
+                    return Err(meaningless(
+                        "ech",
+                        "http",
+                        "the URL is cleartext; use an https:// URL",
+                    ));
+                }
+
+                Ok(ProbeSpec::Http {
+                    url,
+                    expect_status: self.expect_status.clone(),
+                    timeout: self.timeout,
+                    ech: self.ech.clone(),
+                })
+            }
+
+            other => Err(format!(
+                "unknown probe mode {other:?}; expected tcp, tls or http"
+            )),
+        }
+    }
+}
+
+/// The fully-resolved ECH settings for one pool probe.
+///
+/// A probe's `[ech]` block sits at the same rung of the ladder a resolver's does
+/// — `probe.ech → [global.ech] → [global]` — for the same reason: a pool is a
+/// top-level object, with no listener or route between it and `[global]`.
+#[derive(Debug, Clone)]
+pub struct EffectiveProbeEch {
+    pub settings: EffectiveEch,
+    pub require_ech: bool,
+    pub ech_refresh: Duration,
+    /// Resolver performing the probe's ECH HTTPS-record lookup. Never inherited
+    /// — it is a dependency edge, like a resolver's `bootstrap`.
+    pub ech_resolver: Option<String>,
+}
+
+impl EffectiveProbeEch {
+    /// Flatten a probe's `[ech]` block, applying inheritance from `[global]` and
+    /// defaults. Field-by-field, exactly as [`ResolverDef::effective`] does.
+    pub fn resolve(ech: &EchConfig, global: &Global) -> Self {
+        let g = &global.common;
+        let ge = global.ech.as_ref();
+        Self {
+            settings: EffectiveEch {
+                mode: ech
+                    .mode
+                    .or_else(|| ge.and_then(|x| x.mode))
+                    .unwrap_or_default(),
+                config: ech
+                    .config
+                    .clone()
+                    .or_else(|| ge.and_then(|x| x.config.clone())),
+                ech_domain: ech
+                    .ech_domain
+                    .clone()
+                    .or_else(|| ge.and_then(|x| x.ech_domain.clone())),
+                max_retries: ech
+                    .max_retries
+                    .or_else(|| ge.and_then(|x| x.max_retries))
+                    .unwrap_or(2),
+            },
+            require_ech: ech
+                .require_ech
+                .or_else(|| ge.and_then(|x| x.require_ech))
+                .or(g.require_ech)
+                .unwrap_or(true),
+            ech_refresh: ech
+                .ech_refresh
+                .or_else(|| ge.and_then(|x| x.ech_refresh))
+                .or(g.ech_refresh)
+                .unwrap_or_else(default_ech_refresh),
+            // Never inherited — a dependency edge, like `bootstrap`.
+            ech_resolver: ech.ech_resolver.clone(),
+        }
+    }
 }
 
 /// NAT64 projection of a pool's IPv4 candidates (RFC 6052).
@@ -1021,44 +1266,6 @@ pub enum Selector {
     Index(usize),
     /// Matches a candidate carrying this tag, automatic or custom.
     Tag(String),
-}
-
-/// The fully-resolved probe settings for one pool, defaults applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectiveProbe {
-    pub mode: ProbeMode,
-    pub port: u16,
-    pub sni: Option<String>,
-    pub path: Option<String>,
-    pub status: Vec<u16>,
-    pub timeout: Duration,
-    pub interval: Duration,
-    pub degraded_interval: Duration,
-    pub fail_threshold: u32,
-}
-
-impl ProbeDef {
-    /// Flatten this probe table, applying defaults.
-    ///
-    /// Nothing here can fail: the fallible parts (a mode missing its required
-    /// fields, a nonsensical interval) are checked by
-    /// [`Config::validate_pools`], which reads *this* result rather than the raw
-    /// table so validation and runtime never disagree.
-    pub fn effective(&self) -> EffectiveProbe {
-        EffectiveProbe {
-            mode: self.mode,
-            port: self.port.unwrap_or(443),
-            sni: self.sni.clone(),
-            path: self.path.clone(),
-            status: self.status.clone(),
-            timeout: self.timeout.unwrap_or_else(default_probe_timeout),
-            interval: self.interval.unwrap_or_else(default_pool_interval),
-            degraded_interval: self
-                .degraded_interval
-                .unwrap_or_else(default_pool_degraded_interval),
-            fail_threshold: self.fail_threshold.unwrap_or(2),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,84 +1659,8 @@ impl Config {
                 }
             }
 
-            let probe = pool.probe.effective();
-            match probe.mode {
-                ProbeMode::Tcp => {
-                    if probe.sni.is_some() || probe.path.is_some() || !probe.status.is_empty() {
-                        return Err(ConfigError::Invalid(format!(
-                            "[pools.{name}.probe]: mode = \"tcp\" tests only a TCP connect, so \
-                             `sni`, `path` and `status` are meaningless here; remove them or \
-                             choose mode = \"tls\" / \"http\""
-                        )));
-                    }
-                }
-                ProbeMode::Tls => {
-                    if probe.sni.is_none() {
-                        return Err(ConfigError::Invalid(format!(
-                            "[pools.{name}.probe]: mode = \"tls\" requires `sni` (the name \
-                             presented on the probe handshake)"
-                        )));
-                    }
-                    if probe.path.is_some() || !probe.status.is_empty() {
-                        return Err(ConfigError::Invalid(format!(
-                            "[pools.{name}.probe]: mode = \"tls\" stops after the handshake, so \
-                             `path` and `status` are meaningless here; use mode = \"http\" to \
-                             send a request"
-                        )));
-                    }
-                }
-                ProbeMode::Http => {
-                    if probe.sni.is_none() {
-                        return Err(ConfigError::Invalid(format!(
-                            "[pools.{name}.probe]: mode = \"http\" requires `sni`"
-                        )));
-                    }
-                    match &probe.path {
-                        None => {
-                            return Err(ConfigError::Invalid(format!(
-                                "[pools.{name}.probe]: mode = \"http\" requires `path`"
-                            )))
-                        }
-                        Some(p) if !p.starts_with('/') => {
-                            return Err(ConfigError::Invalid(format!(
-                                "[pools.{name}.probe]: path {p:?} must start with '/'"
-                            )))
-                        }
-                        Some(_) => {}
-                    }
-                    if probe.status.is_empty() {
-                        return Err(ConfigError::Invalid(format!(
-                            "[pools.{name}.probe]: mode = \"http\" requires `status` (the \
-                             accepted response codes, e.g. status = [200])"
-                        )));
-                    }
-                    for s in &probe.status {
-                        if !(100..=599).contains(s) {
-                            return Err(ConfigError::Invalid(format!(
-                                "[pools.{name}.probe]: status {s} is not an HTTP status code"
-                            )));
-                        }
-                    }
-                }
-            }
-
-            if probe.timeout.is_zero() {
-                return Err(ConfigError::Invalid(format!(
-                    "[pools.{name}.probe]: timeout must be greater than zero"
-                )));
-            }
-            if probe.interval.is_zero() || probe.degraded_interval.is_zero() {
-                return Err(ConfigError::Invalid(format!(
-                    "[pools.{name}.probe]: interval and degraded_interval must be greater \
-                     than zero"
-                )));
-            }
-            if probe.fail_threshold == 0 {
-                return Err(ConfigError::Invalid(format!(
-                    "[pools.{name}.probe]: fail_threshold must be at least 1 (0 would degrade \
-                     a candidate that never failed)"
-                )));
-            }
+            // Validate probe configuration
+            self.validate_pool_probe(name, &pool.probe)?;
 
             if let Some(n) = &pool.nat64 {
                 if n.prefixes.is_empty() {
@@ -1663,6 +1794,43 @@ impl Config {
                 route.label()
             )));
         }
+        Ok(())
+    }
+
+    /// Validate one pool's probe table.
+    ///
+    /// The shape check is [`ProbeDef::validate`], shared with the pool builder so
+    /// that a probe which loads is a probe which builds. What is added here is
+    /// the part that needs the whole document: an `ech_resolver` naming a
+    /// `[resolvers.*]` entry that must exist.
+    fn validate_pool_probe(&self, pool_name: &str, probe: &ProbeDef) -> Result<(), ConfigError> {
+        let spec = probe
+            .validate()
+            .map_err(|e| ConfigError::Invalid(format!("[pools.{pool_name}.probe]: {e}")))?;
+
+        if let Some(ech) = spec.ech() {
+            let eff = EffectiveProbeEch::resolve(ech, &self.global);
+            if matches!(
+                eff.settings.mode,
+                EchMode::Static | EchMode::DohWithFallback
+            ) && eff.settings.config.is_none()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "[pools.{pool_name}.probe.ech]: mode {:?} requires an inline `config` \
+                     (set it here or in [global.ech])",
+                    eff.settings.mode
+                )));
+            }
+            // Only a `@name` needs the registry; an inline spec is self-contained.
+            if let Some(spec) = &eff.ech_resolver {
+                if Self::is_resolver_ref(spec) {
+                    self.resolve_resolver_ref(spec).map_err(|e| {
+                        ConfigError::Invalid(format!("[pools.{pool_name}.probe.ech]: {e}"))
+                    })?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2907,19 +3075,6 @@ fn default_probe_timeout() -> Duration {
     // or nearby backend; 3s is generous while keeping startup snappy when a
     // backend is unreachable.
     Duration::from_secs(3)
-}
-fn default_pool_interval() -> Duration {
-    // A healthy edge node's RTT ranking is stable over minutes, and every cycle
-    // costs one probe per candidate. 5 minutes keeps the ranking current without
-    // making the pool a traffic source in its own right.
-    Duration::from_secs(300)
-}
-fn default_pool_degraded_interval() -> Duration {
-    // The *first* retry delay for a degraded candidate, doubling from here up to
-    // `interval`. Short enough that a brief outage is noticed quickly, while the
-    // backoff keeps a permanently dead candidate from probing forever at this
-    // rate.
-    Duration::from_secs(30)
 }
 fn default_psl_path() -> PathBuf {
     PathBuf::from("cache/public_suffix_list.dat")
@@ -4388,48 +4543,210 @@ addr = "0.0.0.0:443"
 
     #[test]
     fn probe_modes_require_their_own_fields() {
-        const SNI: &str = r#"sni = "x.example""#;
-        const PATH: &str = r#"path = "/cdn-cgi/trace""#;
-        const STATUS: &str = "status = [200]";
-
         // A `tcp` probe needs nothing else.
         validate_probe(r#"mode = "tcp""#).unwrap();
 
-        // `tls` needs an sni.
-        let err = validate_probe(r#"mode = "tls""#).unwrap_err().to_string();
-        assert!(err.contains("requires `sni`"), "unhelpful: {err}");
-        validate_probe(&format!("mode = \"tls\"\n{SNI}")).unwrap();
+        // An unknown mode names the three that exist.
+        let err = validate_probe(r#"mode = "ping""#).unwrap_err().to_string();
+        assert!(err.contains("tcp, tls or http"), "unhelpful: {err}");
 
-        // `http` needs sni + path + status.
+        // `tls` needs an sni, and a blank one is not an sni.
+        let err = validate_probe(r#"mode = "tls""#).unwrap_err().to_string();
+        assert!(
+            err.contains("requires a non-empty `sni`"),
+            "unhelpful: {err}"
+        );
+        let err = validate_probe("mode = \"tls\"\nsni = \"  \"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires a non-empty `sni`"),
+            "unhelpful: {err}"
+        );
+        validate_probe("mode = \"tls\"\nsni = \"x.example\"").unwrap();
+
+        // `http` needs url + expect_status.
         let http =
             |fields: &[&str]| validate_probe(&format!("mode = \"http\"\n{}", fields.join("\n")));
-        assert!(http(&[PATH, STATUS]).is_err(), "missing sni accepted");
-        assert!(http(&[SNI, STATUS]).is_err(), "missing path accepted");
-        let err = http(&[SNI, PATH]).unwrap_err().to_string();
-        assert!(err.contains("requires `status`"), "unhelpful: {err}");
+
+        let err = http(&["expect_status = [200]"]).unwrap_err().to_string();
+        assert!(err.contains("requires a `url`"), "unhelpful: {err}");
+
+        let err = http(&[r#"url = "https://x.example/p""#])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires a non-empty `expect_status`"),
+            "unhelpful: {err}"
+        );
+
         // Complete.
-        http(&[SNI, PATH, STATUS]).unwrap();
-        // A path must be a path.
-        assert!(http(&[SNI, r#"path = "cdn-cgi/trace""#, STATUS]).is_err());
+        http(&[r#"url = "https://x.example/p""#, "expect_status = [200]"]).unwrap();
+        // Cleartext is equally valid; only ECH is refused on it.
+        http(&[r#"url = "http://x.example/p""#, "expect_status = [200]"]).unwrap();
+
+        // A URL must parse, carry a host, and speak a scheme the probe can.
+        let err = http(&[r#"url = "not-a-url""#, "expect_status = [200]"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid `url`"), "unhelpful: {err}");
+
+        let err = http(&[r#"url = "ftp://x.example/p""#, "expect_status = [200]"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be http or https"), "unhelpful: {err}");
+
         // A status must be an HTTP status code.
-        assert!(http(&[SNI, PATH, "status = [999]"]).is_err());
+        let err = http(&[r#"url = "https://x.example/p""#, "expect_status = [999]"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("999 is not an HTTP status code"),
+            "unhelpful: {err}"
+        );
     }
 
     /// A field a mode cannot use is a mistake, not a harmless extra: silently
     /// ignoring it would leave the operator believing the probe checks content.
     #[test]
     fn fields_meaningless_for_a_mode_are_rejected() {
-        // `sni` on a tcp probe: nothing presents it.
-        let err = validate_probe("mode = \"tcp\"\nsni = \"x.example\"")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("meaningless"), "unhelpful: {err}");
+        let cases = [
+            // `tcp` performs no handshake and reads no response.
+            ("mode = \"tcp\"\nsni = \"x.example\"", "`sni`"),
+            ("mode = \"tcp\"\nurl = \"https://x.example/p\"", "`url`"),
+            ("mode = \"tcp\"\nexpect_status = [200]", "`expect_status`"),
+            ("mode = \"tcp\"\n[pools.p.probe.ech]", "`ech`"),
+            // `tls` stops at the handshake.
+            (
+                "mode = \"tls\"\nsni = \"x.example\"\nurl = \"https://x.example/p\"",
+                "`url`",
+            ),
+            (
+                "mode = \"tls\"\nsni = \"x.example\"\nexpect_status = [200]",
+                "`expect_status`",
+            ),
+            // `http` takes its server name and its port from the URL.
+            (
+                "mode = \"http\"\nurl = \"https://x.example/p\"\nexpect_status = [200]\nsni = \"y.example\"",
+                "`sni`",
+            ),
+            (
+                "mode = \"http\"\nurl = \"https://x.example/p\"\nexpect_status = [200]\nport = 8443",
+                "`port`",
+            ),
+            // ECH protects a ClientHello; a cleartext probe has none.
+            (
+                "mode = \"http\"\nurl = \"http://x.example/p\"\nexpect_status = [200]\n[pools.p.probe.ech]",
+                "`ech`",
+            ),
+        ];
+        for (body, field) in cases {
+            let err = validate_probe(body).unwrap_err().to_string();
+            assert!(
+                err.contains("meaningless") && err.contains(field),
+                "{body:?} -> unhelpful: {err}"
+            );
+        }
+    }
 
-        // `path` / `status` on a tls probe: it stops at the handshake.
-        let err = validate_probe("mode = \"tls\"\nsni = \"x.example\"\npath = \"/x\"")
+    /// A probe's `[ech]` block resolves against `[global.ech]` field-by-field,
+    /// exactly as a resolver's does, and its *presence* is never inherited.
+    #[test]
+    fn probe_ech_inherits_from_global_but_is_never_implied() {
+        const GLOBAL: &str = "[global.ech]\nmode = \"static\"\nconfig = \"CFG\"\n\
+                              require_ech = false\nech_refresh = \"10m\"\n";
+
+        // No `[probe.ech]`: a bare `[global.ech]` must not switch ECH on for a
+        // probe that never asked for it.
+        let cfg = parse(&format!(
+            "{GLOBAL}\n[pools.p]\ntargets = [\"1.2.3.4\"]\n\
+             [pools.p.probe]\nmode = \"tls\"\nsni = \"x.example\"\n\
+             \n[[listener]]\naddr = \"0.0.0.0:443\"\n  [[listener.route]]\n  \
+             type = \"tls\"\n  match_sni = [\".a.com\"]\n  upstream = \"@p\"\n"
+        ));
+        cfg.validate().unwrap();
+        assert!(cfg
+            .pool_def("p")
+            .unwrap()
+            .probe
+            .validate()
+            .unwrap()
+            .ech()
+            .is_none());
+
+        // An empty `[probe.ech]` opts in and takes every field from `[global]`.
+        let cfg = parse(&format!(
+            "{GLOBAL}\n[pools.p]\ntargets = [\"1.2.3.4\"]\n\
+             [pools.p.probe]\nmode = \"tls\"\nsni = \"x.example\"\n\
+             [pools.p.probe.ech]\n\
+             \n[[listener]]\naddr = \"0.0.0.0:443\"\n  [[listener.route]]\n  \
+             type = \"tls\"\n  match_sni = [\".a.com\"]\n  upstream = \"@p\"\n"
+        ));
+        cfg.validate().unwrap();
+        let spec = cfg.pool_def("p").unwrap().probe.validate().unwrap();
+        let eff = EffectiveProbeEch::resolve(spec.ech().unwrap(), &cfg.global);
+        assert_eq!(eff.settings.mode, EchMode::Static);
+        assert_eq!(eff.settings.config.as_deref(), Some("CFG"));
+        assert!(!eff.require_ech);
+        assert_eq!(eff.ech_refresh, Duration::from_secs(600));
+        // Never inherited: a dependency edge, like a resolver's `bootstrap`.
+        assert!(eff.ech_resolver.is_none());
+    }
+
+    /// `static` and `doh-with-fallback` have nothing to fall back *to* without
+    /// an inline config, and an `ech_resolver` must name a resolver that exists.
+    #[test]
+    fn probe_ech_is_validated_against_the_resolved_ladder() {
+        let pool = |ech: &str| {
+            format!(
+                "[pools.p]\ntargets = [\"1.2.3.4\"]\n\
+                 [pools.p.probe]\nmode = \"tls\"\nsni = \"x.example\"\n\
+                 [pools.p.probe.ech]\n{ech}\n\
+                 \n[[listener]]\naddr = \"0.0.0.0:443\"\n  [[listener.route]]\n  \
+                 type = \"tls\"\n  match_sni = [\".a.com\"]\n  upstream = \"@p\"\n"
+            )
+        };
+
+        let err = parse(&pool("mode = \"static\""))
+            .validate()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("meaningless"), "unhelpful: {err}");
+        assert!(
+            err.contains("requires an inline `config`"),
+            "unhelpful: {err}"
+        );
+
+        // Supplied at `[global.ech]` instead, it resolves and passes.
+        parse(&format!(
+            "[global.ech]\nconfig = \"CFG\"\n{}",
+            pool("mode = \"doh-with-fallback\"")
+        ))
+        .validate()
+        .unwrap();
+
+        // `doh` needs nothing inline.
+        parse(&pool("mode = \"doh\"")).validate().unwrap();
+
+        let err = parse(&pool("ech_resolver = \"@nope\""))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("probe.ech") && err.contains("nope"),
+            "unhelpful: {err}"
+        );
+
+        // Only a `@name` is a reference. An inline spec is self-contained and
+        // must not be looked up in the registry it was never meant to be in.
+        parse(&pool("ech_resolver = \"udp://127.0.0.1:5353\""))
+            .validate()
+            .unwrap();
+        parse(&format!(
+            "[resolvers.fast]\nendpoint = \"1.1.1.1\"\n{}",
+            pool("ech_resolver = \"@fast\"")
+        ))
+        .validate()
+        .unwrap();
     }
 
     #[test]

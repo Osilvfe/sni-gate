@@ -104,6 +104,101 @@ addr = "127.0.0.1:{listen}"
     );
 }
 
+/// An `http` probe drives the whole request path end to end.
+///
+/// The `url` is the only place the probe's scheme, host, port and path are
+/// written, and each is read from a different part of it: the port decides which
+/// socket every candidate is dialled on, while the host only ever appears in the
+/// `Host` header. Pointing the URL at a name that resolves to nothing, with the
+/// live address supplied by `targets`, is what separates the two — a probe that
+/// dialled the URL's host instead would never reach the backend.
+#[test]
+fn an_http_probe_ranks_a_candidate_that_answers_with_an_accepted_status() {
+    let dir = tempdir();
+    let (backend, _b) = spawn_mock_backend();
+    let listen = free_port();
+
+    let config = format!(
+        r#"{}
+[pools.edge]
+targets = ["{DEAD_IP}", "127.0.0.1"]
+
+[pools.edge.probe]
+mode = "http"
+url = "http://edge.pool.test:{backend}/health?probe=1"
+expect_status = [200]
+timeout = "600ms"
+interval = "5s"
+degraded_interval = "1s"
+
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "pooled"
+  type = "http"
+  match_sni = [".pool.test"]
+  upstream = "@edge:{backend}"
+"#,
+        preamble()
+    );
+
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    let resp = get_via_gateway(listen, "a.pool.test");
+    assert!(
+        resp.contains("200 OK"),
+        "the http probe never ranked the live candidate: {resp:?}"
+    );
+}
+
+/// `expect_status` is enforced, not decorative: a candidate that answers, and
+/// answers well-formed HTTP, is still unhealthy if it answers with the wrong
+/// code.
+///
+/// The mock always replies `200`, so demanding `404` makes "reachable" and
+/// "healthy" disagree — which is the entire reason an `http` probe exists
+/// instead of a `tcp` one.
+#[test]
+fn an_http_probe_rejects_a_status_it_was_not_promised() {
+    let dir = tempdir();
+    let (backend, _b) = spawn_mock_backend();
+    let listen = free_port();
+
+    let config = format!(
+        r#"{}
+[pools.edge]
+targets = ["127.0.0.1"]
+
+[pools.edge.probe]
+mode = "http"
+url = "http://edge.pool.test:{backend}/health"
+expect_status = [404]
+timeout = "600ms"
+interval = "5s"
+degraded_interval = "1s"
+
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "pooled"
+  type = "http"
+  match_sni = [".pool.test"]
+  upstream = "@edge:{backend}"
+"#,
+        preamble()
+    );
+
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    let resp = get_via_gateway(listen, "a.pool.test");
+    assert!(
+        !resp.contains("200 OK"),
+        "a candidate answering 200 was ranked by a probe that demanded 404: {resp:?}"
+    );
+}
+
 /// A candidate nothing answers on is never ranked, so it never receives traffic —
 /// even when it is listed first.
 ///
@@ -286,6 +381,74 @@ addr = "127.0.0.1:{listen}"
     assert!(
         dns.asked("edge.pool.test"),
         "the pool never resolved its domain target through the configured resolver"
+    );
+}
+
+/// A probe's `[ech]` block is wired end to end: the provider is built at
+/// startup, and its HTTPS-record lookup goes to the probe's *own*
+/// `ech_resolver` rather than to the pool's target resolver.
+///
+/// Two mock resolvers is the whole point. An implementation that accepted
+/// `ech_resolver` and then quietly reused the pool's resolver would still boot,
+/// still probe, and still pass every other test here — the only observable
+/// difference is which socket the HTTPS question arrives on.
+#[test]
+fn a_probe_ech_lookup_goes_to_its_own_resolver() {
+    /// DNS qtype for HTTPS (RFC 9460), the record carrying `ech=`.
+    const HTTPS_QTYPE: u16 = 65;
+
+    let dir = tempdir();
+    let listen = free_port();
+
+    // Neither answers an HTTPS record, so the probe fails and nothing is ranked.
+    // That is fine: what is asserted is which resolver was *asked*.
+    let targets = MockDns::builder()
+        .a("edge.pool.test", DEAD_IP.parse().unwrap())
+        .start();
+    let ech_dns = MockDns::builder().start();
+
+    let config = format!(
+        r#"{}
+[pools.edge]
+targets = ["edge.pool.test"]
+resolver = "udp://127.0.0.1:{}"
+
+[pools.edge.probe]
+mode = "tls"
+sni = "edge.pool.test"
+timeout = "300ms"
+interval = "2s"
+degraded_interval = "300ms"
+  [pools.edge.probe.ech]
+  mode = "doh"
+  ech_resolver = "udp://127.0.0.1:{}"
+
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  type = "http"
+  match_sni = [".pool.test"]
+  upstream = "@edge:443"
+"#,
+        preamble(),
+        targets.port(),
+        ech_dns.port()
+    );
+
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    for _ in 0..120 {
+        if ech_dns.asked_type("edge.pool.test", HTTPS_QTYPE) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        ech_dns.asked_type("edge.pool.test", HTTPS_QTYPE),
+        "the probe's ECH lookup never reached its own ech_resolver; \
+         the pool's resolver saw {:?}",
+        targets.queries()
     );
 }
 
@@ -606,8 +769,7 @@ fn an_incomplete_http_probe_is_refused_at_startup() {
 targets = ["127.0.0.1"]
 [pools.edge.probe]
 mode = "http"
-sni = "x.test"
-path = "/health"
+url = "http://x.test/health"
 
 [[listener]]
 addr = "127.0.0.1:1"
@@ -616,7 +778,57 @@ addr = "127.0.0.1:1"
   match_sni = [".a.test"]
   upstream = "@edge"
 "#,
-        "requires `status`",
+        "requires a non-empty `expect_status`",
+    );
+}
+
+/// A field the active mode cannot act on is refused by name, because ignoring
+/// it would leave the operator believing the probe checks something it does not.
+#[test]
+fn a_probe_field_its_mode_cannot_use_is_refused_at_startup() {
+    assert_rejected(
+        r#"
+[pools.edge]
+targets = ["127.0.0.1"]
+[pools.edge.probe]
+mode = "http"
+url = "http://x.test/health"
+expect_status = [200]
+port = 8080
+
+[[listener]]
+addr = "127.0.0.1:1"
+  [[listener.route]]
+  type = "http"
+  match_sni = [".a.test"]
+  upstream = "@edge"
+"#,
+        "`port` is meaningless for http mode",
+    );
+}
+
+/// A probe's `ech_resolver` is a dependency edge like any other, and one that
+/// names nothing is caught before a single probe runs.
+#[test]
+fn a_probe_ech_resolver_that_does_not_exist_is_refused_at_startup() {
+    assert_rejected(
+        r#"
+[pools.edge]
+targets = ["127.0.0.1"]
+[pools.edge.probe]
+mode = "tls"
+sni = "x.test"
+[pools.edge.probe.ech]
+ech_resolver = "@missing"
+
+[[listener]]
+addr = "127.0.0.1:1"
+  [[listener.route]]
+  type = "http"
+  match_sni = [".a.test"]
+  upstream = "@edge"
+"#,
+        "probe.ech",
     );
 }
 
