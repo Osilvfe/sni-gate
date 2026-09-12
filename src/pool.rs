@@ -745,8 +745,15 @@ fn build_probe_plan(
             let port = url
                 .port_or_known_default()
                 .expect("http and https have known default ports");
-            let tls = (url.scheme() == "https")
-                .then(|| build_tls_probe(host.to_string(), HTTP_PROBE_ALPN, port, ech, root_store));
+            let tls = (url.scheme() == "https").then(|| {
+                build_tls_probe(
+                    tls_name_from_url(&url),
+                    HTTP_PROBE_ALPN,
+                    port,
+                    ech,
+                    root_store,
+                )
+            });
             ProbePlan {
                 port,
                 timeout: timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
@@ -757,6 +764,20 @@ fn build_probe_plan(
                 },
             }
         }
+    }
+}
+
+/// Return the certificate identity from a probe URL in the representation
+/// rustls expects. `Url::host_str()` deliberately brackets IPv6 literals for
+/// use in an HTTP authority; rustls `ServerName` requires the bare IP instead.
+fn tls_name_from_url(url: &Url) -> String {
+    match url
+        .host()
+        .expect("ProbeSpec::Http carries a URL with a host")
+    {
+        url::Host::Domain(name) => name.to_string(),
+        url::Host::Ipv4(addr) => addr.to_string(),
+        url::Host::Ipv6(addr) => addr.to_string(),
     }
 }
 
@@ -1620,6 +1641,7 @@ async fn tls_connect(
             .client(&tls.sni, alpn)
             .await
             .context("assembling the probe ECH client config")?;
+        let generation = client.generation;
         let connector = TlsConnector::from(client.client_config);
 
         let started = Instant::now();
@@ -1645,8 +1667,11 @@ async fn tls_connect(
                     "probe ECH rejected; refreshing the config and retrying"
                 );
                 // The server's published key rotated out from under the cached
-                // config; drop it so the next attempt refetches.
-                provider.invalidate(&tls.sni).await;
+                // config. Only evict the generation this handshake used; a
+                // slower rejection must not discard a concurrent refresh.
+                provider
+                    .invalidate_after_rejection(&tls.sni, generation)
+                    .await;
             }
             Err(e) => return Err(e).context("probe TLS handshake"),
         }
@@ -1753,6 +1778,20 @@ mod tests {
 
         // `Connection: close`, so the origin does not wait for a second request.
         assert!(rendered("https://x.example/p").ends_with("Connection: close\r\n\r\n"));
+    }
+
+    /// URL syntax brackets an IPv6 literal in an HTTP authority, while rustls
+    /// accepts it as a `ServerName::IpAddress` only without those brackets.
+    #[test]
+    fn an_ipv6_probe_url_uses_a_bare_tls_identity() {
+        let url: Url = "https://[2001:db8::1]/health".parse().unwrap();
+        assert_eq!(url.host_str(), Some("[2001:db8::1]"));
+        let tls_name = tls_name_from_url(&url);
+        assert_eq!(tls_name, "2001:db8::1");
+        assert!(ServerName::try_from(tls_name).is_ok());
+
+        let request = http_request(&url, url.host_str().unwrap());
+        assert!(request.contains("\r\nHost: [2001:db8::1]\r\n"));
     }
 
     /// The status line may arrive split across reads, including between the CR
