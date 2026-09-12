@@ -374,6 +374,15 @@ impl DnsResolver {
         self.inner.read().expect("resolver lock poisoned").clone()
     }
 
+    /// Clear one cached lookup from the resolver that is currently live.
+    ///
+    /// ECH callers use this after a server rejects a published config. Clearing
+    /// only their own provider cache is not enough: hickory may otherwise serve
+    /// the same stale HTTPS RR again until its DNS TTL expires.
+    pub fn clear_lookup_cache(&self, name: &str, rtype: RecordType) {
+        self.snapshot().clear_lookup_cache(name, rtype);
+    }
+
     fn swap(&self, new: Arc<TokioResolver>, ech: Option<Vec<u8>>) {
         *self.inner.write().expect("resolver lock poisoned") = new;
         *self.ech_bytes.write().expect("ech lock poisoned") = ech;

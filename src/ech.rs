@@ -7,6 +7,7 @@
 //! `retry_configs` for the ECH retry path (driven by the proxy).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +43,9 @@ struct Cached {
     ech_mode: EchMode,
     configs: HashMap<Vec<Vec<u8>>, Arc<ClientConfig>>,
     refresh_at: Instant,
+    /// Identifies the resolved ECHConfig generation handed to a connection.
+    /// A rejection may evict only the generation that connection actually used.
+    generation: u64,
 }
 
 /// Per-route ECH provider, caching a client config per inner name.
@@ -60,11 +64,14 @@ pub struct EchProvider {
     root_store: Arc<RootCertStore>,
     refresh_bound: Duration,
     cache: RwLock<HashMap<String, Cached>>,
+    next_generation: AtomicU64,
 }
 
 /// A ready-to-use ECH client config handed to the connection path.
 pub struct EchClient {
     pub client_config: Arc<ClientConfig>,
+    /// Generation of the resolved ECHConfig used by `client_config`.
+    pub generation: u64,
 }
 
 impl EchProvider {
@@ -87,6 +94,7 @@ impl EchProvider {
             root_store,
             refresh_bound,
             cache: RwLock::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -106,6 +114,7 @@ impl EchProvider {
                     if let Some(cfg) = c.configs.get(alpn) {
                         return Ok(EchClient {
                             client_config: cfg.clone(),
+                            generation: c.generation,
                         });
                     }
                 }
@@ -119,6 +128,7 @@ impl EchProvider {
                 // the already-resolved mode without re-fetching.
                 return Ok(EchClient {
                     client_config: self.config_for(c, alpn)?,
+                    generation: c.generation,
                 });
             }
         }
@@ -130,7 +140,10 @@ impl EchProvider {
                 guard.insert(inner_name.to_string(), fresh);
                 let entry = guard.get_mut(inner_name).expect("just inserted this entry");
                 let client_config = self.config_for(entry, alpn)?;
-                Ok(EchClient { client_config })
+                Ok(EchClient {
+                    client_config,
+                    generation: entry.generation,
+                })
             }
             Err(e) => {
                 if let Some(c) = guard.get_mut(inner_name) {
@@ -138,6 +151,7 @@ impl EchProvider {
                     c.refresh_at = Instant::now() + Duration::from_secs(30);
                     return Ok(EchClient {
                         client_config: self.config_for(c, alpn)?,
+                        generation: c.generation,
                     });
                 }
                 Err(e)
@@ -162,11 +176,30 @@ impl EchProvider {
         Ok(config)
     }
 
-    /// Evict the cached config for `inner_name` so the next `client()` call
-    /// re-fetches a fresh ECHConfig. Used by the ECH retry path after the server
-    /// rejects ECH (its published key rotated).
-    pub async fn invalidate(&self, inner_name: &str) {
-        self.cache.write().await.remove(inner_name);
+    /// Evict the generation rejected by the server and force its next DNS
+    /// lookup past hickory's response cache.
+    ///
+    /// Returns false when another connection has already replaced or evicted
+    /// `generation`. In that case its replacement is newer than the config the
+    /// caller used, so an old, slower handshake must not remove it again.
+    pub async fn invalidate_after_rejection(&self, inner_name: &str, generation: u64) -> bool {
+        let mut guard = self.cache.write().await;
+        let is_current = guard
+            .get(inner_name)
+            .is_some_and(|cached| cached.generation == generation);
+        if !is_current {
+            return false;
+        }
+
+        if matches!(
+            self.settings.mode,
+            SourceMode::Doh | SourceMode::DohWithFallback
+        ) {
+            self.resolver
+                .clear_lookup_cache(&self.lookup_name(inner_name), RecordType::HTTPS);
+        }
+        guard.remove(inner_name);
+        true
     }
 
     async fn build(&self, inner_name: &str) -> Result<Cached, EchError> {
@@ -193,6 +226,7 @@ impl EchProvider {
             ech_mode: mode,
             configs: HashMap::new(),
             refresh_at: Instant::now() + refresh,
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -482,4 +516,253 @@ fn extract_ech_from_lookup(lookup: &hickory_resolver::lookup::Lookup) -> Option<
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AddressFamily;
+    use crate::dns::ResolverSpec;
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::thread;
+
+    struct MockHttpsDns {
+        port: u16,
+        queries: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockHttpsDns {
+        fn start() -> Self {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+
+            let queries = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_queries = queries.clone();
+            let thread_stop = stop.clone();
+            let thread = thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let (len, peer) = match socket.recv_from(&mut buf) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    let Some(reply) = https_reply(&buf[..len]) else {
+                        continue;
+                    };
+                    thread_queries.fetch_add(1, Ordering::Relaxed);
+                    let _ = socket.send_to(&reply, peer);
+                }
+            });
+            Self {
+                port,
+                queries,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn query_count(&self) -> usize {
+            self.queries.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for MockHttpsDns {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let wake = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let _ = wake.send_to(&[0; 12], ("127.0.0.1", self.port));
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    /// Build a minimal successful DNS response containing one HTTPS RR. Its
+    /// service binding has priority 1, target ".", no parameters, and a long
+    /// enough TTL for a second lookup to prove that hickory used its cache.
+    fn https_reply(query: &[u8]) -> Option<Vec<u8>> {
+        if query.len() < 17 {
+            return None;
+        }
+        let mut end = 12usize;
+        loop {
+            let label = *query.get(end)? as usize;
+            end += 1;
+            if label == 0 {
+                break;
+            }
+            if label & 0xc0 != 0 || end.checked_add(label)? > query.len() {
+                return None;
+            }
+            end += label;
+        }
+        end = end.checked_add(4)?;
+        if end > query.len() || query.get(end - 4..end - 2)? != [0, 65] {
+            return None;
+        }
+
+        let mut reply = Vec::with_capacity(end + 15);
+        reply.extend_from_slice(&query[..2]); // transaction ID
+        reply.extend_from_slice(&[0x81, 0x80]); // response, recursion available, no error
+        reply.extend_from_slice(&[0, 1]); // one question
+        reply.extend_from_slice(&[0, 1]); // one answer
+        reply.extend_from_slice(&[0, 0, 0, 0]); // no authority/additional records
+        reply.extend_from_slice(&query[12..end]);
+        reply.extend_from_slice(&[0xc0, 0x0c]); // answer name points to the question
+        reply.extend_from_slice(&[0, 65, 0, 1]); // HTTPS, IN
+        reply.extend_from_slice(&60u32.to_be_bytes());
+        reply.extend_from_slice(&[0, 3, 0, 1, 0]); // priority 1, target root, no params
+        Some(reply)
+    }
+
+    fn resolver(spec: &str) -> Arc<DnsResolver> {
+        let resolver = ResolverSpec::parse(spec)
+            .unwrap()
+            .build(AddressFamily::Dual)
+            .unwrap();
+        DnsResolver::new("test".to_string(), resolver, None, None)
+    }
+
+    fn test_provider() -> EchProvider {
+        EchProvider::new(
+            EffectiveEch {
+                mode: SourceMode::Static,
+                config: Some(String::new()),
+                ech_domain: None,
+                max_retries: 1,
+            },
+            443,
+            true,
+            true,
+            resolver("udp://127.0.0.1:9"),
+            Arc::new(webpki_root_store()),
+            Duration::from_secs(60),
+        )
+    }
+
+    fn cached(generation: u64) -> Cached {
+        Cached {
+            ech_mode: grease_mode().unwrap(),
+            configs: HashMap::new(),
+            refresh_at: Instant::now() + Duration::from_secs(60),
+            generation,
+        }
+    }
+
+    /// A handshake that started on generation 1 may finish after another task
+    /// has installed generation 2. Its late rejection must preserve generation
+    /// 2 instead of causing another refresh storm.
+    #[tokio::test]
+    async fn a_stale_rejection_cannot_evict_a_newer_generation() {
+        let provider = test_provider();
+        provider
+            .cache
+            .write()
+            .await
+            .insert("inner.test".to_string(), cached(2));
+
+        assert!(!provider.invalidate_after_rejection("inner.test", 1).await);
+        assert_eq!(
+            provider
+                .cache
+                .read()
+                .await
+                .get("inner.test")
+                .unwrap()
+                .generation,
+            2
+        );
+
+        assert!(provider.invalidate_after_rejection("inner.test", 2).await);
+        assert!(!provider.cache.read().await.contains_key("inner.test"));
+    }
+
+    /// All probes for one pool normally share a generation and can be rejected
+    /// together. Exactly one of them may evict it; the others observe that a
+    /// refresh is already in progress instead of starting a refresh storm.
+    #[tokio::test]
+    async fn concurrent_rejections_grant_one_refresh_for_a_generation() {
+        const TASKS: usize = 16;
+
+        let provider = Arc::new(test_provider());
+        provider
+            .cache
+            .write()
+            .await
+            .insert("inner.test".to_string(), cached(7));
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS + 1));
+        let mut tasks = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let provider = provider.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                provider.invalidate_after_rejection("inner.test", 7).await
+            }));
+        }
+        barrier.wait().await;
+
+        let mut granted = 0usize;
+        for task in tasks {
+            granted += usize::from(task.await.unwrap());
+        }
+        assert_eq!(granted, 1);
+    }
+
+    /// The provider cache and hickory's DNS response cache are two separate
+    /// layers. An ECH rejection must evict both or the rebuild simply receives
+    /// the same stale HTTPS RR without touching the upstream resolver.
+    #[tokio::test]
+    async fn a_rejection_bypasses_the_cached_https_record() {
+        let dns = MockHttpsDns::start();
+        let resolver = resolver(&format!("udp://127.0.0.1:{}", dns.port));
+        let provider = EchProvider::new(
+            EffectiveEch {
+                mode: SourceMode::Doh,
+                config: None,
+                ech_domain: None,
+                max_retries: 1,
+            },
+            443,
+            true,
+            true,
+            resolver.clone(),
+            Arc::new(webpki_root_store()),
+            Duration::from_secs(60),
+        );
+
+        resolver
+            .lookup("inner.test", RecordType::HTTPS)
+            .await
+            .unwrap();
+        resolver
+            .lookup("inner.test", RecordType::HTTPS)
+            .await
+            .unwrap();
+        assert_eq!(dns.query_count(), 1, "the second lookup should be cached");
+
+        provider
+            .cache
+            .write()
+            .await
+            .insert("inner.test".to_string(), cached(9));
+        assert!(provider.invalidate_after_rejection("inner.test", 9).await);
+
+        resolver
+            .lookup("inner.test", RecordType::HTTPS)
+            .await
+            .unwrap();
+        assert_eq!(
+            dns.query_count(),
+            2,
+            "the post-rejection lookup must reach DNS again"
+        );
+    }
 }
