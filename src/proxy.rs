@@ -714,6 +714,7 @@ async fn dial_ech(
             .client(inner, alpn)
             .await
             .context("assembling ECH client config")?;
+        let generation = client.generation;
         let connector = TlsConnector::from(client.client_config.clone());
         let (_, tcp) = upstream.connect(rt.connect_timeout, &rt.name).await?;
 
@@ -740,7 +741,7 @@ async fn dial_ech(
                 warn!(%peer, route = %rt.name, attempt, "ECH rejected; refreshing config and retrying");
                 // Force a fresh ECHConfig fetch (server rotated keys; DNS/source
                 // now carries the new one) before the next attempt.
-                ech.invalidate(inner).await;
+                ech.invalidate_after_rejection(inner, generation).await;
                 continue;
             }
             Ok(Err(e)) => return Err(e).context("upstream ECH handshake"),
