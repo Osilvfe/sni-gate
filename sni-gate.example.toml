@@ -9,7 +9,8 @@
 # below its explicit values:
 #   route → route's template → listener → listener's template → global
 # The whole [ech] block inherits field-by-field along the same ladder, so shared
-# ECH settings live once in [global.ech] / [listener.ech] / a template.
+# ECH settings live once in [global.ech] / [listener.ech] / a template. So does
+# [verify], which states what an upstream certificate must prove.
 
 # ---------------------------------------------------------------------------
 # Global defaults (outermost fallback scope)
@@ -57,6 +58,27 @@ enabled = false
 #   "require"  fail startup
 probe = "warn"
 # probe_timeout = "3s"
+
+# Shared [verify] defaults: what an upstream's certificate must prove before
+# this gateway will talk to it. Inherited field-by-field like [ech], and also
+# read by [resolvers.<name>.verify] and [pools.<name>.probe.verify].
+#
+# The default — nothing written anywhere — is the strongest setting there is:
+# chain to the web-PKI roots AND be valid for the name the route asked for. You
+# only need this block when that is not satisfiable, which happens when the name
+# transmitted is not the name the upstream's certificate is for (see the "no-sni"
+# route below). Weakening it here applies to EVERY TLS upstream in this file,
+# including a DoH resolver's own handshake, so prefer a per-route block.
+#
+# [global.verify]
+# mode = "full"                 # full (default) | chain (no name check) | none
+# pins = []                     # sha256/<base64> SPKI pins; an ADDITIONAL
+#                               # requirement in every mode, and the only
+#                               # assurance left under mode = "none"
+# ca_file = "corp-root.pem"     # extra trust anchors (a private CA)
+# trust_webpki = true           # false narrows trust to ca_file alone
+# `verify.name` is route-scope only — it describes one upstream's certificate —
+# so it is written on a route or the template that route uses, never here.
 
 # Shared [ech] defaults, inherited field-by-field by every ECH route that does
 # not override them. A route may then omit [ech] entirely or set just one field.
@@ -207,6 +229,50 @@ connect_timeout = "5s"
   upstream = "127.0.0.1:8867"
   override_sni = ""
 
+  # The same shape, but pointed at a real virtual host: with no SNI to select a
+  # certificate, the upstream answers with its DEFAULT one — issued for whatever
+  # name its operator chose, not for the name the client asked for. Verification
+  # then fails, correctly:
+  #
+  #   upstream TLS handshake: invalid peer certificate: certificate not valid for
+  #   name "fra-storage.example.com"; certificate is only valid for
+  #   DnsName("*.example.net")
+  #
+  # [verify] states the proposition this deployment can actually prove. `name`
+  # is the field to reach for first: chain, expiry and name are ALL still
+  # enforced — only the subject of the claim moves.
+  [[listener.route]]
+  name = "default-cert"
+  type = "tls"
+  match_sni = [".example.com"]
+  override_sni = ""
+
+    [listener.route.verify]
+    name = "default.example.net"     # verify against what the upstream serves
+    # mode = "chain"                 # or: keep the chain check, drop the name
+    #                                # check entirely (more durable if the
+    #                                # upstream's default cert changes names,
+    #                                # but it then accepts ANY publicly-trusted
+    #                                # certificate — prefer `name` or `pins`)
+    # pins = ["sha256/YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2Fuihg="]
+    #                                # bind the upstream to one public key:
+    #                                # openssl s_client -connect host:443 \
+    #                                #   -servername host </dev/null \
+    #                                # | openssl x509 -pubkey -noout \
+    #                                # | openssl pkey -pubin -outform der \
+    #                                # | openssl dgst -sha256 -binary | base64
+
+  # A private CA: the upstream's chain is verified, just not against the public
+  # roots. `trust_webpki = false` requires a ca_file, since it would otherwise
+  # leave no trust anchors at all (a load-time error).
+  # [[listener.route]]
+  # name = "internal"
+  # type = "tls"
+  # match_sni = [".internal.example"]
+  #   [listener.route.verify]
+  #   ca_file = "corp-root.pem"
+  #   trust_webpki = false
+
   # Cleartext HTTP upstream.
   [[listener.route]]
   name = "plain"
@@ -284,6 +350,22 @@ connect_timeout = "5s"
 #   mode = "doh"
 #   require_ech = true
 #   ech_resolver = "@cloudflare"     # Cloudflare fetches secure's ECH config
+#
+# A resolver's own handshake is verified like any other upstream, and [verify]
+# applies to it the same way — fields inherit from [global.verify] only, since a
+# resolver has no listener or route above it. `upstream` (CDN fronting) is the
+# usual reason to need it: the edge you dial may answer with its own
+# certificate rather than the endpoint's.
+#
+# [resolvers.fronted]
+# endpoint = "https://doh.example/dns-query"
+# upstream = "edge.cdn.example"
+# bootstrap = "@cloudflare"
+#   [resolvers.fronted.verify]
+#   name = "edge.cdn.example"        # verify what the edge really serves
+#
+# Only a DoH/DoT endpoint performs a handshake, so writing [verify] on a plain
+# or `system` resolver is a load-time error rather than a silent no-op.
 
 # ---------------------------------------------------------------------------
 # Upstream pools (adaptive endpoint selection)
@@ -368,6 +450,22 @@ connect_timeout = "5s"
 # TTL, never per probe. `require_ech = false` falls back to GREASE when nothing
 # is published, which sends the SNI in the clear — leave it on unless you mean
 # exactly that.
+#
+# A `tls` or `https://` probe verifies the certificate it is presented, and says
+# what it requires the same way a route does. This is its OWN connection: a
+# route that relaxes verification does not relax its pool's probing, and a pool
+# whose edge nodes answer an unmatched name needs this block or every candidate
+# will be marked degraded. Fields inherit from [global.verify] only.
+#
+#     [pools.cf.probe.verify]
+#     mode = "chain"                 # full (default) | chain | none
+#     name = "edge.cdn.example"      # or: verify what the edges really serve
+#     pins = []                      # SPKI pins, checked in every mode
+#
+# A probe that accepts any certificate is still a useful reachability and RTT
+# measurement; it simply stops attesting to the identity of what answered. A
+# `tcp` or cleartext-`http` probe sees no certificate at all, so writing
+# [verify] there is a load-time error.
 #
 #   [pools.cf.nat64]                 # address-family projection, not a new pool
 #   prefixes = ["64:ff9b::"]         # each IPv4 candidate x each prefix

@@ -357,9 +357,9 @@ mod tests {
     #[test]
     fn observed_sidecar_round_trips() {
         let sans = vec![
-            "qy0.ru".to_string(),
-            "*.qy0.ru".to_string(),
-            "mzz.qy0.ru".to_string(),
+            "origin.example".to_string(),
+            "*.origin.example".to_string(),
+            "mzz.origin.example".to_string(),
         ];
         assert_eq!(decode_observed(&encode_observed(&sans)), sans);
     }
@@ -386,8 +386,8 @@ mod tests {
     fn observed_sidecar_tolerates_crlf_and_blank_lines() {
         // A file that has been through a Windows editor must still parse.
         assert_eq!(
-            decode_observed("qy0.ru\r\n\r\n*.qy0.ru\r\n"),
-            vec!["qy0.ru".to_string(), "*.qy0.ru".to_string()]
+            decode_observed("origin.example\r\n\r\n*.origin.example\r\n"),
+            vec!["origin.example".to_string(), "*.origin.example".to_string()]
         );
     }
 }

@@ -51,6 +51,7 @@ use crate::peek::{classify, Inbound};
 use crate::pool::PoolHandle;
 use crate::resolver::{observed_dns_sans, DynamicResolver};
 use crate::router::Router;
+use crate::verify::UpstreamVerify;
 
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
@@ -140,8 +141,75 @@ pub struct RouteRuntime {
     pub fail: FailPolicy,
     /// ECH provider (only for `ech` routes).
     pub ech: Option<EchProvider>,
-    /// Verified web-PKI roots for upstream TLS (`ech`/`tls`).
-    pub root_store: Arc<rustls::RootCertStore>,
+    /// How this route verifies the upstream certificate. `None` for `http` and
+    /// `raw`, which originate no TLS and so have nothing to verify.
+    ///
+    /// Installed in the prebuilt configs below, and in [`EchProvider`]'s own for
+    /// an `ech` route, so the handshake needs nothing from here. The handle is
+    /// kept for the one decision outside the handshake: what name to open a
+    /// connection with when the route transmits none and the connection supplied
+    /// none ([`silent_name_override`]).
+    pub verify: Option<Arc<UpstreamVerify>>,
+    /// Prebuilt upstream client configs, one per ALPN offer (`tls` routes only).
+    pub tls: Option<ClientConfigs>,
+}
+
+/// The upstream `ClientConfig`s for a `tls` route, one per ALPN offer the data
+/// path can produce.
+///
+/// [`negotiable_alpn`] narrows every client offer to a subsequence of
+/// [`SUPPORTED_ALPN`], so exactly four offers exist. Building them once at
+/// startup keeps the per-connection cost to an `Arc` clone, and — unlike a
+/// config built per connection — lets rustls's client session store actually
+/// resume upstream sessions, since that store lives in the config.
+pub struct ClientConfigs {
+    /// No ALPN extension at all — the client offered none we can carry.
+    none: Arc<ClientConfig>,
+    /// `["http/1.1"]`.
+    h1: Arc<ClientConfig>,
+    /// `["h2"]`.
+    h2: Arc<ClientConfig>,
+    /// `["h2", "http/1.1"]`, h2 preferred.
+    h2h1: Arc<ClientConfig>,
+}
+
+impl ClientConfigs {
+    /// Build the four variants under one verification policy.
+    ///
+    /// `enable_sni` is false for a route with `override_sni = ""`: the
+    /// certificate is still verified, only the extension is withheld.
+    pub fn new(verify: &UpstreamVerify, enable_sni: bool) -> Self {
+        let build = |alpn: &[&[u8]]| {
+            let mut cfg = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verify.verifier())
+                .with_no_client_auth();
+            cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+            cfg.enable_sni = enable_sni;
+            Arc::new(cfg)
+        };
+        Self {
+            none: build(&[]),
+            h1: build(&[b"http/1.1"]),
+            h2: build(&[b"h2"]),
+            h2h1: build(&[b"h2", b"http/1.1"]),
+        }
+    }
+
+    /// The config advertising exactly `offer`.
+    ///
+    /// Total by construction: `offer` only ever holds protocols from
+    /// [`SUPPORTED_ALPN`]. An offer naming neither means "no extension", which
+    /// is also what an empty offer means.
+    fn select(&self, offer: &[Vec<u8>]) -> &Arc<ClientConfig> {
+        let offered = |p: &[u8]| offer.iter().any(|o| o.as_slice() == p);
+        match (offered(b"h2"), offered(b"http/1.1")) {
+            (true, true) => &self.h2h1,
+            (true, false) => &self.h2,
+            (false, true) => &self.h1,
+            (false, false) => &self.none,
+        }
+    }
 }
 
 /// The inbound `ServerConfig`s, which differ *only* in the ALPN protocols they
@@ -345,10 +413,17 @@ fn record_upstream_coverage(
     sni: Option<&String>,
     session: &rustls::ClientConnection,
 ) {
-    // A route with a fixed `override_sni` asks every upstream for the same name,
-    // so the certificate it returns says nothing about the *inbound* name this
-    // certificate is for. Mirroring it would attach one upstream's coverage to
-    // every name routed here.
+    // Only a reflecting route asks the upstream about the very name this
+    // certificate is for. A fixed `override_sni` asks every upstream for the
+    // same name, and `override_sni = ""` asks for none at all and is answered
+    // with the upstream's *default* certificate — in both cases the reply says
+    // nothing about the inbound name, so mirroring it would attach one
+    // upstream's coverage to every name routed here.
+    //
+    // What the reply had to *prove* is the route's `[verify]` policy, and that
+    // is not consulted here: the policy is part of the certificate scope
+    // ([`crate::certscope`]), so coverage learned under a weakened one is
+    // already confined to names held to the same policy.
     if rt.sni_policy != SniPolicy::Reflect {
         return;
     }
@@ -452,15 +527,7 @@ async fn serve_mirrored(
             dial_tls(upstream_addr, &name, rt, &client_offer).await?
         }
         RouteType::Ech => {
-            // An inner name is required even when it will not be *sent*: it is
-            // what the upstream certificate is verified against.
-            let inner = sni.clone().ok_or_else(|| {
-                anyhow!(
-                    "ech route {}: the connection carried no SNI/Host to use as \
-                     the inner name, and no override_sni supplies one",
-                    rt.name
-                )
-            })?;
+            let inner = ech_inner_name(rt, &sni)?;
             dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
         }
         RouteType::Http | RouteType::Raw => {
@@ -539,15 +606,7 @@ where
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Ech => {
-            // An inner name is required even when it will not be *sent*: it is
-            // what the upstream certificate is verified against.
-            let inner = sni.clone().ok_or_else(|| {
-                anyhow!(
-                    "ech route {}: the connection carried no SNI/Host to use as \
-                     the inner name, and no override_sni supplies one",
-                    rt.name
-                )
-            })?;
+            let inner = ech_inner_name(rt, &sni)?;
             let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
             splice(inbound, up, rt.idle_timeout).await
@@ -568,8 +627,10 @@ where
 /// certificate an IP-named verification could accept is one with an IP SAN, which
 /// no CDN edge serves. Reporting it names the fix (`override_sni`) instead of
 /// failing later inside the handshake with a name-mismatch nobody can act on.
-/// Verification is never skipped: suppressing SNI changes what is *transmitted*,
-/// not what is *trusted*.
+///
+/// Suppressing SNI changes what is *transmitted*, not what is *trusted*: the
+/// name returned here is still handed to the handshake. What the upstream
+/// certificate must prove about it is the route's `[verify]` policy.
 fn tls_verification_name(
     rt: &RouteRuntime,
     sni: &Option<String>,
@@ -581,12 +642,54 @@ fn tls_verification_name(
     if let Some(host) = dial_host {
         return Ok(host.to_string());
     }
+    if let Some(fixed) = silent_name_override(rt) {
+        return Ok(fixed.to_string());
+    }
     Err(anyhow!(
         "tls route {}: no name to verify the upstream certificate against — the \
          connection carried no SNI/Host, and an upstream pool selects an address \
          rather than a name. Set `override_sni` on this route",
         rt.name
     ))
+}
+
+/// The inner name an `ech` route puts in the encrypted ClientHello.
+///
+/// Required even when it will not be *sent* in the clear: it is the name the
+/// handshake requests of the upstream, and by default the name its certificate
+/// must be valid for.
+fn ech_inner_name(rt: &RouteRuntime, sni: &Option<String>) -> Result<String> {
+    if let Some(name) = sni {
+        return Ok(name.clone());
+    }
+    if let Some(fixed) = silent_name_override(rt) {
+        return Ok(fixed.to_string());
+    }
+    Err(anyhow!(
+        "ech route {}: the connection carried no SNI/Host to use as the inner \
+         name, and no override_sni supplies one",
+        rt.name
+    ))
+}
+
+/// `verify.name` as a *last* source for the name to open a connection with, but
+/// only on a route that transmits no name at all.
+///
+/// rustls needs some `ServerName` to dial with, and under a `name` override that
+/// value decides nothing that is checked — so on an `override_sni = ""` route,
+/// where it is never put on the wire, reusing it is free and saves an otherwise
+/// unserviceable connection.
+///
+/// Deliberately not offered to the other SNI policies. This gateway keeps three
+/// things apart — who we dial, what name we transmit, and what name we trust
+/// (see [`crate::verify`]) — and a route that *does* transmit its name would be
+/// having the third silently decide the second. `override_sni` is the field that
+/// owns what goes on the wire, and the error above says so.
+fn silent_name_override(rt: &RouteRuntime) -> Option<&str> {
+    if rt.sni_policy != SniPolicy::Omit {
+        return None;
+    }
+    rt.verify.as_ref()?.name_override()
 }
 
 /// Plain TCP dial with a timeout.
@@ -602,22 +705,22 @@ async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> 
 /// Dial a plain-TLS upstream, verifying the presented `server_name` and offering
 /// `alpn` (empty = no ALPN extension).
 ///
-/// `server_name` is always used to **verify** the upstream certificate. Whether
-/// it is also **sent** as an SNI extension depends on the route's
-/// [`SniPolicy`]: `Omit` clears `enable_sni`, so the handshake carries no
-/// `server_name` while the certificate is still checked against that name.
+/// `server_name` is the name the handshake requests. Whether it is **sent** as
+/// an SNI extension depends on the route's [`SniPolicy`] (`Omit` clears
+/// `enable_sni` on every prebuilt config), and what the certificate must prove
+/// about it depends on the route's `[verify]` policy — by default that it is
+/// valid for exactly this name under the web PKI.
 async fn dial_tls(
     addr: SocketAddr,
     server_name: &str,
     rt: &RouteRuntime,
     alpn: &[Vec<u8>],
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let mut config = plain_tls_config(rt.root_store.clone());
-    config.alpn_protocols = alpn.to_vec();
-    if rt.sni_policy == SniPolicy::Omit {
-        config.enable_sni = false;
-    }
-    let connector = TlsConnector::from(Arc::new(config));
+    let configs = rt
+        .tls
+        .as_ref()
+        .ok_or_else(|| anyhow!("tls route {} missing its upstream TLS configs", rt.name))?;
+    let connector = TlsConnector::from(configs.select(alpn).clone());
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid upstream SNI {server_name:?}"))?;
     let tcp = dial(addr, rt.connect_timeout).await?;
@@ -832,13 +935,6 @@ async fn apply_fail(
             splice_tcp(client, up, Duration::from_secs(120)).await
         }
     }
-}
-
-/// Build a plain-TLS client config (TLS 1.2/1.3) trusting `roots`.
-fn plain_tls_config(roots: Arc<rustls::RootCertStore>) -> ClientConfig {
-    ClientConfig::builder()
-        .with_root_certificates(roots.as_ref().clone())
-        .with_no_client_auth()
 }
 
 /// Strip a trailing `:port` from a routing key, returning the bare host.

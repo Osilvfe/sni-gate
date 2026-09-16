@@ -47,7 +47,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ipnet::IpNet;
 use rustls::client::EchStatus;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Instant};
@@ -59,6 +59,7 @@ use crate::config::{AddressFamily, EffectiveProbeEch, PoolDef, ProbeSpec, Select
 use crate::dns_resolvers::DnsResolver;
 use crate::ech::{is_ech_reject_io, EchProvider};
 use crate::nat64::Nat64Prefix;
+use crate::verify::UpstreamVerify;
 
 /// The tag vocabulary. These three strings are the *only* automatic tags, and
 /// they are also what `address_family` uses, so an operator learns one set of
@@ -184,9 +185,9 @@ struct TlsProbe {
 
 /// Where a probe's `ClientConfig` comes from.
 ///
-/// Either way it is built once and reused. A `ClientConfig` owns the root store,
-/// so rebuilding one per probe would clone every webpki trust anchor on every
-/// cycle of every candidate.
+/// Either way it is built once and reused: a config carries the whole handshake
+/// policy, so rebuilding one per probe would redo that work on every cycle of
+/// every candidate.
 enum TlsSource {
     /// No ECH: one config, with the probe's ALPN offer already baked in.
     Plain(Arc<ClientConfig>),
@@ -601,7 +602,7 @@ impl PoolBuilder {
         spec: ProbeSpec,
         resolver: Arc<DnsResolver>,
         probe_ech: Option<ProbeEchSetup>,
-        root_store: &Arc<RootCertStore>,
+        verify: Arc<UpstreamVerify>,
     ) -> Result<Self> {
         let mut targets = Vec::with_capacity(def.targets.len());
         for (index, t) in def.targets.iter().enumerate() {
@@ -623,7 +624,7 @@ impl PoolBuilder {
             name: name.to_string(),
             def: def.clone(),
             targets,
-            probe: build_probe_plan(spec, probe_ech, root_store),
+            probe: build_probe_plan(spec, probe_ech, verify),
             timing: ProbeTiming {
                 interval: def.probe.interval.unwrap_or(DEFAULT_INTERVAL),
                 degraded_interval: def
@@ -709,7 +710,7 @@ impl PoolBuilder {
 fn build_probe_plan(
     spec: ProbeSpec,
     ech: Option<ProbeEchSetup>,
-    root_store: &Arc<RootCertStore>,
+    verify: Arc<UpstreamVerify>,
 ) -> ProbePlan {
     match spec {
         ProbeSpec::Tcp { port, timeout } => ProbePlan {
@@ -727,7 +728,7 @@ fn build_probe_plan(
                 timeout: timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT),
                 // No ALPN: a `tls` probe stops at the handshake, so it has no
                 // protocol to negotiate.
-                kind: ProbeKind::Tls(build_tls_probe(sni, &[], port, ech, root_store)),
+                kind: ProbeKind::Tls(build_tls_probe(sni, &[], port, ech, verify)),
             }
         }
 
@@ -746,13 +747,7 @@ fn build_probe_plan(
                 .port_or_known_default()
                 .expect("http and https have known default ports");
             let tls = (url.scheme() == "https").then(|| {
-                build_tls_probe(
-                    tls_name_from_url(&url),
-                    HTTP_PROBE_ALPN,
-                    port,
-                    ech,
-                    root_store,
-                )
+                build_tls_probe(tls_name_from_url(&url), HTTP_PROBE_ALPN, port, ech, verify)
             });
             ProbePlan {
                 port,
@@ -788,7 +783,7 @@ fn build_tls_probe(
     alpn: &[&[u8]],
     port: u16,
     ech: Option<ProbeEchSetup>,
-    root_store: &Arc<RootCertStore>,
+    verify: Arc<UpstreamVerify>,
 ) -> TlsProbe {
     let alpn: Vec<Vec<u8>> = alpn.iter().map(|p| p.to_vec()).collect();
     let config = match ech {
@@ -809,7 +804,7 @@ fn build_tls_probe(
                     // carries the very name whose reachability is measured.
                     true,
                     resolver,
-                    root_store.clone(),
+                    verify,
                     ech_refresh,
                 )),
                 alpn,
@@ -819,7 +814,8 @@ fn build_tls_probe(
         }
         None => {
             let mut cfg = ClientConfig::builder()
-                .with_root_certificates(root_store.as_ref().clone())
+                .dangerous()
+                .with_custom_certificate_verifier(verify.verifier())
                 .with_no_client_auth();
             cfg.alpn_protocols = alpn;
             TlsSource::Plain(Arc::new(cfg))

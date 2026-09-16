@@ -18,7 +18,7 @@ use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
 use rustls::crypto::aws_lc_rs::hpke::{ALL_SUPPORTED_SUITES, DH_KEM_X25519_HKDF_SHA256_AES_128};
 use rustls::crypto::hpke::Hpke as _;
 use rustls::pki_types::EchConfigListBytes;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::ClientConfig;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -26,6 +26,7 @@ use tracing::{debug, warn};
 use crate::config::{EchMode as SourceMode, EffectiveEch};
 use crate::dns_resolvers::DnsResolver;
 use crate::error::EchError;
+use crate::verify::UpstreamVerify;
 
 /// A resolved ECH mode plus its refresh deadline, and the `ClientConfig`s
 /// assembled from it so far.
@@ -61,7 +62,9 @@ pub struct EchProvider {
     /// and the upstream certificate is still verified against the inner name.
     enable_sni: bool,
     resolver: Arc<DnsResolver>,
-    root_store: Arc<RootCertStore>,
+    /// What the upstream certificate must prove, applied to the *inner*
+    /// handshake — the one that carries the real identity.
+    verify: Arc<UpstreamVerify>,
     refresh_bound: Duration,
     cache: RwLock<HashMap<String, Cached>>,
     next_generation: AtomicU64,
@@ -82,7 +85,7 @@ impl EchProvider {
         require_ech: bool,
         enable_sni: bool,
         resolver: Arc<DnsResolver>,
-        root_store: Arc<RootCertStore>,
+        verify: Arc<UpstreamVerify>,
         refresh_bound: Duration,
     ) -> Self {
         Self {
@@ -91,7 +94,7 @@ impl EchProvider {
             require_ech,
             enable_sni,
             resolver,
-            root_store,
+            verify,
             refresh_bound,
             cache: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
@@ -303,7 +306,10 @@ impl EchProvider {
         let mut config = ClientConfig::builder_with_provider(provider.into())
             .with_ech(ech_mode)
             .map_err(EchError::Rustls)?
-            .with_root_certificates(self.root_store.as_ref().clone())
+            // Every upstream config in the program installs its verification
+            // policy this way, the default one included; see [`crate::verify`].
+            .dangerous()
+            .with_custom_certificate_verifier(self.verify.verifier())
             .with_no_client_auth();
         config.enable_sni = self.enable_sni;
         Ok(config)
@@ -319,13 +325,6 @@ pub fn https_lookup_name(base: &str, port: u16) -> String {
     match port {
         443 => base.to_string(),
         p => format!("_{p}._https.{base}"),
-    }
-}
-
-/// Web-PKI root store from webpki-roots.
-pub fn webpki_root_store() -> RootCertStore {
-    RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     }
 }
 
@@ -419,40 +418,31 @@ pub enum ResolverEch<'a> {
 
 /// Build a `ClientConfig` for a resolver, with ECH when configured.
 ///
-/// This is the resolver analogue of `EchProvider::assemble_client_config`.
+/// This is the resolver analogue of `EchProvider::assemble_client_config`. The
+/// three ECH cases differ only in how the protocol versions are settled; the
+/// verifier and the client-auth choice are shared, so they are applied once.
 pub fn resolver_client_config(
     mode: ResolverEch<'_>,
     enable_sni: bool,
-    root_store: &RootCertStore,
+    verify: &UpstreamVerify,
 ) -> Result<ClientConfig, EchError> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
-    let mut config = match mode {
+    let builder = ClientConfig::builder_with_provider(provider.into());
+    let versions = match mode {
         ResolverEch::Config(bytes) => {
             let list = EchConfigListBytes::from(bytes.to_vec());
-            let ech_mode = build_real_ech_mode(list)?;
-            ClientConfig::builder_with_provider(provider.into())
-                .with_ech(ech_mode)
-                .map_err(EchError::Rustls)?
-                .with_root_certificates(root_store.clone())
-                .with_no_client_auth()
+            builder.with_ech(build_real_ech_mode(list)?)
         }
-        ResolverEch::Grease => {
-            let ech_mode = grease_mode()?;
-            ClientConfig::builder_with_provider(provider.into())
-                .with_ech(ech_mode)
-                .map_err(EchError::Rustls)?
-                .with_root_certificates(root_store.clone())
-                .with_no_client_auth()
-        }
-        ResolverEch::Disabled => {
-            // Plain TLS without ECH.
-            ClientConfig::builder_with_provider(provider.into())
-                .with_safe_default_protocol_versions()
-                .map_err(EchError::Rustls)?
-                .with_root_certificates(root_store.clone())
-                .with_no_client_auth()
-        }
-    };
+        ResolverEch::Grease => builder.with_ech(grease_mode()?),
+        // Plain TLS without ECH.
+        ResolverEch::Disabled => builder.with_safe_default_protocol_versions(),
+    }
+    .map_err(EchError::Rustls)?;
+
+    let mut config = versions
+        .dangerous()
+        .with_custom_certificate_verifier(verify.verifier())
+        .with_no_client_auth();
     config.enable_sni = enable_sni;
     // ALPN deliberately left empty: hickory sets h2 for DoH when unset.
     Ok(config)
@@ -630,6 +620,16 @@ mod tests {
         DnsResolver::new("test".to_string(), resolver, None, None)
     }
 
+    /// The default verification policy — full web-PKI verification — built
+    /// through the same factory production uses, so a test can never hold a
+    /// policy production could not produce.
+    fn default_verify() -> Arc<UpstreamVerify> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        crate::verify::VerifierFactory::new()
+            .get(&crate::config::EffectiveVerify::default(), "ech tests")
+            .expect("the default policy always builds")
+    }
+
     fn test_provider() -> EchProvider {
         EchProvider::new(
             EffectiveEch {
@@ -642,7 +642,7 @@ mod tests {
             true,
             true,
             resolver("udp://127.0.0.1:9"),
-            Arc::new(webpki_root_store()),
+            default_verify(),
             Duration::from_secs(60),
         )
     }
@@ -734,7 +734,7 @@ mod tests {
             true,
             true,
             resolver.clone(),
-            Arc::new(webpki_root_store()),
+            default_verify(),
             Duration::from_secs(60),
         );
 

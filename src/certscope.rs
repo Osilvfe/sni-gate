@@ -39,8 +39,9 @@
 //!
 //! * **Forwarding target** ([`Forwarding`]) — the protocol, dial host (or the
 //!   marker for reflecting routes), port, upstream SNI policy, address family,
-//!   NAT64 prefix, resolver, and ECH source. Everything that decides where a
-//!   connection for a given name goes and under what name it is presented.
+//!   NAT64 prefix, resolver, ECH source, and the upstream verification policy.
+//!   Everything that decides where a connection for a given name goes, under
+//!   what name it is presented, and what the far end had to prove.
 //! * **Routing table** — the router's own fingerprint. A scope's safety is
 //!   established *against a specific routing table*: a wildcard proven confined
 //!   under listener A's routes may not be confined under listener B's. Folding
@@ -59,14 +60,35 @@
 //! name — again precisely what coalescing against a wildcard-serving origin does
 //! without this gateway in the path.
 //!
-//! Scope confinement is therefore the second of two independent gates, not the
-//! only one: coverage must first have been mirrored from a real upstream
-//! certificate, and must then be confined to a single scope. A name that fails
-//! either test is never served.
+//! # Why the verification policy is part of the identity
+//!
+//! Mirrored coverage is evidence, and a partition is the claim that one piece of
+//! evidence may speak for every name in it. What the evidence is *worth* is
+//! decided by [`crate::verify`]: a certificate accepted under
+//! `verify.mode = "none"` was authenticated by nothing, one accepted under
+//! `"chain"` proves no name, and one accepted under a `verify.name` override
+//! speaks about a different identity than the one requested.
+//!
+//! Folding the policy in is what makes that harmless. A route may still mirror
+//! whatever its upstream presents — including under a weakened policy, which is
+//! the operator's decision to make — but the names it can share that coverage
+//! with are exactly those held to the *same* policy against the *same*
+//! destination. Coverage learned from an unauthenticated peer can therefore
+//! never end up on a certificate that a fully verified sibling route serves, and
+//! a client can never coalesce a strictly verified name onto a connection whose
+//! far end was never checked. The alternative — one partition plus a runtime
+//! rule about who may contribute to it — would have to forbid mirroring
+//! outright wherever the policy is weak, which costs every such route its
+//! coalescing while still leaving the sibling direction to argue about.
+//!
+//! It also keeps the on-disk store honest. The scope names the directory under
+//! `certs/`, so editing a `[verify]` block moves the partition: the coverage a
+//! route learned under its old policy is not re-served under the new one, and
+//! the first connection re-learns it under the policy actually in force.
 
 use std::sync::Arc;
 
-use crate::config::{AddressFamily, EchMode, RouteType, SniPolicy};
+use crate::config::{AddressFamily, EchMode, EffectiveVerify, RouteType, SniPolicy};
 
 /// Where a route sends a connection, and how that destination is determined.
 ///
@@ -106,10 +128,11 @@ pub enum UpstreamIdentity {
 /// Everything about a route that determines how a connection is forwarded.
 ///
 /// Two routes with equal `Forwarding` send a connection for a given name to the
-/// same place, presented the same way — so names matched by either may share a
-/// certificate. Fields that cannot change the destination (timeouts, the fail
-/// policy, the HTTP/2 switch, ECH refresh cadence) are deliberately absent: they
-/// would fragment scopes without buying any safety.
+/// same place, presented the same way, having demanded the same proof of it — so
+/// names matched by either may share a certificate. Fields that can change none
+/// of those three (timeouts, the fail policy, the HTTP/2 switch, ECH refresh
+/// cadence) are deliberately absent: they would fragment scopes without buying
+/// any safety.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forwarding {
     /// Upstream protocol handling.
@@ -123,6 +146,13 @@ pub struct Forwarding {
     pub sni: SniPolicy,
     /// ECH source identity; `Some` only for `ech` routes.
     pub ech: Option<EchIdentity>,
+    /// What the upstream certificate had to prove. Part of the identity because
+    /// it decides what a mirrored observation is worth — see the module docs.
+    ///
+    /// Always the default policy for `http` and `raw`, which originate no TLS:
+    /// they verify nothing, so an inherited `[global.verify]` must not split
+    /// their partitions. Only `tls` and `ech` carry a resolved policy here.
+    pub verify: EffectiveVerify,
 }
 
 /// The identity of an ECH configuration source.
@@ -152,7 +182,7 @@ impl CertScope {
     /// routing table whose fingerprint is `router_fp`.
     ///
     /// The rendered key leads with a human-readable summary so `certs/` stays
-    /// legible (`ech_cf.0sm.com_443-1f3a9c07b2d45e18`), and ends with a digest
+    /// legible (`ech_edge.example.net_443-1f3a9c07b2d45e18`), and ends with a digest
     /// over the full identity so that two scopes differing in any field —
     /// including the routing table — never collide.
     ///
@@ -250,10 +280,23 @@ pub fn router_fingerprint(
 /// The canonical, order-stable rendering of a scope's full identity. Only ever
 /// hashed, never parsed — but written to be readable in a debugger.
 fn canonical(router_fp: u64, f: &Forwarding) -> String {
-    let mut s = String::with_capacity(192);
+    // Destructured rather than read field by field, so that adding a field to
+    // `Forwarding` fails to compile here. A field the digest forgets puts two
+    // different forwarding targets in one partition — the one bug this module
+    // exists to prevent, and the one it cannot detect at runtime.
+    let Forwarding {
+        route_type,
+        upstream,
+        port,
+        sni,
+        ech,
+        verify,
+    } = f;
+
+    let mut s = String::with_capacity(256);
     s.push_str(&format!("router={router_fp:016x};"));
-    s.push_str(&format!("type={};", route_type_str(f.route_type)));
-    match &f.upstream {
+    s.push_str(&format!("type={};", route_type_str(*route_type)));
+    match upstream {
         UpstreamIdentity::Direct {
             host,
             family,
@@ -271,9 +314,9 @@ fn canonical(router_fp: u64, f: &Forwarding) -> String {
         // `x` are different destinations.
         UpstreamIdentity::Pool { name } => s.push_str(&format!("pool={name};")),
     }
-    s.push_str(&format!("port={};", f.port));
-    s.push_str(&format!("sni={};", sni_str(&f.sni)));
-    match &f.ech {
+    s.push_str(&format!("port={port};"));
+    s.push_str(&format!("sni={};", sni_str(sni)));
+    match ech {
         Some(e) => s.push_str(&format!(
             "ech=mode:{:?},domain:{},resolver:{},inline:{};",
             e.mode,
@@ -283,6 +326,9 @@ fn canonical(router_fp: u64, f: &Forwarding) -> String {
         )),
         None => s.push_str("ech=-;"),
     }
+    // Rendered by the policy itself, beside its own fields, for the same reason
+    // the rest of this function is destructured.
+    s.push_str(&format!("verify={};", verify.canonical()));
     s
 }
 
@@ -351,7 +397,7 @@ mod tests {
         Forwarding {
             route_type: RouteType::Ech,
             upstream: UpstreamIdentity::Direct {
-                host: Some("cf.0sm.com".into()),
+                host: Some("edge.example.net".into()),
                 family: AddressFamily::Ipv4,
                 nat64: None,
                 addr_resolver: "dnspod-doh".into(),
@@ -364,7 +410,13 @@ mod tests {
                 resolver: "system".into(),
                 inline_config: false,
             }),
+            verify: EffectiveVerify::default(),
         }
+    }
+
+    /// [`fwd`] with its verification policy replaced.
+    fn fwd_verified(verify: EffectiveVerify) -> Forwarding {
+        Forwarding { verify, ..fwd() }
     }
 
     /// A `Direct` upstream, spelled out field by field so a test can vary exactly
@@ -394,7 +446,7 @@ mod tests {
         let b = CertScope::new(7, &fwd());
         assert_eq!(a, b, "same identity must yield the same scope");
         assert!(
-            a.key().starts_with("ech_cf.0sm.com_443-"),
+            a.key().starts_with("ech_edge.example.net_443-"),
             "unexpected key {}",
             a.key()
         );
@@ -411,7 +463,7 @@ mod tests {
         f.route_type = RouteType::Tls;
         cases.push(("route_type", f));
         // Each case varies exactly one field of the baseline `Direct` upstream
-        // (host `cf.0sm.com`, family ipv4, no nat64, resolver `dnspod-doh`).
+        // (host `edge.example.net`, family ipv4, no nat64, resolver `dnspod-doh`).
         let v4 = AddressFamily::Ipv4;
         cases.push((
             "host->reflect",
@@ -433,7 +485,7 @@ mod tests {
         cases.push((
             "family",
             fwd_with(direct_of(
-                Some("cf.0sm.com"),
+                Some("edge.example.net"),
                 AddressFamily::Dual,
                 None,
                 "dnspod-doh",
@@ -442,7 +494,7 @@ mod tests {
         cases.push((
             "nat64",
             fwd_with(direct_of(
-                Some("cf.0sm.com"),
+                Some("edge.example.net"),
                 v4,
                 Some("64:ff9b::"),
                 "dnspod-doh",
@@ -450,7 +502,7 @@ mod tests {
         ));
         cases.push((
             "addr_resolver",
-            fwd_with(direct_of(Some("cf.0sm.com"), v4, None, "system")),
+            fwd_with(direct_of(Some("edge.example.net"), v4, None, "system")),
         ));
         let mut f = fwd();
         f.ech = None;
@@ -471,6 +523,11 @@ mod tests {
         let mut f = fwd();
         f.upstream = UpstreamIdentity::Pool { name: "cf".into() };
         cases.push(("direct->pool", f));
+        // Every field of the verification policy, for the same reason: names
+        // held to different assurances must not share a certificate.
+        for (what, verify) in verify_variants() {
+            cases.push((what, fwd_verified(verify)));
+        }
 
         for (what, f) in cases {
             assert_ne!(
@@ -503,6 +560,83 @@ mod tests {
             "dnspod-doh",
         ));
         assert_ne!(pool("cf"), CertScope::new(1, &host_named_cf));
+    }
+
+    /// One variant per field of [`EffectiveVerify`], each differing from the
+    /// default policy in exactly that field.
+    fn verify_variants() -> Vec<(&'static str, EffectiveVerify)> {
+        use crate::config::VerifyMode;
+        vec![
+            (
+                "verify mode chain",
+                EffectiveVerify {
+                    mode: VerifyMode::Chain,
+                    ..EffectiveVerify::default()
+                },
+            ),
+            (
+                "verify mode none",
+                EffectiveVerify {
+                    mode: VerifyMode::None,
+                    ..EffectiveVerify::default()
+                },
+            ),
+            (
+                "verify name",
+                EffectiveVerify {
+                    name: Some("default.example".into()),
+                    ..EffectiveVerify::default()
+                },
+            ),
+            (
+                "verify pins",
+                EffectiveVerify {
+                    pins: vec!["sha256/AA".into()],
+                    ..EffectiveVerify::default()
+                },
+            ),
+            (
+                "verify ca_file",
+                EffectiveVerify {
+                    ca_file: Some("corp.pem".into()),
+                    ..EffectiveVerify::default()
+                },
+            ),
+            (
+                "verify trust_webpki",
+                EffectiveVerify {
+                    ca_file: Some("corp.pem".into()),
+                    trust_webpki: false,
+                    ..EffectiveVerify::default()
+                },
+            ),
+        ]
+    }
+
+    /// Two policies that demand the same thing are one partition, and a pin set
+    /// written in a different order is the same set.
+    #[test]
+    fn equal_policies_share_a_partition() {
+        let pinned = |pins: &[&str]| {
+            fwd_verified(EffectiveVerify {
+                pins: pins.iter().map(|p| (*p).to_string()).collect(),
+                ..EffectiveVerify::default()
+            })
+        };
+        assert_eq!(
+            CertScope::new(1, &fwd()),
+            CertScope::new(1, &fwd_verified(EffectiveVerify::default()))
+        );
+        assert_eq!(
+            CertScope::new(1, &pinned(&["sha256/AA", "sha256/BB"])),
+            CertScope::new(1, &pinned(&["sha256/BB", "sha256/AA"])),
+            "pins are a set; reordering them must not rename the scope"
+        );
+        assert_ne!(
+            CertScope::new(1, &pinned(&["sha256/AA"])),
+            CertScope::new(1, &pinned(&["sha256/AA", "sha256/BB"])),
+            "a different pin set is a different assurance"
+        );
     }
 
     #[test]
@@ -612,7 +746,10 @@ mod tests {
 
     #[test]
     fn sanitize_produces_one_safe_component() {
-        assert_eq!(sanitize("ech_cf.0sm.com_443"), "ech_cf.0sm.com_443");
+        assert_eq!(
+            sanitize("ech_edge.example.net_443"),
+            "ech_edge.example.net_443"
+        );
         assert_eq!(sanitize("tls_[2a01:4f8::1]_443"), "tls_2a01_4f8_1_443");
         assert_eq!(sanitize("a//b\\c"), "a_b_c");
         assert_eq!(sanitize("..."), "_");

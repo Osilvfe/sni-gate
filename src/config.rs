@@ -116,6 +116,17 @@ pub struct Global {
     #[serde(default)]
     pub http2: Option<Http2Config>,
 
+    /// Outermost `[verify]` defaults for upstream certificate verification,
+    /// inherited field-by-field by every route, resolver and pool probe that
+    /// does not override them.
+    ///
+    /// Worth writing sparingly: a weakening here applies to every TLS upstream
+    /// in the document, including a resolver's own DoH handshake. Each scope
+    /// that resolves a weakened policy reports it at startup. `name` is refused
+    /// at this scope — it describes one upstream, not all of them.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
+
     /// Policy for connections matching no route and no default_route.
     #[serde(default)]
     pub unmatched: FailPolicy,
@@ -162,6 +173,12 @@ pub struct Listener {
     /// Listener-scope `[http2]` defaults, between `[global.http2]` and per-route.
     #[serde(default)]
     pub http2: Option<Http2Config>,
+
+    /// Listener-scope `[verify]` defaults, between `[global.verify]` and
+    /// per-route. Like `[global]`, it spans upstreams, so `name` is refused
+    /// here too.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
 
     /// Routes matched by inbound SNI/Host.
     #[serde(default, rename = "route")]
@@ -286,6 +303,12 @@ pub struct Route {
     /// HTTP/2 settings (deepest scope).
     #[serde(default)]
     pub http2: Option<Http2Config>,
+
+    /// Upstream certificate verification (deepest scope). Meaningful for
+    /// `tls`/`ech`, which dial a TLS upstream; writing it on an `http`/`raw`
+    /// route is a load-time error.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
 
     /// Optional PEM cert chain pinned for local termination when this route's
     /// name is presented. Falls back to the dynamic CA issuer.
@@ -414,6 +437,358 @@ pub enum EchMode {
 }
 
 // ---------------------------------------------------------------------------
+// Upstream certificate verification
+// ---------------------------------------------------------------------------
+
+/// What an upstream certificate must prove. See [`crate::verify`] for the full
+/// account; the short version is the table below.
+///
+/// | mode     | chains to a trust anchor | certificate name checked |
+/// |----------|--------------------------|--------------------------|
+/// | `full`   | yes                      | yes *(the default)*      |
+/// | `chain`  | yes                      | no                       |
+/// | `none`   | no                       | no                       |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyMode {
+    /// Chain to a trust anchor **and** be valid for the verification name.
+    #[default]
+    Full,
+    /// Chain to a trust anchor; do not check any name.
+    Chain,
+    /// Accept whatever the upstream presents. Only `pins` can still constrain it.
+    None,
+}
+
+impl VerifyMode {
+    /// The spelling this mode has in the configuration — the one word every
+    /// diagnostic about it must use, so it is written once.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Chain => "chain",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Per-scope upstream verification settings (deepest scope for verification
+/// overrides), as written.
+///
+/// Every field is `Option`; `None` means "inherit from the enclosing scope". The
+/// block resolves field-by-field along the same five-tier ladder as
+/// [`EchConfig`] and [`Http2Config`], and — unlike `[ech]` — its *presence* is
+/// not an opt-in gate, because the value it resolves to when nothing is written
+/// is the strongest one there is.
+///
+/// `name` is the one field that does not resolve from the whole ladder: it
+/// describes one upstream's certificate, so only the two route-scope tiers
+/// supply it (see [`EffectiveVerify::merge`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyConfig {
+    /// What the certificate must prove. Inherits; default [`VerifyMode::Full`].
+    #[serde(default)]
+    pub mode: Option<VerifyMode>,
+
+    /// Verify the certificate against this name instead of the one the route
+    /// requested. `full` mode only — nothing else checks a name.
+    ///
+    /// This is the field to reach for when an upstream answers with a default
+    /// certificate for some other name (the usual consequence of
+    /// `override_sni = ""`): chain, validity and name are all still enforced,
+    /// only the subject of the claim moves.
+    ///
+    /// Route scope only — the route's own block or the template it `use`s, like
+    /// `upstream` and `select`. It names *one* upstream's certificate, so in a
+    /// scope that spans upstreams it would be both wrong and impossible for a
+    /// deeper scope to take back; written there, it is a load-time error.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Accepted SPKI pins, spelled `sha256/<base64>` (RFC 7469 §2.1.1, the same
+    /// form as `curl --pinnedpubkey`). The upstream's end-entity public key must
+    /// match one of them, in *addition* to whatever `mode` requires.
+    ///
+    /// Written as a whole list: a deeper scope replaces the inherited set rather
+    /// than adding to it, so a route can never be quietly held to a pin it
+    /// cannot see.
+    #[serde(default)]
+    pub pins: Option<Vec<String>>,
+
+    /// PEM bundle of extra trust anchors — a private CA. Meaningless for
+    /// `mode = "none"`, which builds no chain.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+
+    /// Keep the built-in web-PKI roots alongside `ca_file`. Inherits; default
+    /// true. `false` narrows trust to `ca_file` alone, which it therefore
+    /// requires.
+    #[serde(default)]
+    pub trust_webpki: Option<bool>,
+}
+
+/// The fully-resolved verification policy for one scope that dials a TLS
+/// upstream.
+///
+/// Compared and hashed by value, because two things key off it. Verifiers are
+/// shared per distinct policy ([`crate::verify::VerifierFactory`]): scopes that
+/// demand exactly the same thing get the same verifier. And the policy is part
+/// of a route's certificate scope ([`crate::certscope`]): what an upstream had
+/// to prove decides what a mirrored observation is worth, so names held to
+/// different policies must not share a certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EffectiveVerify {
+    pub mode: VerifyMode,
+    pub name: Option<String>,
+    pub pins: Vec<String>,
+    pub ca_file: Option<PathBuf>,
+    pub trust_webpki: bool,
+}
+
+impl Default for EffectiveVerify {
+    /// Full verification against the web-PKI roots: the policy every scope has
+    /// until it says otherwise.
+    fn default() -> Self {
+        Self {
+            mode: VerifyMode::Full,
+            name: None,
+            pins: Vec::new(),
+            ca_file: None,
+            trust_webpki: true,
+        }
+    }
+}
+
+/// The prefix every SPKI pin carries. Only SHA-256 is accepted: it is the digest
+/// RFC 7469 specifies, and offering a weaker one would only invite its use.
+pub const SPKI_PIN_PREFIX: &str = "sha256/";
+
+/// Parse a `sha256/<base64>` SPKI pin into the 32 raw digest bytes.
+///
+/// Lives here, beside the other configuration parsers, so that the load-time
+/// check and the runtime verifier read a pin through the same function.
+pub fn parse_spki_pin(pin: &str) -> Result<[u8; 32], String> {
+    use base64::Engine as _;
+
+    let pin = pin.trim();
+    let body = pin.strip_prefix(SPKI_PIN_PREFIX).ok_or_else(|| {
+        format!(
+            "pin {pin:?} must be written {SPKI_PIN_PREFIX}<base64 of the SHA-256 digest of the \
+             certificate's DER SubjectPublicKeyInfo>"
+        )
+    })?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .map_err(|e| format!("pin {pin:?} is not valid base64: {e}"))?;
+    let len = raw.len();
+    raw.try_into()
+        .map_err(|_| format!("pin {pin:?} decodes to {len} bytes; a SHA-256 pin is 32"))
+}
+
+impl EffectiveVerify {
+    /// Flatten a top-level scope's `[verify]` block, which has `[global.verify]`
+    /// as its only parent — the same two-tier shape
+    /// [`EffectiveProbeEch::resolve`] has, and for the same reason: a resolver
+    /// and a pool are top-level objects, with no listener or route between them
+    /// and `[global]`.
+    pub fn resolve(own: Option<&VerifyConfig>, global: &Global) -> Self {
+        Self::merge(&[own], &[global.verify.as_ref()])
+    }
+
+    /// Merge the ladder, deepest tier first.
+    ///
+    /// The split is about one field. `name` says which certificate *one
+    /// specific upstream* serves, so it is only meaningful in a scope that
+    /// chooses that upstream — the same rule `upstream` and `select` already
+    /// follow. `own` holds those scopes (a route and its template; a resolver's
+    /// or a probe's own block), `outer` the ones that merely supply defaults
+    /// across destinations. Writing `name` in an outer scope is refused at load
+    /// time ([`VerifyConfig::reject_name`]) rather than silently inherited,
+    /// which also means the field can never arrive from a scope a route cannot
+    /// override.
+    ///
+    /// Tiers are passed positionally, `None` for an absent block, so that
+    /// "which tier is this" survives the flattening.
+    fn merge(own: &[Option<&VerifyConfig>], outer: &[Option<&VerifyConfig>]) -> Self {
+        let default = Self::default();
+        let all = || own.iter().chain(outer.iter()).flatten();
+        Self {
+            mode: all().find_map(|v| v.mode).unwrap_or(default.mode),
+            name: own.iter().flatten().find_map(|v| v.name.clone()),
+            pins: all().find_map(|v| v.pins.clone()).unwrap_or(default.pins),
+            ca_file: all().find_map(|v| v.ca_file.clone()),
+            trust_webpki: all()
+                .find_map(|v| v.trust_webpki)
+                .unwrap_or(default.trust_webpki),
+        }
+    }
+
+    /// Order-stable rendering of the whole policy, for the certificate scope
+    /// digest ([`crate::certscope`]).
+    ///
+    /// Destructured, like the rest of that digest, so a field added to this
+    /// struct fails to compile here: a policy difference the digest missed would
+    /// place two different assurances in one certificate partition.
+    pub fn canonical(&self) -> String {
+        let Self {
+            mode,
+            name,
+            pins,
+            ca_file,
+            trust_webpki,
+        } = self;
+        // A set, not a list: sorting a copy keeps a cosmetic reordering from
+        // renaming every scope directory.
+        let mut pins: Vec<&str> = pins.iter().map(String::as_str).collect();
+        pins.sort_unstable();
+        format!(
+            "mode:{},name:{},pins:[{}],ca:{},webpki:{trust_webpki}",
+            mode.as_str(),
+            name.as_deref().unwrap_or("-"),
+            pins.join(","),
+            ca_file
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |p| p.display().to_string()),
+        )
+    }
+
+    /// Syntax **and** coherence of a resolved policy, for a scope that will
+    /// really dial a TLS upstream.
+    ///
+    /// Coherence is only checkable here, on the resolved value: a block that
+    /// writes `name` while its `mode` comes from `[global.verify]` is perfectly
+    /// valid, so judging blocks in isolation would reject exactly what
+    /// inheritance exists for.
+    pub fn validate(&self, scope: &str) -> Result<(), ConfigError> {
+        check_verify_name(scope, self.name.as_deref())?;
+        check_verify_pins(scope, &self.pins)?;
+        check_verify_ca_file(scope, self.ca_file.as_deref())?;
+
+        let mode = self.mode.as_str();
+        // Only `full` checks a name.
+        if self.mode != VerifyMode::Full && self.name.is_some() {
+            return Err(verify_meaningless(
+                scope,
+                "name",
+                mode,
+                "no name is checked in this mode; use mode = \"full\" to verify against it",
+            ));
+        }
+        // `none` builds no chain, so everything about trust anchors is
+        // inapplicable — including the check below, which is why this returns.
+        if self.mode == VerifyMode::None {
+            if self.ca_file.is_some() {
+                return Err(verify_meaningless(
+                    scope,
+                    "ca_file",
+                    mode,
+                    "no chain is built in this mode; use mode = \"chain\" to keep verifying \
+                     the chain without the name",
+                ));
+            }
+            if !self.trust_webpki {
+                return Err(verify_meaningless(
+                    scope,
+                    "trust_webpki",
+                    mode,
+                    "no chain is built in this mode, so there is nothing to trust",
+                ));
+            }
+            return Ok(());
+        }
+        // Reached by `full` as well as `chain`: both build a chain, and neither
+        // can build one out of nothing.
+        if !self.trust_webpki && self.ca_file.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "{scope} [verify]: `trust_webpki = false` leaves no trust anchors at all; \
+                 supply a `ca_file`, or keep the web-PKI roots"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl VerifyConfig {
+    /// Syntax of the values written in *this* block, independent of
+    /// inheritance.
+    ///
+    /// Used for the scopes that only supply defaults (`[global]`, a listener, a
+    /// template): a typo in a pin must be reported where it was written, even
+    /// when no route happens to consume the block. Coherence between fields is
+    /// deliberately not checked here — see [`EffectiveVerify::validate`].
+    pub fn validate_syntax(&self, scope: &str) -> Result<(), ConfigError> {
+        check_verify_name(scope, self.name.as_deref())?;
+        check_verify_pins(scope, self.pins.as_deref().unwrap_or_default())?;
+        check_verify_ca_file(scope, self.ca_file.as_deref())
+    }
+
+    /// Refuse a `name` written in a scope that spans destinations.
+    ///
+    /// `name` identifies the certificate one upstream serves, so it belongs
+    /// where that upstream is chosen: a route, or the template a route `use`s.
+    /// `[global]` and a listener cover many upstreams at once, and a value
+    /// written there would apply to every one of them with no way for a deeper
+    /// scope to take it back — the reason [`EffectiveVerify::merge`] does not
+    /// read it from those tiers, and the reason writing it there is an error
+    /// rather than a silent no-op.
+    pub fn reject_name(&self, scope: &str) -> Result<(), ConfigError> {
+        if self.name.is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{scope} [verify]: `name` states which certificate one specific upstream \
+                 serves, so it belongs on the route that dials it (or on the template that \
+                 route uses), not on a scope that spans several upstreams"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A `[verify]` field the resolved mode cannot act on. Refused by name and with
+/// the reason, never ignored — the same treatment a pool probe's inapplicable
+/// fields get, and for the same reason: an operator who writes it believes it
+/// does something.
+fn verify_meaningless(scope: &str, field: &str, mode: &str, why: &str) -> ConfigError {
+    ConfigError::Invalid(format!(
+        "{scope} [verify]: `{field}` is meaningless with mode = \"{mode}\" ({why})"
+    ))
+}
+
+fn check_verify_name(scope: &str, name: Option<&str>) -> Result<(), ConfigError> {
+    let Some(name) = name else { return Ok(()) };
+    if name.trim().is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "{scope} [verify]: `name`, when set, must not be empty (omit it to verify against \
+             the name the route requested)"
+        )));
+    }
+    // The same parse rustls performs when the name reaches the verifier, so a
+    // malformed one fails at load rather than on every handshake.
+    rustls::pki_types::ServerName::try_from(name).map_err(|_| {
+        ConfigError::Invalid(format!(
+            "{scope} [verify]: `name` {name:?} is not a valid DNS name or IP address"
+        ))
+    })?;
+    Ok(())
+}
+
+fn check_verify_pins(scope: &str, pins: &[String]) -> Result<(), ConfigError> {
+    for pin in pins {
+        parse_spki_pin(pin).map_err(|e| ConfigError::Invalid(format!("{scope} [verify]: {e}")))?;
+    }
+    Ok(())
+}
+
+fn check_verify_ca_file(scope: &str, ca_file: Option<&Path>) -> Result<(), ConfigError> {
+    match ca_file {
+        Some(path) if path.as_os_str().is_empty() => Err(ConfigError::Invalid(format!(
+            "{scope} [verify]: `ca_file`, when set, must be a path"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Named templates
 // ---------------------------------------------------------------------------
 
@@ -456,6 +831,13 @@ pub struct Template {
     /// HTTP/2 settings; merged field-by-field into the HTTP/2 ladder here.
     #[serde(default)]
     pub http2: Option<Http2Config>,
+
+    /// Upstream verification settings; merged field-by-field into the
+    /// verification ladder at this scope. `name` reaches a route only when a
+    /// *route* uses the template — a listener's template is an outer tier, like
+    /// `upstream`.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
 
     /// Pool candidate filter (see [`Route::select`]). Route scope only, like
     /// `upstream` itself: a listener has no upstream to select candidates for.
@@ -681,6 +1063,17 @@ pub struct ResolverDef {
     #[serde(default)]
     pub ech: Option<EchConfig>,
 
+    /// Verification of the certificate this resolver's endpoint presents.
+    /// Fields inherit from `[global.verify]`.
+    ///
+    /// Unlike `[ech]`, the block needs no presence gate: with nothing written
+    /// anywhere the policy is full verification, so there is no weaker default
+    /// for an unwritten block to fall into. Only a DoH/DoT endpoint performs a
+    /// TLS handshake, so writing this on a plain or `system` endpoint is a
+    /// load-time error.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
+
     /// Address family used when resolving the dial host. Inherits from `[global]`.
     #[serde(default)]
     pub address_family: Option<AddressFamily>,
@@ -722,6 +1115,9 @@ pub struct EffectiveResolver {
     /// Resolver performing this resolver's own ECH HTTPS-record lookup.
     /// Never inherited.
     pub ech_resolver: Option<String>,
+    /// What this resolver's endpoint certificate must prove. Only read for a
+    /// TLS transport (DoH/DoT).
+    pub verify: EffectiveVerify,
 }
 
 impl ResolverDef {
@@ -794,6 +1190,7 @@ impl ResolverDef {
                 .unwrap_or_else(default_ech_refresh),
             // Never inherited — a dependency edge, like `bootstrap`.
             ech_resolver: self.ech.as_ref().and_then(|e| e.ech_resolver.clone()),
+            verify: EffectiveVerify::resolve(self.verify.as_ref(), global),
         }
     }
 
@@ -972,6 +1369,17 @@ pub struct ProbeDef {
     #[serde(default)]
     pub ech: Option<EchConfig>,
 
+    /// Verification of the certificate a candidate presents. Valid for `tls`
+    /// and `https://` probes; fields inherit from `[global.verify]`.
+    ///
+    /// A pool probes many addresses for one origin, so this is where a pool
+    /// whose edge nodes answer an unmatched name — the same situation a route
+    /// meets — states what the probe really checks. A probe that accepts any
+    /// certificate is still a useful reachability measurement; it simply no
+    /// longer attests to the identity of what answered.
+    #[serde(default)]
+    pub verify: Option<VerifyConfig>,
+
     /// Probe cycle for healthy candidates. Default 5m.
     #[serde(default, with = "humantime_serde::option")]
     pub interval: Option<Duration>,
@@ -1008,6 +1416,7 @@ pub enum ProbeSpec {
         sni: String,
         timeout: Option<Duration>,
         ech: Option<EchConfig>,
+        verify: Option<VerifyConfig>,
     },
 
     /// Request and response. RTT measured to the first response byte, which is
@@ -1018,6 +1427,7 @@ pub enum ProbeSpec {
         expect_status: Vec<u16>,
         timeout: Option<Duration>,
         ech: Option<EchConfig>,
+        verify: Option<VerifyConfig>,
     },
 }
 
@@ -1027,6 +1437,28 @@ impl ProbeSpec {
         match self {
             ProbeSpec::Tcp { .. } => None,
             ProbeSpec::Tls { ech, .. } | ProbeSpec::Http { ech, .. } => ech.as_ref(),
+        }
+    }
+
+    /// The probe's `[verify]` block, for the modes that perform a handshake.
+    pub fn verify(&self) -> Option<&VerifyConfig> {
+        match self {
+            ProbeSpec::Tcp { .. } => None,
+            ProbeSpec::Tls { verify, .. } | ProbeSpec::Http { verify, .. } => verify.as_ref(),
+        }
+    }
+
+    /// Whether this probe performs a TLS handshake, and therefore has a
+    /// certificate to verify.
+    ///
+    /// `tcp` never does, `tls` always does, and `http` does exactly when its URL
+    /// is `https`. Both the config checker and the pool builder ask, so that
+    /// "which probes resolve a `[verify]` policy" has one answer.
+    pub fn handshakes(&self) -> bool {
+        match self {
+            ProbeSpec::Tcp { .. } => false,
+            ProbeSpec::Tls { .. } => true,
+            ProbeSpec::Http { url, .. } => url.scheme() == "https",
         }
     }
 }
@@ -1083,6 +1515,13 @@ impl ProbeDef {
                 if self.ech.is_some() {
                     return Err(meaningless("ech", "tcp", "no TLS handshake is performed"));
                 }
+                if self.verify.is_some() {
+                    return Err(meaningless(
+                        "verify",
+                        "tcp",
+                        "no certificate is presented, so there is nothing to verify",
+                    ));
+                }
                 Ok(ProbeSpec::Tcp {
                     port: self.port,
                     timeout: self.timeout,
@@ -1111,6 +1550,7 @@ impl ProbeDef {
                     sni: sni.to_string(),
                     timeout: self.timeout,
                     ech: self.ech.clone(),
+                    verify: self.verify.clone(),
                 })
             }
 
@@ -1163,12 +1603,22 @@ impl ProbeDef {
                         "the URL is cleartext; use an https:// URL",
                     ));
                 }
+                // The same argument: a cleartext probe sees no certificate.
+                if self.verify.is_some() && scheme != "https" {
+                    return Err(meaningless(
+                        "verify",
+                        "http",
+                        "the URL is cleartext, so no certificate is presented; use an \
+                         https:// URL",
+                    ));
+                }
 
                 Ok(ProbeSpec::Http {
                     url,
                     expect_status: self.expect_status.clone(),
                     timeout: self.timeout,
                     ech: self.ech.clone(),
+                    verify: self.verify.clone(),
                 })
             }
 
@@ -1831,6 +2281,15 @@ impl Config {
             }
         }
 
+        // A probe that performs a handshake resolves a verification policy, on
+        // the same two-tier ladder its `[ech]` block uses. A `tcp` or cleartext
+        // probe verifies nothing, so it resolves no policy either — writing the
+        // block there was already refused by `ProbeDef::validate`.
+        if spec.handshakes() {
+            EffectiveVerify::resolve(spec.verify(), &self.global)
+                .validate(&format!("[pools.{pool_name}.probe]"))?;
+        }
+
         Ok(())
     }
 
@@ -1973,6 +2432,33 @@ impl Config {
             }
 
             let eff = def.effective(name, &self.global);
+
+            // The endpoint grammar, parsed by the module that owns it rather
+            // than re-implemented here — the same arrangement `validate_pools`
+            // has with `TargetSpec::parse`.
+            let endpoint = crate::dns_resolvers::Endpoint::parse(&eff.endpoint).map_err(|e| {
+                ConfigError::Invalid(format!(
+                    "[resolvers.{name}]: endpoint {:?}: {e}",
+                    eff.endpoint
+                ))
+            })?;
+
+            // Verification applies to this resolver's own handshake, so it is
+            // only meaningful on a TLS transport. An inherited `[global.verify]`
+            // is simply unused by a plain endpoint; writing the block here is
+            // rejected, in the same spirit as `http2` on a `raw` route.
+            match (&def.verify, endpoint.is_tls()) {
+                (_, true) => eff.verify.validate(&format!("[resolvers.{name}]"))?,
+                (Some(_), false) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "[resolvers.{name}]: [verify] configures the certificate an endpoint \
+                         must present, but {:?} performs no TLS handshake. Use an https:// \
+                         (DoH) or tls:// (DoT) endpoint",
+                        eff.endpoint
+                    )))
+                }
+                (None, false) => {}
+            }
 
             // `static` / `doh-with-fallback` need a config from *somewhere*. This
             // reads the **effective** block, not the raw one: `config` may be
@@ -2130,6 +2616,31 @@ impl Config {
                 "at least one [[listener]] is required".into(),
             ));
         }
+
+        // The `[verify]` scopes that only supply defaults are syntax-checked
+        // first, before any scope that *resolves* them. A malformed pin written
+        // in `[global.verify]` would otherwise be reported against the first
+        // route that inherits it, which sends the operator to fix a block that
+        // is not the one with the typo in it. Coherence between fields is
+        // checked on each resolved policy instead — see
+        // `EffectiveVerify::validate`.
+        if let Some(v) = &self.global.verify {
+            v.validate_syntax("[global]")?;
+            v.reject_name("[global]")?;
+        }
+        for (name, t) in &self.templates {
+            if let Some(v) = &t.verify {
+                v.validate_syntax(&format!("[templates.{name}]"))?;
+            }
+        }
+        for a in &self.listeners {
+            if let Some(v) = &a.verify {
+                let scope = format!("listener {}", a.addr);
+                v.validate_syntax(&scope)?;
+                v.reject_name(&scope)?;
+            }
+        }
+
         // Reject duplicate listen addresses.
         for (i, a) in self.listeners.iter().enumerate() {
             for b in &self.listeners[i + 1..] {
@@ -2147,14 +2658,17 @@ impl Config {
                 r.validate(false, port, rt_tpl)?;
                 self.validate_ech(a, r, rt_tpl, ln_tpl)?;
                 self.validate_http2(r, rt_tpl)?;
+                self.validate_verify(a, r, rt_tpl, ln_tpl)?;
             }
             if let Some(d) = &a.default_route {
                 let rt_tpl = self.template_for(&d.use_template)?;
                 d.validate(true, port, rt_tpl)?;
                 self.validate_ech(a, d, rt_tpl, ln_tpl)?;
                 self.validate_http2(d, rt_tpl)?;
+                self.validate_verify(a, d, rt_tpl, ln_tpl)?;
             }
         }
+
         if self.ca.leaf_validity_days < 1 {
             return Err(ConfigError::Invalid(
                 "ca.leaf_validity_days must be >= 1".into(),
@@ -2450,6 +2964,103 @@ impl Config {
                 .iter()
                 .find_map(|h| h.probe_timeout)
                 .unwrap_or_else(default_probe_timeout),
+        }
+    }
+
+    /// The fully-resolved upstream verification policy for `route`, merging the
+    /// five `[verify]` tiers field-by-field along the same ladder
+    /// [`ech_tiers`](Self::ech_tiers) walks.
+    ///
+    /// The ladder is split where `name` stops making sense: the two route-scope
+    /// tiers choose the upstream, the three outer ones only supply defaults
+    /// across destinations (see [`EffectiveVerify::merge`]).
+    ///
+    /// Always resolvable — with nothing written anywhere it is
+    /// [`EffectiveVerify::default`], full verification against the web-PKI roots
+    /// — so callers need no fallback of their own.
+    ///
+    /// Returns the default policy for `http` and `raw`, which originate no TLS:
+    /// there is nothing for a policy to act on, and letting an inherited
+    /// `[global.verify]` reach them would split their certificate scopes
+    /// ([`crate::certscope`]) over a value no handshake ever reads.
+    pub fn effective_verify(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+        ln_tpl: Option<&Template>,
+    ) -> EffectiveVerify {
+        if !matches!(
+            Self::effective_route_type(route, rt_tpl),
+            Some(RouteType::Tls | RouteType::Ech)
+        ) {
+            return EffectiveVerify::default();
+        }
+        EffectiveVerify::merge(
+            &[
+                route.verify.as_ref(),
+                rt_tpl.and_then(|t| t.verify.as_ref()),
+            ],
+            &[
+                listener.verify.as_ref(),
+                ln_tpl.and_then(|t| t.verify.as_ref()),
+                self.global.verify.as_ref(),
+            ],
+        )
+    }
+
+    /// One route's `[verify]` checks: the resolved policy where a TLS upstream
+    /// is really dialed, and a refusal where the block cannot do anything.
+    ///
+    /// Only the two route-scope tiers count for the refusal, exactly as in
+    /// [`validate_http2`](Self::validate_http2): a value inherited from the
+    /// listener or `[global]` is a broad default that `http`/`raw` routes simply
+    /// have no use for, whereas writing it on the route itself (or on the
+    /// template it `use`s) can only be a misunderstanding of what it verifies.
+    fn validate_verify(
+        &self,
+        listener: &Listener,
+        route: &Route,
+        rt_tpl: Option<&Template>,
+        ln_tpl: Option<&Template>,
+    ) -> Result<(), ConfigError> {
+        let scope = format!("route {}", route.label());
+        match Self::effective_route_type(route, rt_tpl) {
+            Some(RouteType::Tls | RouteType::Ech) => self
+                .effective_verify(listener, route, rt_tpl, ln_tpl)
+                .validate(&scope),
+            // A missing type is reported by `Route::validate`, which runs first.
+            None => Ok(()),
+            Some(other) => {
+                let explicit = [
+                    route.verify.as_ref(),
+                    rt_tpl.and_then(|t| t.verify.as_ref()),
+                ]
+                .into_iter()
+                .flatten()
+                .next();
+                match explicit {
+                    None => Ok(()),
+                    Some(_) => Err(ConfigError::Invalid(format!(
+                        "{scope}: [verify] configures the certificate an upstream must \
+                         present, but a `{}` route never verifies one ({}). Use type = \
+                         \"tls\" or \"ech\" to re-originate over TLS",
+                        match other {
+                            RouteType::Http => "http",
+                            RouteType::Raw => "raw",
+                            RouteType::Tls => "tls",
+                            RouteType::Ech => "ech",
+                        },
+                        match other {
+                            RouteType::Http =>
+                                "the upstream is cleartext, so it presents no certificate",
+                            _ =>
+                                "the TCP stream is spliced untouched, so the client — not \
+                                  this gateway — sees the upstream's certificate",
+                        }
+                    ))),
+                }
+            }
         }
     }
 
@@ -4193,6 +4804,448 @@ addr = "0.0.0.0:443"
         cfg.validate().unwrap();
         assert!(!route_http2(&cfg, 0).enabled, "raw ignores inherited http2");
         assert!(route_http2(&cfg, 1).enabled, "http route still gets it");
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream verification: the ladder, and the refusals
+    // -----------------------------------------------------------------------
+
+    /// Two well-formed SPKI pins: the base64 of 32 zero bytes, and of 32 `0x11`
+    /// bytes. Written out rather than computed so the tests exercise the same
+    /// spelling an operator would paste in.
+    const PIN_A: &str = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const PIN_B: &str = "sha256/ERERERERERERERERERERERERERERERERERERERERERE=";
+
+    /// A minimal listener, for documents whose subject is elsewhere — a
+    /// resolver, a pool, `[global]` — but which must still deserialize.
+    const ONE_TLS_ROUTE: &str = r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+"#;
+
+    /// Resolve the effective `[verify]` policy of listener 0's route `idx`.
+    fn route_verify(cfg: &Config, idx: usize) -> EffectiveVerify {
+        let l = &cfg.listeners[0];
+        let r = &l.routes[idx];
+        let rt = cfg.template_for(&r.use_template).unwrap();
+        let lt = cfg.template_for(&l.use_template).unwrap();
+        cfg.effective_verify(l, r, rt, lt)
+    }
+
+    /// With nothing written anywhere, every route demands full web-PKI
+    /// verification of the name it asked for.
+    #[test]
+    fn verify_defaults_to_full_web_pki() {
+        let cfg = parse(
+            r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(route_verify(&cfg, 0), EffectiveVerify::default());
+    }
+
+    #[test]
+    fn verify_inherits_field_by_field() {
+        let cfg = parse(&format!(
+            r#"
+[global.verify]
+ca_file = "corp.pem"
+pins = ["{PIN_A}"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+
+  [listener.verify]
+  mode = "chain"
+
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+    [listener.route.verify]
+    pins = []
+
+  [[listener.route]]
+  name = "b"
+  type = "tls"
+  match_sni = [".b.com"]
+"#
+        ));
+        cfg.validate().unwrap();
+
+        // Route a: ca_file from global, mode from the listener (nearer), and its
+        // own empty list clears the inherited pins.
+        let a = route_verify(&cfg, 0);
+        assert_eq!(a.mode, VerifyMode::Chain);
+        assert_eq!(a.ca_file.as_deref(), Some(Path::new("corp.pem")));
+        assert!(
+            a.pins.is_empty(),
+            "`pins = []` must clear the inherited set"
+        );
+        assert!(a.trust_webpki, "unwritten anywhere: the default");
+
+        // Route b has no [verify] block at all yet still resolves the ladder.
+        let b = route_verify(&cfg, 1);
+        assert_eq!(b.mode, VerifyMode::Chain);
+        assert_eq!(b.pins.len(), 1, "no route override, so global's pin stands");
+    }
+
+    /// A deeper scope replaces the inherited pin set rather than adding to it:
+    /// a route is never held to a pin it cannot see.
+    #[test]
+    fn a_deeper_pin_list_replaces_the_inherited_one() {
+        let cfg = parse(&format!(
+            r#"
+[global.verify]
+pins = ["{PIN_A}"]
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+    [listener.route.verify]
+    pins = ["{PIN_B}"]
+"#
+        ));
+        cfg.validate().unwrap();
+        assert_eq!(
+            route_verify(&cfg, 0).pins,
+            vec![PIN_B.to_string()],
+            "the route's own list must replace the inherited one, not extend it"
+        );
+    }
+
+    /// `name` names the certificate one upstream serves, so it is refused in the
+    /// scopes that span upstreams — where no deeper scope could take it back.
+    #[test]
+    fn a_verification_name_outside_a_route_scope_is_an_error() {
+        for (what, doc) in [
+            (
+                "[global]",
+                r#"
+[global.verify]
+name = "default.example"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+"#,
+            ),
+            (
+                "listener",
+                r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [listener.verify]
+  name = "default.example"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+"#,
+            ),
+        ] {
+            let err = parse(doc).validate().unwrap_err().to_string();
+            assert!(
+                err.contains("`name`") && err.contains(what),
+                "{what}: unhelpful message: {err}"
+            );
+        }
+    }
+
+    /// The route scopes that *may* set it: the route itself, and the template it
+    /// uses — the same two tiers `upstream` resolves from.
+    #[test]
+    fn a_verification_name_resolves_from_the_route_scopes() {
+        let cfg = parse(
+            r#"
+[templates.edge.verify]
+name = "template.example"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+  use = "edge"
+
+  [[listener.route]]
+  name = "b"
+  type = "tls"
+  match_sni = [".b.com"]
+  use = "edge"
+    [listener.route.verify]
+    name = "route.example"
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(
+            route_verify(&cfg, 0).name.as_deref(),
+            Some("template.example")
+        );
+        assert_eq!(route_verify(&cfg, 1).name.as_deref(), Some("route.example"));
+    }
+
+    /// A template used by a *listener* supplies defaults across that listener's
+    /// routes, so it is the same case as the listener's own block: no `name`.
+    #[test]
+    fn a_listener_template_cannot_supply_a_verification_name() {
+        let cfg = parse(
+            r#"
+[templates.shared.verify]
+name = "default.example"
+
+[[listener]]
+addr = "0.0.0.0:443"
+use = "shared"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(
+            route_verify(&cfg, 0).name,
+            None,
+            "a listener template is an outer tier; `name` must not reach the route"
+        );
+    }
+
+    /// Each field the resolved mode cannot act on is refused by name, so an
+    /// operator who wrote it learns that it does nothing.
+    #[test]
+    fn a_field_the_mode_cannot_act_on_is_refused() {
+        let route = |block: &str| {
+            format!(
+                r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "tls"
+  match_sni = [".a.com"]
+    [listener.route.verify]
+{block}
+"#
+            )
+        };
+        for (field, block) in [
+            ("name", "    mode = \"chain\"\n    name = \"x.example\""),
+            ("ca_file", "    mode = \"none\"\n    ca_file = \"corp.pem\""),
+            (
+                "trust_webpki",
+                "    mode = \"none\"\n    trust_webpki = false",
+            ),
+        ] {
+            let err = parse(&route(block)).validate().unwrap_err().to_string();
+            assert!(
+                err.contains(field) && err.contains("meaningless"),
+                "{field}: unhelpful message: {err}"
+            );
+        }
+
+        // Narrowing trust to anchors that were never supplied verifies nothing.
+        let err = parse(&route("    trust_webpki = false"))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no trust anchors"), "unhelpful message: {err}");
+    }
+
+    /// A malformed pin is reported where it was written, even in a scope no
+    /// route consumes.
+    #[test]
+    fn a_malformed_pin_is_reported_at_its_own_scope() {
+        for (scope, block) in [
+            // No `sha256/` prefix at all: the digest algorithm is not optional.
+            ("[global]", "[global.verify]\npins = [\"AAAA\"]\n"),
+            (
+                "[templates.edge]",
+                "[templates.edge.verify]\npins = [\"sha256/not-base64!\"]\n",
+            ),
+        ] {
+            let err = parse(&format!("{block}{ONE_TLS_ROUTE}"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(scope) && err.contains("pin"),
+                "{scope}: unhelpful message: {err}"
+            );
+        }
+
+        // A digest of the wrong length is caught too, not just bad base64.
+        let err = parse(&format!(
+            "[global.verify]\npins = [\"sha256/AAAA\"]\n{ONE_TLS_ROUTE}"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("32"), "unhelpful message: {err}");
+    }
+
+    /// Routes that originate no TLS verify nothing: writing the block on one is
+    /// an error, while an inherited default must still coexist with them.
+    #[test]
+    fn verify_written_on_a_route_that_verifies_nothing_is_an_error() {
+        for ty in ["http", "raw"] {
+            let err = parse(&format!(
+                r#"
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "a"
+  type = "{ty}"
+  match_sni = [".a.com"]
+  upstream = "127.0.0.1:8080"
+    [listener.route.verify]
+    mode = "none"
+"#
+            ))
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("[verify]") && err.contains(ty),
+                "{ty}: unhelpful message: {err}"
+            );
+        }
+    }
+
+    /// The counterpart: a global default coexists with such routes, and — since
+    /// they never read it — must not reach them, or it would split their
+    /// certificate scopes over a value no handshake consults.
+    #[test]
+    fn verify_inherited_by_a_route_that_verifies_nothing_is_ignored() {
+        let cfg = parse(
+            r#"
+[global.verify]
+mode = "none"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  name = "plain"
+  type = "http"
+  match_sni = [".plain.com"]
+  upstream = "127.0.0.1:8080"
+
+  [[listener.route]]
+  name = "web"
+  type = "tls"
+  match_sni = [".web.com"]
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(
+            route_verify(&cfg, 0),
+            EffectiveVerify::default(),
+            "an http route keeps the default policy it never uses"
+        );
+        assert_eq!(route_verify(&cfg, 1).mode, VerifyMode::None);
+    }
+
+    /// A resolver verifies its endpoint's certificate only when it performs a
+    /// handshake, so the block is refused on a plain endpoint — and an
+    /// inherited `[global.verify]` still reaches the ones that do.
+    #[test]
+    fn verify_on_a_cleartext_resolver_is_an_error() {
+        let err = parse(&format!(
+            r#"
+[resolvers.plain]
+endpoint = "8.8.8.8"
+  [resolvers.plain.verify]
+  mode = "chain"
+{ONE_TLS_ROUTE}"#
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("[resolvers.plain]") && err.contains("no TLS handshake"),
+            "unhelpful message: {err}"
+        );
+
+        let cfg = parse(&format!(
+            r#"
+[global.verify]
+mode = "chain"
+
+[resolvers.doh]
+endpoint = "https://doh.example/dns-query"
+bootstrap = "@plain"
+
+[resolvers.plain]
+endpoint = "8.8.8.8"
+{ONE_TLS_ROUTE}"#
+        ));
+        cfg.validate().unwrap();
+        let doh = cfg.resolvers["doh"].effective("doh", &cfg.global);
+        assert_eq!(doh.verify.mode, VerifyMode::Chain);
+        let plain = cfg.resolvers["plain"].effective("plain", &cfg.global);
+        assert_eq!(
+            plain.verify.mode,
+            VerifyMode::Chain,
+            "resolved but never read: only a TLS transport consults it"
+        );
+    }
+
+    /// A probe that performs no handshake has no certificate to verify.
+    #[test]
+    fn verify_on_a_probe_that_sees_no_certificate_is_an_error() {
+        for (mode, extra) in [
+            ("tcp", "port = 443"),
+            (
+                "http",
+                "url = \"http://edge.example/health\"\n  expect_status = [200]",
+            ),
+        ] {
+            let err = parse(&format!(
+                r#"
+[pools.edge]
+targets = ["a.example"]
+  [pools.edge.probe]
+  mode = "{mode}"
+  {extra}
+    [pools.edge.probe.verify]
+    mode = "none"
+{ONE_TLS_ROUTE}"#
+            ))
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("verify") && err.contains(mode),
+                "{mode}: unhelpful message: {err}"
+            );
+        }
+    }
+
+    /// The example configuration ships in the release archive, so it is part of
+    /// the product: it must parse and validate exactly as a user's own file
+    /// would. Compiled in, so the check cannot be skipped by a missing file.
+    #[test]
+    fn the_shipped_example_configuration_is_valid() {
+        let cfg: Config = toml::from_str(include_str!("../sni-gate.example.toml"))
+            .expect("sni-gate.example.toml must parse");
+        cfg.validate().expect("sni-gate.example.toml must validate");
     }
 
     #[test]

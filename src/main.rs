@@ -23,6 +23,7 @@ mod router;
 mod store;
 mod suffix;
 mod trust;
+mod verify;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rustls::{RootCertStore, ServerConfig};
+use rustls::ServerConfig;
 use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -47,6 +48,7 @@ use crate::proxy::{ListenerState, RouteRuntime, ServerConfigs, Upstream};
 use crate::resolver::{DynamicResolver, Issuer, IssuerParams};
 use crate::router::Router;
 use crate::store::CertStore;
+use crate::verify::VerifierFactory;
 
 /// Resolver cache key: (spec string, address family).
 type ResolverCache = HashMap<(String, config::AddressFamily), Arc<hickory_resolver::TokioResolver>>;
@@ -216,18 +218,18 @@ async fn run(cfg: Config) -> Result<()> {
         cache_ttl: Duration::from_secs(cfg.cache.ttl_secs),
     }));
 
-    // Shared web-PKI roots for upstream TLS verification.
-    let root_store = Arc::new(RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    });
+    // Every upstream certificate verifier in the process comes from here: one
+    // web-PKI root store, one CA file read per distinct path, and one verifier
+    // per distinct `[verify]` policy no matter how many routes resolve to it.
+    let mut verifiers = VerifierFactory::new();
 
     let mut resolver_cache: ResolverCache = HashMap::new();
 
     // --- Build named resolvers in dependency order ---
-    let named_resolvers = build_named_resolvers(&cfg, &mut resolver_cache).await?;
+    let named_resolvers = build_named_resolvers(&cfg, &mut resolver_cache, &mut verifiers).await?;
 
     // --- Build and start pools, before any route can read one ---
-    let pools = build_pools(&cfg, &named_resolvers, &mut resolver_cache, &root_store)?;
+    let pools = build_pools(&cfg, &named_resolvers, &mut resolver_cache, &mut verifiers)?;
 
     let mut probe_targets: Vec<ProbeTarget> = Vec::new();
 
@@ -238,9 +240,9 @@ async fn run(cfg: Config) -> Result<()> {
             &cfg,
             listener,
             issuer.clone(),
-            root_store.clone(),
             &named_resolvers,
             &mut resolver_cache,
+            &mut verifiers,
             &mut probe_targets,
             &pools,
         )?;
@@ -290,7 +292,7 @@ fn build_pools(
     cfg: &Config,
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
-    root_store: &Arc<RootCertStore>,
+    verifiers: &mut VerifierFactory,
 ) -> Result<HashMap<String, Arc<Pool>>> {
     if cfg.pools.is_empty() {
         return Ok(HashMap::new());
@@ -345,9 +347,21 @@ fn build_pools(
             }
         };
 
+        // What the probe requires of the endpoint's certificate, on the same
+        // two-tier ladder its `[ech]` block uses. A `tcp` or cleartext-`http`
+        // probe performs no handshake, so it resolves no policy — it takes the
+        // default, which it never consults, rather than inheriting a weakened
+        // `[global.verify]` and reporting a relaxation it does not perform.
+        let verify_policy = if probe.handshakes() {
+            config::EffectiveVerify::resolve(probe.verify(), &cfg.global)
+        } else {
+            config::EffectiveVerify::default()
+        };
+        let verify = verifiers.get(&verify_policy, &format!("[pools.{name}.probe]"))?;
+
         builders.insert(
             name.as_str(),
-            PoolBuilder::new(name, def, probe, resolver, probe_ech, root_store)
+            PoolBuilder::new(name, def, probe, resolver, probe_ech, verify)
                 .with_context(|| format!("[pools.{name}]"))?,
         );
     }
@@ -394,9 +408,9 @@ fn build_listener(
     cfg: &Config,
     listener: &Listener,
     issuer: Arc<Issuer>,
-    root_store: Arc<RootCertStore>,
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
+    verifiers: &mut VerifierFactory,
     probe_targets: &mut Vec<ProbeTarget>,
     pools: &HashMap<String, Arc<Pool>>,
 ) -> Result<ListenerState> {
@@ -410,9 +424,9 @@ fn build_listener(
             cfg,
             listener,
             route,
-            &root_store,
             named_resolvers,
             resolver_cache,
+            verifiers,
             probe_targets,
             pools,
         )?;
@@ -428,9 +442,9 @@ fn build_listener(
             cfg,
             listener,
             d,
-            &root_store,
             named_resolvers,
             resolver_cache,
+            verifiers,
             probe_targets,
             pools,
         )?;
@@ -612,9 +626,9 @@ fn build_route(
     cfg: &Config,
     listener: &Listener,
     route: &Route,
-    root_store: &Arc<RootCertStore>,
     named_resolvers: &HashMap<String, Arc<dns_resolvers::DnsResolver>>,
     resolver_cache: &mut ResolverCache,
+    verifiers: &mut VerifierFactory,
     probe_targets: &mut Vec<ProbeTarget>,
     pools: &HashMap<String, Arc<Pool>>,
 ) -> Result<BuiltRoute> {
@@ -713,39 +727,61 @@ fn build_route(
     // ECH routes to one socket that draw their keys from different sources are not
     // interchangeable, so they must not share a certificate.
     let mut ech_identity: Option<EchIdentity> = None;
-    let ech = if route_type == RouteType::Ech {
-        let ech_spec = eff.ech_resolver.clone().unwrap_or_else(|| {
-            // Default ECH resolver: use addr_resolver if present, else system resolver
-            eff.addr_resolver
-                .clone()
-                .unwrap_or_else(|| "system".to_string())
-        });
-        ech_identity = Some(EchIdentity {
-            mode: eff_ech.mode,
-            domain: eff_ech.ech_domain.clone(),
-            resolver: ech_spec.clone(),
-            inline_config: eff_ech.config.is_some(),
-        });
-        // HTTPS records are resolved dual-family regardless of upstream family.
-        let ech_resolver = get_resolver(
-            named_resolvers,
-            resolver_cache,
-            &ech_spec,
-            config::AddressFamily::Dual,
-        )?;
-        Some(EchProvider::new(
-            eff_ech.clone(),
-            port,
-            eff.require_ech,
-            // RFC 9849 permits an inner hello with no SNI; `override_sni = ""`
-            // asks for exactly that.
-            sni_policy != config::SniPolicy::Omit,
-            ech_resolver,
-            root_store.clone(),
-            eff.ech_refresh,
-        ))
-    } else {
-        None
+
+    // What this route requires of the upstream certificate — and, because it
+    // decides what a mirrored observation is worth, part of this route's
+    // certificate scope. `http` and `raw` resolve the default policy, which they
+    // never consult (writing a `[verify]` block on them is a load-time error).
+    let eff_verify = cfg.effective_verify(listener, route, rt_tpl, ln_tpl);
+
+    // The upstream TLS artifacts, built once per route rather than per
+    // connection: a `tls` route's client configs (one per ALPN offer), or an
+    // `ech` route's provider, which memoizes its own.
+    let (verify, ech, tls) = match route_type {
+        RouteType::Http | RouteType::Raw => (None, None, None),
+
+        RouteType::Tls => {
+            let verify = verifiers.get(&eff_verify, &format!("route {}", route.label()))?;
+            // `override_sni = ""` withholds the extension; the certificate is
+            // still checked under `eff_verify`.
+            let tls = proxy::ClientConfigs::new(&verify, sni_policy != config::SniPolicy::Omit);
+            (Some(verify), None, Some(tls))
+        }
+
+        RouteType::Ech => {
+            let verify = verifiers.get(&eff_verify, &format!("route {}", route.label()))?;
+            let ech_spec = eff.ech_resolver.clone().unwrap_or_else(|| {
+                // Default ECH resolver: use addr_resolver if present, else system resolver
+                eff.addr_resolver
+                    .clone()
+                    .unwrap_or_else(|| "system".to_string())
+            });
+            ech_identity = Some(EchIdentity {
+                mode: eff_ech.mode,
+                domain: eff_ech.ech_domain.clone(),
+                resolver: ech_spec.clone(),
+                inline_config: eff_ech.config.is_some(),
+            });
+            // HTTPS records are resolved dual-family regardless of upstream family.
+            let ech_resolver = get_resolver(
+                named_resolvers,
+                resolver_cache,
+                &ech_spec,
+                config::AddressFamily::Dual,
+            )?;
+            let provider = EchProvider::new(
+                eff_ech.clone(),
+                port,
+                eff.require_ech,
+                // RFC 9849 permits an inner hello with no SNI; `override_sni = ""`
+                // asks for exactly that.
+                sni_policy != config::SniPolicy::Omit,
+                ech_resolver,
+                verify.clone(),
+                eff.ech_refresh,
+            );
+            (Some(verify), Some(provider), None)
+        }
     };
 
     let eff_http2 = cfg.effective_http2(listener, route, rt_tpl, ln_tpl);
@@ -817,6 +853,7 @@ fn build_route(
         port,
         sni: sni_policy.clone(),
         ech: ech_identity,
+        verify: eff_verify,
     };
 
     Ok(BuiltRoute {
@@ -833,7 +870,8 @@ fn build_route(
             idle_timeout: eff.idle_timeout,
             fail: eff.fail,
             ech,
-            root_store: root_store.clone(),
+            verify,
+            tls,
         },
         forwarding,
         pinned,
@@ -1057,9 +1095,9 @@ fn get_resolver(
 async fn build_named_resolvers(
     cfg: &Config,
     _cache: &mut ResolverCache,
+    verifiers: &mut VerifierFactory,
 ) -> Result<HashMap<String, Arc<dns_resolvers::DnsResolver>>> {
     let mut registry: HashMap<String, Arc<dns_resolvers::DnsResolver>> = HashMap::new();
-    let root_store = Arc::new(ech::webpki_root_store());
 
     // Topological order so each resolver's dependencies are already built.
     let order = cfg.resolver_build_order()?;
@@ -1192,11 +1230,13 @@ async fn build_named_resolvers(
                     require_ech: eff.require_ech,
                     refresh: eff.ech_refresh,
                     resolver: ech_resolver,
-                    root_store: root_store.clone(),
                     max_retries: e_settings.max_retries,
                 })
             })
             .transpose()?;
+
+        // What the endpoint's certificate must prove about the server name.
+        let verify = verifiers.get(&eff.verify, &format!("[resolvers.{name}]"))?;
 
         let plan = Arc::new(dns_resolvers::ResolverPlan {
             // `eff.name` is the declared name, carried through by
@@ -1211,6 +1251,7 @@ async fn build_named_resolvers(
             nat64,
             connect_timeout: eff.connect_timeout,
             bootstrap,
+            verify,
             ech,
         });
 

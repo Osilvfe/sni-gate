@@ -49,7 +49,6 @@ use hickory_resolver::lookup::Lookup;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::TokioResolver;
-use rustls::RootCertStore;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -57,6 +56,7 @@ use crate::config::{AddressFamily, EffectiveEch};
 use crate::dns;
 use crate::ech::{self, ResolverEch};
 use crate::nat64::Nat64Prefix;
+use crate::verify::UpstreamVerify;
 
 // ---------------------------------------------------------------------------
 // Endpoint: the transport, parsed without touching the network
@@ -250,8 +250,12 @@ pub struct ResolverPlan {
     pub server_name: Option<String>,
     /// Whether to send a `server_name` extension at all. False only when
     /// `override_sni = ""`; the certificate is still verified against
-    /// `server_name`.
+    /// `server_name`, under the policy in `verify`.
     pub enable_sni: bool,
+    /// What the endpoint's certificate must prove. Only consulted for a TLS
+    /// transport (DoH/DoT); the default policy is full web-PKI verification
+    /// against `server_name`.
+    pub verify: Arc<UpstreamVerify>,
     /// Address family used when resolving `dial_host`.
     pub family: AddressFamily,
     pub nat64: Option<Nat64Prefix>,
@@ -276,7 +280,6 @@ pub struct EchPlan {
     pub refresh: Duration,
     /// Resolver performing this resolver's own HTTPS-record lookup.
     pub resolver: Arc<DnsResolver>,
-    pub root_store: Arc<RootCertStore>,
     /// Bound on reactive rebuild-and-retry attempts per lookup.
     pub max_retries: u32,
 }
@@ -749,16 +752,12 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
     // --- 5. TLS config, injected only when we need to change it ---
     //
     // hickory's default TLS config already has sensible roots and ALPN. We
-    // replace it only to add ECH or to suppress the SNI extension, so an
+    // replace it only to add ECH, to suppress the SNI extension, or to apply a
+    // verification policy that is not simply "the web-PKI roots" — so an
     // ordinary DoH/DoT resolver keeps hickory's own defaults.
     if plan.endpoint.is_tls() {
-        let needs_custom = plan.ech.is_some() || !plan.enable_sni;
+        let needs_custom = plan.ech.is_some() || !plan.enable_sni || !plan.verify.is_default();
         if needs_custom {
-            let root_store = plan
-                .ech
-                .as_ref()
-                .map(|e| e.root_store.clone())
-                .unwrap_or_else(|| Arc::new(ech::webpki_root_store()));
             let mode = match (&plan.ech, ech_bytes.as_deref()) {
                 (Some(_), Some(b)) => ResolverEch::Config(b),
                 // ECH opted into but nothing published, and `require_ech` is
@@ -767,7 +766,7 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
                 (Some(_), None) => ResolverEch::Grease,
                 (None, _) => ResolverEch::Disabled,
             };
-            let tls = ech::resolver_client_config(mode, plan.enable_sni, &root_store)
+            let tls = ech::resolver_client_config(mode, plan.enable_sni, &plan.verify)
                 .with_context(|| format!("[resolvers.{}]: building the TLS config", plan.label))?;
             // ALPN is deliberately left empty: hickory sets `h2` itself for DoH
             // when the injected config does not specify one, so leaving it unset
@@ -786,6 +785,7 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
         dial = ?dial_ip.map(|ip| SocketAddr::new(ip, plan.dial_port)),
         server_name = ?plan.server_name,
         ech = ech_bytes.is_some(),
+        verify = plan.verify.label(),
         "built resolver"
     );
 

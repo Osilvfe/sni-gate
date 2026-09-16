@@ -161,6 +161,139 @@ target; it only sets the upstream TLS server name for `tls`/`ech`. A connection
 routed to a reflecting route that carries no SNI/Host is closed (there is
 nothing to reflect).
 
+## Upstream certificate verification
+
+A terminating route re-originates the connection, so it decides for itself what
+the upstream must prove. By default the upstream's certificate must chain to the
+web-PKI roots **and** be valid for the name the route asked for. That is what
+almost every route should keep.
+
+It is not always satisfiable, and the reason is structural. This gateway
+deliberately separates three things a browser keeps welded together: **who we
+dial** (`upstream`), **what name we transmit** (`override_sni`), and **what name
+we trust**. Once the second has moved, the third no longer follows from it. A
+route with `override_sni = ""` sends no SNI at all, so the upstream answers with
+its **default** certificate — issued for whatever name its operator chose, not
+for the one the client asked for:
+
+```
+upstream TLS handshake: invalid peer certificate: certificate not valid for name
+"fra-storage.example.com"; certificate is only valid for DnsName("*.example.net")
+```
+
+The handshake is sound; it simply does not prove the proposition the default
+policy checks. `[verify]` is where that proposition is stated.
+
+```toml
+  [[listener.route]]
+  match_sni = [".example.com"]
+  type = "tls"
+  override_sni = ""                 # send no SNI
+    [listener.route.verify]
+    name = "default.example.net"    # verify against what the upstream really serves
+```
+
+### `mode`
+
+| `mode`    | chains to a trust anchor | certificate name checked |
+|-----------|--------------------------|--------------------------|
+| `"full"`  | yes                      | yes — **the default**    |
+| `"chain"` | yes                      | no                       |
+| `"none"`  | no                       | no                       |
+
+### Two fields worth preferring over a weaker mode
+
+- **`name`** — verify against a *different* name, still in `full` mode. Chain,
+  expiry and name are all enforced; only the subject of the claim moves. This is
+  the right answer whenever the upstream serves a stable default certificate.
+  Route scope only (the route's own block or the template it `use`s), like
+  `upstream` — it describes one upstream's certificate, so writing it in
+  `[global]` or on a listener is a load-time error.
+- **`pins`** — SPKI pins, `sha256/<base64>`, the same spelling as
+  `curl --pinnedpubkey`. The upstream's end-entity public key must match one of
+  them **in addition** to whatever `mode` requires; a pin binds the peer to one
+  key, which no CA and no name can be substituted for. Pins are the only
+  assurance left under `mode = "none"`, so a pinned `none` is reported as
+  information while an unpinned one is a warning. Written as a whole list: a
+  deeper scope *replaces* the inherited set rather than adding to it.
+
+```toml
+    [listener.route.verify]
+    mode = "none"
+    pins = ["sha256/YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2Fuihg="]
+```
+
+Get a pin the same way curl documents it:
+
+```sh
+openssl s_client -connect host:443 -servername host </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout \
+  | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | base64
+```
+
+### Private CAs
+
+`ca_file` adds trust anchors from a PEM bundle, and `trust_webpki = false`
+narrows trust to *only* those anchors (it therefore requires a `ca_file`).
+
+```toml
+    [listener.route.verify]
+    ca_file = "corp-root.pem"
+    trust_webpki = false
+```
+
+### Where it can be written
+
+`[verify]` inherits field-by-field along the usual ladder (see [Hierarchical
+configuration](#hierarchical-configuration)), and also applies to the two other
+places this gateway performs a TLS handshake of its own:
+
+| scope                     | applies to                                        |
+|---------------------------|---------------------------------------------------|
+| `[global.verify]`         | every TLS upstream in the document                |
+| `[listener.verify]`       | that listener's routes                            |
+| `[templates.<n>.verify]`  | whatever `use`s the template                      |
+| `[listener.route.verify]` | one route — deepest scope, wins over all above    |
+| `[resolvers.<n>.verify]`  | that resolver's own DoH/DoT endpoint certificate  |
+| `[pools.<n>.probe.verify]`| that pool's `tls` / `https://` probe              |
+
+A resolver's and a pool probe's blocks inherit from `[global.verify]` only; they
+are top-level objects with no listener or route above them. A pool probe is
+verified **separately from the routes that use the pool** — the probe measures
+its own connection, so weakening a route does not weaken its pool's probing, and
+a probe against an edge that answers an unmatched name needs its own `[verify]`.
+
+Anything the active configuration cannot act on is refused by name at load time
+rather than ignored: `[verify]` on an `http` or `raw` route (neither verifies a
+certificate — a `raw` stream is spliced untouched, so the *client* sees the
+upstream's certificate), on a plain-DNS resolver, or on a `tcp`/cleartext probe;
+`name` with a mode that checks no name; `ca_file` or `trust_webpki` with
+`mode = "none"`, which builds no chain at all.
+
+### What a weakened policy does to mirrored coverage
+
+Nothing is switched off, but the policy becomes part of the route's
+[certificate scope](#certificate-scopes). Mirroring keeps working in every mode
+— a route under `mode = "none"` still learns its upstream's coverage and still
+gets connection coalescing — and what changes is *who it is shared with*: only
+names held to the **same** policy against the **same** destination. So coverage
+learned from an unauthenticated peer can never reach a certificate that a fully
+verified route serves, and a client can never coalesce a strictly verified name
+onto a connection whose far end was never checked.
+
+Editing a `[verify]` block therefore moves the partition: the route starts a new
+`certs/<scope>/` directory and re-learns coverage under the policy now in force,
+rather than re-serving what it learned under the old one.
+
+Every scope that resolves a weakened policy says so at startup, `INFO` when a
+real assurance remains and `WARN` when none does:
+
+```
+WARN upstream certificate names are NOT checked: any certificate a public CA has
+     issued for any name is accepted here [...] scope="route web" policy=chain
+```
+
 ## Certificate coverage
 
 How much a certificate covers is **not configurable**. Guessing it is what breaks
@@ -176,15 +309,16 @@ for.
 **Then mirror what the upstream presented.** When a TLS-terminating route hands
 the connection to a TLS/ECH upstream, the upstream's leaf is read as part of the
 handshake that was happening anyway — no extra probe, no blocking — and its DNS
-SANs become this gateway's coverage for that host. If `cf.example.net` answers a
-handshake for `qy0.ru` with `{qy0.ru, mzz.qy0.ru}`, that is exactly what the
-client is served, so `t4.qy0.ru` cannot coalesce onto it. If the same upstream
-answers a handshake for `t4.qy0.ru` with `{qy0.ru, *.qy0.ru}`, that connection
+SANs become this gateway's coverage for that host. If `edge.example.net` answers
+a handshake for `origin.example` with `{origin.example, mzz.origin.example}`,
+that is exactly what the client is served, so `t4.origin.example` cannot
+coalesce onto it. If the same upstream answers a handshake for
+`t4.origin.example` with `{origin.example, *.origin.example}`, that connection
 does carry the wildcard — coalescing is preserved precisely where the upstream
 accepts it.
 
 Observed SANs are keyed by the **requested** name, so a set learned for
-`t4.qy0.ru` is never served to a client asking for `qy0.ru`.
+`t4.origin.example` is never served to a client asking for `origin.example`.
 
 **Rotation is handled by comparing every handshake.** The raw observed set is
 stored alongside the certificate. When a later handshake presents a different set
@@ -244,11 +378,12 @@ A **scope** is a set of names that may share a certificate. Two routes share one
 when they forward identically *and* are matched by the same routing table:
 
 - **Forwarding target** — route type, dial host (or the reflecting marker), port,
-  `override_sni` policy, `address_family`, `nat64_prefix`, `addr_resolver`, and
-  the ECH config source. Everything that decides where a connection goes and under
-  what name it is presented. Settings that cannot change the destination
-  (timeouts, `fail`, the HTTP/2 switch, `ech_refresh`) are excluded: they would
-  fragment scopes without buying safety.
+  `override_sni` policy, `address_family`, `nat64_prefix`, `addr_resolver`, the
+  ECH config source, and the [`[verify]` policy](#upstream-certificate-verification).
+  Everything that decides where a connection goes, under what name it is
+  presented, and what the far end had to prove. Settings that can change none of
+  those three (timeouts, `fail`, the HTTP/2 switch, `ech_refresh`) are excluded:
+  they would fragment scopes without buying safety.
 - **Routing table** — a fingerprint of the listener's routes. A wildcard proven
   confined under one listener's routes may not be confined under another's, so a
   proof is only ever reused where it still holds. Listeners with identical route
@@ -267,12 +402,16 @@ demultiplexes on `:authority` as any origin does. Nothing needs to be turned off
 to stay safe — a host whose upstream has not been observed is served an exact
 certificate, and an upstream that never presents a wildcard never yields one.
 
+Because the verification policy is part of the scope, "the same destination" also
+means "proven the same way". A route that verifies less keeps mirroring; it
+simply shares what it learned with fewer names.
+
 Every mirroring decision is logged at `INFO`, including each name clipping
 dropped:
 
 ```
 mirrored upstream certificate coverage (clipped to this route scope)
-  scope=ech_cf.0sm.com_443-1f3a9c07b2d45e18 host=t4.example.com
+  scope=ech_edge.example.net_443-1f3a9c07b2d45e18 host=t4.example.com
   sans=["t4.example.com", "example.com"] dropped=["*.example.com"]
 ```
 
@@ -310,6 +449,13 @@ single route while everything else inherits the global value.
 The **`[http2]` block** inherits field-by-field along this same ladder, so
 `enabled` / `probe` / `probe_timeout` each resolve independently — see
 [HTTP/2](#http2).
+
+The **`[verify]` block** (see [Upstream certificate
+verification](#upstream-certificate-verification)) inherits the same way, so
+`mode` / `pins` / `ca_file` / `trust_webpki` each resolve independently and a
+route can relax one of them without restating the rest. Its `name` is the one
+exception: it resolves only from the route's own block and the template that
+route `use`s, because it describes a single upstream's certificate.
 
 The entire **`[ech]` block inherits field-by-field along the same ladder**:
 `mode`, `config`, `ech_domain`, `max_retries` (and `require_ech` / `ech_refresh`
@@ -883,6 +1029,13 @@ their trusted-root store.
 - Terminating TLS means sni-gate sees plaintext for terminating route types.
 - Binding to 443/80 requires elevated privileges: Administrator on Windows,
   root/sudo on macOS/Linux.
+- Upstream certificates are fully verified unless you say otherwise. A
+  [`[verify]`](#upstream-certificate-verification) block that weakens this is
+  reported at startup, and it is worth understanding what it costs: the client
+  still sees a certificate this gateway's CA signed, so it cannot tell that the
+  far end was not checked. `verify.name` and `verify.pins` both keep a real
+  assurance in place and are almost always the better answer than
+  `mode = "chain"` or `"none"`.
 
 ## Logging
 

@@ -38,15 +38,22 @@
 //! * **Mirror what was observed, per requested name.** SANs are learned from the
 //!   upstream handshake that the *same* SNI produced, and recorded against that
 //!   SNI ([`DynamicResolver::record_upstream_sans`]). A CDN commonly answers two
-//!   sibling names with two *different* certificates — `cf.0sm.com` returns
-//!   `{qy0.ru, mzz.qy0.ru}` for `qy0.ru` but `{qy0.ru, *.qy0.ru}` for
-//!   `t4.qy0.ru` — so what was learned for one name must never be served for the
-//!   other. Keying the cache by the exact SNI is what prevents that.
+//!   sibling names with two *different* certificates — `edge.example.net`
+//!   returns `{origin.example, mzz.origin.example}` for `origin.example`, but
+//!   `{origin.example, *.origin.example}` for `t4.origin.example` — so what was
+//!   learned for one name must never be served for the other. Keying the cache
+//!   by the exact SNI is what prevents that.
 //! * **Clip to this listener's routes.** An upstream SAN is adopted only if every
 //!   host it covers routes back into the requesting connection's certificate
 //!   scope. The upstream is authoritative about what *it* will serve; it knows
 //!   nothing about how this gateway routes, and a name it happens to cover may be
 //!   configured here to go somewhere else entirely.
+//!
+//! What the upstream had to *prove* before any of this is the route's `[verify]`
+//! policy, and it is not a fourth rule here: it is part of the certificate scope
+//! ([`crate::certscope`]), so the second and third rules already confine an
+//! observation to names held to the same policy. A route that verifies less
+//! therefore still mirrors — it simply shares what it learned with fewer names.
 //!
 //! # Rotation
 //!
@@ -769,7 +776,7 @@ impl ResolvesServerCert for DynamicResolver {
 mod tests {
     use super::*;
     use crate::certscope::{CertScope, Forwarding, UpstreamIdentity};
-    use crate::config::{AddressFamily, RouteType, SniPolicy};
+    use crate::config::{AddressFamily, EffectiveVerify, RouteType, SniPolicy};
     use crate::router::Escape;
 
     fn scope(port: u16) -> CertScope {
@@ -786,6 +793,7 @@ mod tests {
                 port,
                 sni: SniPolicy::Reflect,
                 ech: None,
+                verify: EffectiveVerify::default(),
             },
         )
     }
@@ -932,40 +940,46 @@ mod tests {
 
     #[test]
     fn a_siblings_wildcard_is_never_served_for_the_apex() {
-        // The exact shape of the reported failure. One upstream (`cf.0sm.com`)
+        // The exact shape of the reported failure. One upstream (`edge.example.net`)
         // answers two names with two different certificates:
         //
-        //   qy0.ru    -> {qy0.ru, mzz.qy0.ru}     (no wildcard)
-        //   t4.qy0.ru -> {qy0.ru, *.qy0.ru}       (wildcard)
+        //   origin.example    -> {origin.example, mzz.origin.example}     (no wildcard)
+        //   t4.origin.example -> {origin.example, *.origin.example}       (wildcard)
         //
-        // Serving t4's wildcard for a `qy0.ru` connection would let the browser
-        // coalesce `t4.qy0.ru` onto it; the upstream then sees an `:authority`
+        // Serving t4's wildcard for a `origin.example` connection would let the browser
+        // coalesce `t4.origin.example` onto it; the upstream then sees an `:authority`
         // its own handshake certificate never authorized, and answers 403.
         //
         // One scope, so routing permits sharing — the *upstream observation* is
         // the only thing keeping them apart, which is precisely the claim.
         let scopes = [scope(443)];
-        let r = resolver(&[vec![".qy0.ru".into()]], None, &scopes);
+        let r = resolver(&[vec![".origin.example".into()]], None, &scopes);
 
-        r.record_upstream_sans("t4.qy0.ru", &sans(&["qy0.ru", "*.qy0.ru"]));
-        r.record_upstream_sans("qy0.ru", &sans(&["qy0.ru", "mzz.qy0.ru"]));
+        r.record_upstream_sans(
+            "t4.origin.example",
+            &sans(&["origin.example", "*.origin.example"]),
+        );
+        r.record_upstream_sans(
+            "origin.example",
+            &sans(&["origin.example", "mzz.origin.example"]),
+        );
 
-        let apex = issued_sans(&r.get_or_issue("qy0.ru", 0).unwrap());
+        let apex = issued_sans(&r.get_or_issue("origin.example", 0).unwrap());
         assert!(
-            !apex.iter().any(|s| s == "*.qy0.ru"),
+            !apex.iter().any(|s| s == "*.origin.example"),
             "the apex must not inherit the sibling's wildcard, got {apex:?}"
         );
         assert!(
-            !host_covered_by(&apex, "t4.qy0.ru"),
-            "the apex certificate must not be valid for t4.qy0.ru, got {apex:?}"
+            !host_covered_by(&apex, "t4.origin.example"),
+            "the apex certificate must not be valid for t4.origin.example, got {apex:?}"
         );
-        assert!(host_covered_by(&apex, "qy0.ru"), "got {apex:?}");
+        assert!(host_covered_by(&apex, "origin.example"), "got {apex:?}");
 
         // And the sibling keeps the coverage its own upstream really granted, so
         // legitimate coalescing is not sacrificed to fix the illegitimate kind.
-        let sub = issued_sans(&r.get_or_issue("t4.qy0.ru", 0).unwrap());
+        let sub = issued_sans(&r.get_or_issue("t4.origin.example", 0).unwrap());
         assert!(
-            sub.iter().any(|s| s == "*.qy0.ru"),
+            sub.iter().any(|s| s == "*.origin.example"),
             "the sibling must keep the wildcard its upstream returned, got {sub:?}"
         );
     }
