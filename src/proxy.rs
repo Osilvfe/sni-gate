@@ -54,13 +54,15 @@ use crate::router::Router;
 use crate::verify::UpstreamVerify;
 
 const COPY_BUF_SIZE: usize = 64 * 1024;
+/// Bound one client connection's live failover work even when a pool is huge.
+const MAX_POOL_CONNECT_ATTEMPTS: usize = 3;
 
 /// Where a route's connections go, and what turns that into an address.
 ///
 /// The two cases are settled by different machinery, so they carry different
 /// data: a direct upstream is resolved per connection through this route's own
 /// resolver, family and NAT64 prefix, while a pool has already resolved, probed
-/// and ranked its endpoints and simply hands over the current best one.
+/// and ranked its endpoints and hands over a bounded prefix of that ranking.
 pub enum Upstream {
     Direct {
         /// Fixed upstream host, or `None` to reflect the matched source SNI/Host
@@ -71,7 +73,7 @@ pub enum Upstream {
         /// DNS resolver for upstream A/AAAA.
         resolver: Arc<crate::dns_resolvers::DnsResolver>,
     },
-    /// A pool's current best endpoint for this route's view.
+    /// A pool's current ranked endpoints for this route's view.
     Pool(PoolHandle),
 }
 
@@ -93,8 +95,14 @@ impl Upstream {
         }
     }
 
-    /// The address to dial on `port`.
-    async fn resolve(&self, port: u16, dial_host: Option<&str>, route: &str) -> Result<SocketAddr> {
+    /// Resolve this connection's dial plan. Direct upstreams contain one
+    /// address; pools expose a bounded prefix of their published ranking.
+    async fn resolve<'a>(
+        &'a self,
+        port: u16,
+        dial_host: Option<&str>,
+        route: &str,
+    ) -> Result<DialPlan<'a>> {
         match self {
             Upstream::Direct {
                 family,
@@ -104,21 +112,76 @@ impl Upstream {
             } => {
                 let host = dial_host.ok_or_else(|| {
                     anyhow!(
-                        "route {route} reflects the source SNI/Host upstream, but the \
-                         connection presented none"
+                        "route {route} reflects the source SNI/Host upstream, but the                          connection presented none"
                     )
                 })?;
-                resolver
+                let addr = resolver
                     .lookup_addr(host, port, *family, nat64.as_ref())
                     .await
-                    .with_context(|| format!("resolving upstream {host}"))
+                    .with_context(|| format!("resolving upstream {host}"))?;
+                Ok(DialPlan {
+                    candidates: vec![addr],
+                    pool: None,
+                })
             }
-            // No I/O and no DNS: the probe task already decided. A failure here
-            // means every candidate is degraded and no fallback is usable, which
-            // the route's fail policy then handles.
-            Upstream::Pool(handle) => handle
-                .pick(port)
-                .with_context(|| format!("route {route}: selecting a pool endpoint")),
+            Upstream::Pool(handle) => {
+                let candidates = handle
+                    .candidates(port, MAX_POOL_CONNECT_ATTEMPTS)
+                    .with_context(|| format!("route {route}: selecting pool endpoints"))?;
+                Ok(DialPlan {
+                    candidates,
+                    pool: Some(handle),
+                })
+            }
+        }
+    }
+}
+
+/// One immutable per-connection snapshot of where an upstream may be reached.
+/// Keeping it through an ECH retry preserves the old "resolve once" behavior.
+struct DialPlan<'a> {
+    candidates: Vec<SocketAddr>,
+    pool: Option<&'a PoolHandle>,
+}
+
+impl DialPlan<'_> {
+    async fn connect(
+        &self,
+        connect_timeout: Duration,
+        route: &str,
+    ) -> Result<(SocketAddr, TcpStream)> {
+        let mut last_error = None;
+        for (index, addr) in self.candidates.iter().copied().enumerate() {
+            match dial(addr, connect_timeout).await {
+                Ok(stream) => return Ok((addr, stream)),
+                Err(e) => {
+                    if let Some(pool) = self.pool {
+                        pool.report_connect_failure(addr);
+                    }
+                    if index + 1 < self.candidates.len() {
+                        debug!(
+                            route,
+                            candidate = %addr,
+                            attempt = index + 1,
+                            total = self.candidates.len(),
+                            error = %format!("{e:#}"),
+                            "upstream TCP connect failed; trying next pool candidate"
+                        );
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+        let err = last_error.unwrap_or_else(|| anyhow!("route {route}: no upstream candidates"));
+        if let Some(pool) = self.pool {
+            Err(err).with_context(|| {
+                format!(
+                    "route {route}: every tried candidate in pool {} failed to connect",
+                    pool.name()
+                )
+            })
+        } else {
+            Err(err)
         }
     }
 }
@@ -515,7 +578,7 @@ async fn serve_mirrored(
     // What the client is willing to speak, narrowed to what we can splice.
     let client_offer = negotiable_alpn(start.client_hello().alpn().map(Iterator::collect));
 
-    let upstream_addr = rt
+    let upstream = rt
         .upstream
         .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
         .await?;
@@ -524,11 +587,12 @@ async fn serve_mirrored(
     let up = match rt.route_type {
         RouteType::Tls => {
             let name = tls_verification_name(rt, &sni, dial_host.as_deref())?;
-            dial_tls(upstream_addr, &name, rt, &client_offer).await?
+            let (_, tcp) = upstream.connect(rt.connect_timeout, &rt.name).await?;
+            dial_tls(tcp, &name, rt, &client_offer).await?
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
-            dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
+            dial_ech(&upstream, &inner, peer, rt, &client_offer).await?
         }
         RouteType::Http | RouteType::Raw => {
             unreachable!("mirroring only applies to tls/ech routes")
@@ -583,14 +647,14 @@ async fn forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let upstream_addr = rt
+    let upstream = rt
         .upstream
         .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
         .await?;
 
     match rt.route_type {
         RouteType::Http => {
-            let up = dial(upstream_addr, rt.connect_timeout).await?;
+            let (_, up) = upstream.connect(rt.connect_timeout, &rt.name).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
         // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
@@ -598,7 +662,8 @@ where
         // and let it default to HTTP/1.1 too, exactly as before.
         RouteType::Tls => {
             let name = tls_verification_name(rt, &sni, dial_host.as_deref())?;
-            let up = dial_tls(upstream_addr, &name, rt, &[]).await?;
+            let (_, tcp) = upstream.connect(rt.connect_timeout, &rt.name).await?;
+            let up = dial_tls(tcp, &name, rt, &[]).await?;
             // HTTP/2 is off for this connection, so it cannot coalesce — but a
             // later connection for the same name can, and this is a free look at
             // what the upstream's certificate covers.
@@ -607,7 +672,7 @@ where
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
-            let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
+            let up = dial_ech(&upstream, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
             splice(inbound, up, rt.idle_timeout).await
         }
@@ -705,13 +770,12 @@ async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> 
 /// Dial a plain-TLS upstream, verifying the presented `server_name` and offering
 /// `alpn` (empty = no ALPN extension).
 ///
-/// `server_name` is the name the handshake requests. Whether it is **sent** as
-/// an SNI extension depends on the route's [`SniPolicy`] (`Omit` clears
-/// `enable_sni` on every prebuilt config), and what the certificate must prove
-/// about it depends on the route's `[verify]` policy — by default that it is
-/// valid for exactly this name under the web PKI.
+/// `server_name` is always used to **verify** the upstream certificate. Whether
+/// it is also **sent** as an SNI extension depends on the route's
+/// [`SniPolicy`]: `Omit` clears `enable_sni`, so the handshake carries no
+/// `server_name` while the certificate is still checked against that name.
 async fn dial_tls(
-    addr: SocketAddr,
+    tcp: TcpStream,
     server_name: &str,
     rt: &RouteRuntime,
     alpn: &[Vec<u8>],
@@ -723,7 +787,6 @@ async fn dial_tls(
     let connector = TlsConnector::from(configs.select(alpn).clone());
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid upstream SNI {server_name:?}"))?;
-    let tcp = dial(addr, rt.connect_timeout).await?;
     let tls = timeout(rt.connect_timeout, connector.connect(name, tcp))
         .await
         .map_err(|_| anyhow!("upstream TLS handshake timed out"))?
@@ -733,7 +796,7 @@ async fn dial_tls(
 
 /// Dial an ECH upstream for `inner` offering `alpn`, with retry on ECH rejection.
 async fn dial_ech(
-    addr: SocketAddr,
+    upstream: &DialPlan<'_>,
     inner: &str,
     peer: SocketAddr,
     rt: &RouteRuntime,
@@ -755,7 +818,7 @@ async fn dial_ech(
             .context("assembling ECH client config")?;
         let generation = client.generation;
         let connector = TlsConnector::from(client.client_config.clone());
-        let tcp = dial(addr, rt.connect_timeout).await?;
+        let (_, tcp) = upstream.connect(rt.connect_timeout, &rt.name).await?;
 
         match timeout(rt.connect_timeout, connector.connect(name.clone(), tcp)).await {
             Ok(Ok(tls)) => {
@@ -885,11 +948,14 @@ async fn raw_passthrough(
     dial_host: Option<String>,
 ) -> Result<()> {
     let dialed = async {
-        let upstream_addr = rt
+        let upstream = rt
             .upstream
             .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
             .await?;
-        dial(upstream_addr, rt.connect_timeout).await
+        upstream
+            .connect(rt.connect_timeout, &rt.name)
+            .await
+            .map(|(_, stream)| stream)
     }
     .await;
 
@@ -1012,6 +1078,29 @@ mod tests {
 
         upstream_task.await.unwrap();
         spliced.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_plan_fails_over_after_tcp_connect_error() {
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let accepted = tokio::spawn(async move {
+            let _ = live.accept().await.unwrap();
+        });
+        let plan = DialPlan {
+            candidates: vec![dead_addr, live_addr],
+            pool: None,
+        };
+        let (chosen, _stream) = plan
+            .connect(Duration::from_millis(500), "test")
+            .await
+            .unwrap();
+        assert_eq!(chosen, live_addr);
+        accepted.await.unwrap();
     }
 
     #[test]
