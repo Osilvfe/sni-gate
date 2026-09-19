@@ -31,6 +31,7 @@
 //!   speaks h2c, but never silently downgrades the route.
 
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
 use crate::config::{AddressFamily, FailPolicy, RouteType, SniPolicy};
+use crate::dns::ResolvedAddrs;
 use crate::ech::EchProvider;
 use crate::nat64::Nat64Prefix;
 use crate::peek::{classify, Inbound};
@@ -93,8 +95,14 @@ impl Upstream {
         }
     }
 
-    /// The address to dial on `port`.
-    async fn resolve(&self, port: u16, dial_host: Option<&str>, route: &str) -> Result<SocketAddr> {
+    /// Where to dial on `port` — both address families when the upstream
+    /// publishes both, for [`dial`] to race.
+    async fn resolve(
+        &self,
+        port: u16,
+        dial_host: Option<&str>,
+        route: &str,
+    ) -> Result<ResolvedAddrs> {
         match self {
             Upstream::Direct {
                 family,
@@ -116,8 +124,13 @@ impl Upstream {
             // No I/O and no DNS: the probe task already decided. A failure here
             // means every candidate is degraded and no fallback is usable, which
             // the route's fail policy then handles.
+            //
+            // One address, deliberately: a pool has already ranked every
+            // candidate across both families, so racing two of them here would
+            // second-guess that ranking with a measurement it cannot see.
             Upstream::Pool(handle) => handle
                 .pick(port)
+                .map(ResolvedAddrs::single)
                 .with_context(|| format!("route {route}: selecting a pool endpoint")),
         }
     }
@@ -515,7 +528,7 @@ async fn serve_mirrored(
     // What the client is willing to speak, narrowed to what we can splice.
     let client_offer = negotiable_alpn(start.client_hello().alpn().map(Iterator::collect));
 
-    let upstream_addr = rt
+    let upstream_addrs = rt
         .upstream
         .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
         .await?;
@@ -524,11 +537,11 @@ async fn serve_mirrored(
     let up = match rt.route_type {
         RouteType::Tls => {
             let name = tls_verification_name(rt, &sni, dial_host.as_deref())?;
-            dial_tls(upstream_addr, &name, rt, &client_offer).await?
+            dial_tls(upstream_addrs, &name, rt, &client_offer).await?
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
-            dial_ech(upstream_addr, &inner, peer, rt, &client_offer).await?
+            dial_ech(upstream_addrs, &inner, peer, rt, &client_offer).await?
         }
         RouteType::Http | RouteType::Raw => {
             unreachable!("mirroring only applies to tls/ech routes")
@@ -583,14 +596,14 @@ async fn forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let upstream_addr = rt
+    let upstream_addrs = rt
         .upstream
         .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
         .await?;
 
     match rt.route_type {
         RouteType::Http => {
-            let up = dial(upstream_addr, rt.connect_timeout).await?;
+            let up = dial(upstream_addrs, rt.connect_timeout).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
         // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
@@ -598,7 +611,7 @@ where
         // and let it default to HTTP/1.1 too, exactly as before.
         RouteType::Tls => {
             let name = tls_verification_name(rt, &sni, dial_host.as_deref())?;
-            let up = dial_tls(upstream_addr, &name, rt, &[]).await?;
+            let up = dial_tls(upstream_addrs, &name, rt, &[]).await?;
             // HTTP/2 is off for this connection, so it cannot coalesce — but a
             // later connection for the same name can, and this is a free look at
             // what the upstream's certificate covers.
@@ -607,7 +620,7 @@ where
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
-            let up = dial_ech(upstream_addr, &inner, peer, rt, &[]).await?;
+            let up = dial_ech(upstream_addrs, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
             splice(inbound, up, rt.idle_timeout).await
         }
@@ -692,14 +705,104 @@ fn silent_name_override(rt: &RouteRuntime) -> Option<&str> {
     rt.verify.as_ref()?.name_override()
 }
 
-/// Plain TCP dial with a timeout.
-async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> {
-    let up = timeout(connect_timeout, TcpStream::connect(addr))
-        .await
-        .map_err(|_| anyhow!("upstream connect timed out"))?
-        .with_context(|| format!("connecting to {addr}"))?;
-    up.set_nodelay(true).ok();
-    Ok(up)
+/// RFC 8305 §5 "Connection Attempt Delay": how long the first address family
+/// gets to itself before the second starts alongside it.
+///
+/// The RFC's recommended value. What matters is that it is far shorter than a
+/// TCP SYN timeout, so a family whose packets are silently dropped costs this
+/// much instead of the whole connect budget.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// Plain TCP dial, bounded as a whole by `connect_timeout`.
+///
+/// With two address families available this is a Happy Eyeballs race (RFC 8305)
+/// rather than a try-then-fall-back: the primary gets [`ATTEMPT_DELAY`] alone,
+/// then the alternative starts in parallel and the first connection to complete
+/// wins. Racing is what covers the failure that actually matters — a host with
+/// no working IPv6 route usually *blackholes* the SYN rather than refusing it,
+/// so there is no error to trigger a fallback on and an error-driven one would
+/// sit out the entire timeout before trying the address that would have worked.
+///
+/// `connect_timeout` bounds the race, not each attempt, so a route's configured
+/// budget stays its real worst case.
+async fn dial(addrs: ResolvedAddrs, connect_timeout: Duration) -> Result<TcpStream> {
+    let stream = match addrs.fallback {
+        None => timeout(connect_timeout, TcpStream::connect(addrs.primary))
+            .await
+            .map_err(|_| anyhow!("upstream connect to {} timed out", addrs.primary))?
+            .with_context(|| format!("connecting to {}", addrs.primary))?,
+        Some(fallback) => {
+            let race = race_families(addrs.primary, fallback);
+            timeout(connect_timeout, race).await.map_err(|_| {
+                anyhow!(
+                    "upstream connect timed out (raced {} and {fallback})",
+                    addrs.primary
+                )
+            })??
+        }
+    };
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+/// Race two addresses of the same upstream and return the first socket to
+/// connect, per RFC 8305.
+///
+/// Deliberately unbounded in time: the caller owns the budget, and applying one
+/// here as well would make the two attempts cost twice what the route asked for.
+/// The loser's in-flight connect is cancelled by dropping its future.
+async fn race_families(primary: SocketAddr, fallback: SocketAddr) -> Result<TcpStream> {
+    let mut primary_fut = pin!(TcpStream::connect(primary));
+
+    // The head start. A primary that fails inside it does not get to hold the
+    // alternative back for the remainder — the delay bounds how long we wait on
+    // silence, not on an answer.
+    let mut primary_err = {
+        let delay = pin!(tokio::time::sleep(ATTEMPT_DELAY));
+        tokio::select! {
+            biased;
+            r = &mut primary_fut => match r {
+                Ok(stream) => return Ok(stream),
+                Err(e) => Some(e),
+            },
+            () = delay => None,
+        }
+    };
+
+    // `primary_err` distinguishes the two ways the head start can end, and they
+    // mean different things to whoever reads this: an error is a host with no
+    // route to that family, silence is a path that drops packets.
+    debug!(
+        %primary,
+        %fallback,
+        ?primary_err,
+        "primary did not connect first; racing the second address family"
+    );
+    let mut fallback_fut = pin!(TcpStream::connect(fallback));
+    let mut fallback_err: Option<std::io::Error> = None;
+
+    loop {
+        if let (Some(pe), Some(fe)) = (&primary_err, &fallback_err) {
+            return Err(anyhow!(
+                "connecting to {primary} ({pe}) and {fallback} ({fe})"
+            ));
+        }
+        // `biased` keeps the primary family preferred when both are ready in the
+        // same poll, which is the tie-break RFC 6724 already made at resolution.
+        // Each arm is disabled once its future has completed, so neither is
+        // polled after returning `Ready`.
+        tokio::select! {
+            biased;
+            r = &mut primary_fut, if primary_err.is_none() => match r {
+                Ok(stream) => return Ok(stream),
+                Err(e) => primary_err = Some(e),
+            },
+            r = &mut fallback_fut, if fallback_err.is_none() => match r {
+                Ok(stream) => return Ok(stream),
+                Err(e) => fallback_err = Some(e),
+            },
+        }
+    }
 }
 
 /// Dial a plain-TLS upstream, verifying the presented `server_name` and offering
@@ -711,7 +814,7 @@ async fn dial(addr: SocketAddr, connect_timeout: Duration) -> Result<TcpStream> 
 /// about it depends on the route's `[verify]` policy — by default that it is
 /// valid for exactly this name under the web PKI.
 async fn dial_tls(
-    addr: SocketAddr,
+    addrs: ResolvedAddrs,
     server_name: &str,
     rt: &RouteRuntime,
     alpn: &[Vec<u8>],
@@ -723,7 +826,7 @@ async fn dial_tls(
     let connector = TlsConnector::from(configs.select(alpn).clone());
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid upstream SNI {server_name:?}"))?;
-    let tcp = dial(addr, rt.connect_timeout).await?;
+    let tcp = dial(addrs, rt.connect_timeout).await?;
     let tls = timeout(rt.connect_timeout, connector.connect(name, tcp))
         .await
         .map_err(|_| anyhow!("upstream TLS handshake timed out"))?
@@ -733,7 +836,7 @@ async fn dial_tls(
 
 /// Dial an ECH upstream for `inner` offering `alpn`, with retry on ECH rejection.
 async fn dial_ech(
-    addr: SocketAddr,
+    addrs: ResolvedAddrs,
     inner: &str,
     peer: SocketAddr,
     rt: &RouteRuntime,
@@ -755,7 +858,7 @@ async fn dial_ech(
             .context("assembling ECH client config")?;
         let generation = client.generation;
         let connector = TlsConnector::from(client.client_config.clone());
-        let tcp = dial(addr, rt.connect_timeout).await?;
+        let tcp = dial(addrs, rt.connect_timeout).await?;
 
         match timeout(rt.connect_timeout, connector.connect(name.clone(), tcp)).await {
             Ok(Ok(tls)) => {
@@ -885,11 +988,11 @@ async fn raw_passthrough(
     dial_host: Option<String>,
 ) -> Result<()> {
     let dialed = async {
-        let upstream_addr = rt
+        let upstream_addrs = rt
             .upstream
             .resolve(rt.upstream_port, dial_host.as_deref(), &rt.name)
             .await?;
-        dial(upstream_addr, rt.connect_timeout).await
+        dial(upstream_addrs, rt.connect_timeout).await
     }
     .await;
 
@@ -921,7 +1024,7 @@ async fn apply_fail(
             Ok(())
         }
         FailPolicy::Passthrough { addr } => {
-            let up = dial(*addr, Duration::from_secs(10)).await?;
+            let up = dial(ResolvedAddrs::single(*addr), Duration::from_secs(10)).await?;
             splice_tcp(client, up, Duration::from_secs(120)).await
         }
         FailPolicy::SystemOutbound => {
@@ -958,6 +1061,93 @@ fn strip_port(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listening socket plus its address. Held by the caller so the port
+    /// stays bound for the duration of a test.
+    async fn listening() -> (tokio::net::TcpListener, SocketAddr) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        (l, addr)
+    }
+
+    /// An address nothing is listening on: bound to learn a free port, then
+    /// released. Connecting to it either is refused outright or — on hosts that
+    /// drop the SYN instead — hangs, and the race must handle both.
+    fn dead_addr() -> SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    }
+
+    /// Both addresses reachable: the primary gets a head start and must win, so
+    /// a healthy dual-stack upstream keeps its RFC 6724 family preference
+    /// instead of drifting to whichever socket happened to be faster.
+    #[tokio::test]
+    async fn the_race_prefers_the_primary_when_both_connect() {
+        let (_p, primary) = listening().await;
+        let (_f, fallback) = listening().await;
+
+        let up = race_families(primary, fallback).await.unwrap();
+        assert_eq!(up.peer_addr().unwrap(), primary);
+    }
+
+    /// The whole point: a primary that cannot be connected to must not sink the
+    /// dial when a second family is available. Covers both shapes of a broken
+    /// path — an immediate refusal, and a SYN that goes unanswered until the
+    /// attempt delay hands over.
+    #[tokio::test]
+    async fn the_race_wins_on_the_fallback_when_the_primary_is_dead() {
+        let primary = dead_addr();
+        let (_f, fallback) = listening().await;
+
+        let up = race_families(primary, fallback).await.unwrap();
+        assert_eq!(up.peer_addr().unwrap(), fallback);
+    }
+
+    /// Neither address usable: the error has to name both, because "connection
+    /// refused" against one address of two does not tell an operator which leg
+    /// of a dual-stack upstream to go fix.
+    #[tokio::test]
+    async fn a_failed_race_reports_both_addresses() {
+        let primary = dead_addr();
+        let fallback = dead_addr();
+
+        // Built by hand rather than via `dual`: the families are irrelevant
+        // here, only that there are two addresses and neither answers.
+        let addrs = ResolvedAddrs {
+            primary,
+            fallback: Some(fallback),
+        };
+        let err = dial(addrs, Duration::from_millis(600)).await.unwrap_err();
+
+        // Either both connects were refused or the budget expired first; both
+        // reports are required to carry both addresses.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&primary.to_string()) && rendered.contains(&fallback.to_string()),
+            "error names only one leg: {rendered}"
+        );
+    }
+
+    /// A single address keeps the plain path — no race, and the error still
+    /// says where it was trying to go.
+    #[tokio::test]
+    async fn a_single_address_dials_directly() {
+        let (_l, addr) = listening().await;
+        let up = dial(ResolvedAddrs::single(addr), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(up.peer_addr().unwrap(), addr);
+
+        let dead = dead_addr();
+        let err = dial(ResolvedAddrs::single(dead), Duration::from_millis(600))
+            .await
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&dead.to_string()),
+            "error does not name the address: {rendered}"
+        );
+    }
 
     #[test]
     fn strip_port_forms() {

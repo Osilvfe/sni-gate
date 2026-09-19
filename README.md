@@ -682,13 +682,24 @@ Concurrent rebuilds are idempotent via generation counters.
 
 ## Upstream address family & NAT64
 
-- `address_family = "dual"` (default) prefers AAAA and falls back to A;
-  `"ipv4"` uses A only; `"ipv6"` uses AAAA only.
+- `address_family = "dual"` (default) queries both families and, when both
+  answer, **races** the two addresses (RFC 8305 "Happy Eyeballs"): IPv6 is
+  dialed first and IPv4 joins it 250 ms later, with the first connection to
+  complete carrying the traffic. A published AAAA record says the *destination*
+  has IPv6, not that this host can route to it, so a dual-stack upstream stays
+  reachable when the local IPv6 path is broken — including the usual case where
+  the path silently drops packets instead of returning an error. The route's
+  `connect_timeout` bounds the race as a whole, not each attempt.
+  `"ipv4"` uses A only; `"ipv6"` uses AAAA only, and neither races.
 - `nat64_prefix` (a /96 prefix such as `64:ff9b::` or `2a01:4f8:c2c:123f:64:5`)
   synthesizes an IPv6 target from a resolved IPv4 (RFC 6052). NAT64 is applied
   in `dual`/`ipv4` when only an A record is available; it is **disabled** in
   `ipv6` mode. You can also write a literal IPv6 upstream in bracket form,
   e.g. `upstream = "[2a01:4f8:c2c:123f:64:5:203:405]:443"`.
+  A prefix also **turns the race off**: it declares a v6-only host, so a
+  synthesized address is another IPv6 address over the same stack rather than a
+  second path, and the raw IPv4 it came from is unroutable there. In `dual` with
+  a prefix set, an AAAA answer therefore ends the lookup and no A query is sent.
 
 ## Upstream pools
 
@@ -944,8 +955,12 @@ surface.
 
 `warn` is the default so that a backend which merely has not started yet cannot
 stop the gateway from booting. Backends are deduplicated, probed concurrently,
-and each is bounded by `probe_timeout`. Routes that reflect the source SNI/Host
-have no fixed upstream at startup and are skipped.
+and each *attempt* is bounded by `probe_timeout`. A backend that resolved in
+both address families is probed on the second only if the first could not be
+reached — the data path races both, so condemning a route over one unreachable
+family would be a verdict it never actually earns — which makes `2 ×
+probe_timeout` the worst case for such a backend. Routes that reflect the
+source SNI/Host have no fixed upstream at startup and are skipped.
 
 Cleartext (non-TLS) inbound connections cannot use HTTP/2: a prior-knowledge h2c
 request carries its `:authority` in HPACK-compressed HEADERS, which cannot be

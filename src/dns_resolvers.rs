@@ -413,7 +413,7 @@ impl DnsResolver {
         port: u16,
         family: AddressFamily,
         nat64: Option<&Nat64Prefix>,
-    ) -> Result<SocketAddr> {
+    ) -> Result<dns::ResolvedAddrs> {
         self.with_ech_retry(|resolver| async move {
             dns::resolve_upstream(&resolver, host, port, family, nat64).await
         })
@@ -591,82 +591,76 @@ pub struct Built {
     pub ech_bytes: Option<Vec<u8>>,
 }
 
-/// Build a resolver from its plan: resolve the dial address through the
+/// Resolve `host` through the plan's bootstrap into every address it can be
+/// dialed at, most-preferred first. `what` names the role of `host` in the
+/// config so a failure points at the field the operator wrote.
+///
+/// A resolver endpoint behind a broken IPv6 path is the same hazard the data
+/// path races around, but hickory owns the dialing here rather than us — so
+/// hand it every address and let its own name-server failover carry the load.
+async fn bootstrap_ips(plan: &ResolverPlan, host: &str, what: &str) -> Result<Vec<IpAddr>> {
+    let addrs = plan
+        .bootstrap
+        .lookup_addr(host, plan.dial_port, plan.family, plan.nat64.as_ref())
+        .await
+        .with_context(|| {
+            format!(
+                "[resolvers.{}]: resolving {what} {host:?} through bootstrap {:?}",
+                plan.label,
+                plan.bootstrap.label()
+            )
+        })?;
+    Ok(std::iter::once(addrs.primary)
+        .chain(addrs.fallback)
+        .map(|sa| sa.ip())
+        .collect())
+}
+
+/// One name-server entry per dial address, all on `port`.
+///
+/// The `NameServerConfig` constructors take no port — hickory reads it from
+/// each connection entry — so it is set after building.
+fn name_servers(
+    ips: &[IpAddr],
+    port: u16,
+    build: impl Fn(IpAddr) -> NameServerConfig,
+) -> Vec<NameServerConfig> {
+    assert!(
+        !ips.is_empty(),
+        "a non-system resolver endpoint always resolves to at least one dial address"
+    );
+    ips.iter()
+        .copied()
+        .map(|ip| {
+            let mut ns = build(ip);
+            ns.connections.iter_mut().for_each(|c| c.port = port);
+            ns
+        })
+        .collect()
+}
+
+/// Build a resolver from its plan: resolve the dial addresses through the
 /// bootstrap, fetch the ECHConfigList, assemble the TLS config, and construct
 /// the hickory resolver.
 pub async fn build(plan: &ResolverPlan) -> Result<Built> {
     // --- 1. Where to dial ---
     //
-    // System is the one transport we do not dial ourselves.
-    let dial_ip = match &plan.endpoint {
-        Endpoint::System => None,
-        Endpoint::Plain { target, .. } => {
-            // Plain endpoint: if target is an IP, use it directly; otherwise resolve via bootstrap
-            if let Ok(ip) = target.parse::<std::net::IpAddr>() {
-                Some(ip)
-            } else if plan.dial_host.is_empty() {
-                // No upstream override - resolve the endpoint's target
-                Some(
-                    plan.bootstrap
-                        .lookup_addr(
-                            target,
-                            plan.dial_port,
-                            plan.family,
-                            plan.nat64.as_ref(),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "[resolvers.{}]: resolving plain endpoint target {:?} through bootstrap {:?}",
-                                plan.label,
-                                target,
-                                plan.bootstrap.label()
-                            )
-                        })?
-                        .ip(),
-                )
-            } else {
-                // Upstream override specified - resolve dial_host
-                Some(
-                    plan.bootstrap
-                        .lookup_addr(
-                            &plan.dial_host,
-                            plan.dial_port,
-                            plan.family,
-                            plan.nat64.as_ref(),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "[resolvers.{}]: resolving dial host {:?} through bootstrap {:?}",
-                                plan.label,
-                                plan.dial_host,
-                                plan.bootstrap.label()
-                            )
-                        })?
-                        .ip(),
-                )
+    // Every address the endpoint is reachable at, in dial order. Empty only for
+    // `system`, the one transport we do not dial ourselves.
+    let dial_ips: Vec<IpAddr> = match &plan.endpoint {
+        Endpoint::System => Vec::new(),
+        // A plain endpoint may be written as a literal IP, which needs no
+        // bootstrap at all; a name is resolved like any other endpoint host,
+        // except that without an `upstream` override the name to resolve is the
+        // endpoint's own target.
+        Endpoint::Plain { target, .. } => match target.parse::<IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) if plan.dial_host.is_empty() => {
+                bootstrap_ips(plan, target, "plain endpoint target").await?
             }
-        }
-        _ => Some(
-            plan.bootstrap
-                .lookup_addr(
-                    &plan.dial_host,
-                    plan.dial_port,
-                    plan.family,
-                    plan.nat64.as_ref(),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "[resolvers.{}]: resolving dial host {:?} through bootstrap {:?}",
-                        plan.label,
-                        plan.dial_host,
-                        plan.bootstrap.label()
-                    )
-                })?
-                .ip(),
-        ),
+            Err(_) => bootstrap_ips(plan, &plan.dial_host, "dial host").await?,
+        },
+        _ => bootstrap_ips(plan, &plan.dial_host, "dial host").await?,
     };
 
     // --- 2. ECHConfigList, if this resolver uses ECH ---
@@ -695,40 +689,39 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
     let config = match &plan.endpoint {
         Endpoint::System => dns::system_resolver_config()?,
         Endpoint::Doh { path, .. } => {
-            let ip = dial_ip.expect("non-system endpoints resolve a dial IP");
-            let name = plan
-                .server_name
-                .as_deref()
-                .expect("a DoH endpoint always has a server name");
-            let mut ns =
-                NameServerConfig::https(ip, Arc::from(name), Some(Arc::from(path.as_str())));
-            // The constructor has no port argument; hickory takes the port from
-            // each connection entry (origin does the same for plain DNS).
-            ns.connections
-                .iter_mut()
-                .for_each(|c| c.port = plan.dial_port);
-            ResolverConfig::from_parts(None, vec![], vec![ns])
+            let name: Arc<str> = Arc::from(
+                plan.server_name
+                    .as_deref()
+                    .expect("a DoH endpoint always has a server name"),
+            );
+            let path: Arc<str> = Arc::from(path.as_str());
+            ResolverConfig::from_parts(
+                None,
+                vec![],
+                name_servers(&dial_ips, plan.dial_port, |ip| {
+                    NameServerConfig::https(ip, Arc::clone(&name), Some(Arc::clone(&path)))
+                }),
+            )
         }
         Endpoint::Dot { .. } => {
-            let ip = dial_ip.expect("non-system endpoints resolve a dial IP");
-            let name = plan
-                .server_name
-                .as_deref()
-                .expect("a DoT endpoint always has a server name");
-            let mut ns = NameServerConfig::tls(ip, Arc::from(name));
-            ns.connections
-                .iter_mut()
-                .for_each(|c| c.port = plan.dial_port);
-            ResolverConfig::from_parts(None, vec![], vec![ns])
+            let name: Arc<str> = Arc::from(
+                plan.server_name
+                    .as_deref()
+                    .expect("a DoT endpoint always has a server name"),
+            );
+            ResolverConfig::from_parts(
+                None,
+                vec![],
+                name_servers(&dial_ips, plan.dial_port, |ip| {
+                    NameServerConfig::tls(ip, Arc::clone(&name))
+                }),
+            )
         }
-        Endpoint::Plain { .. } => {
-            let ip = dial_ip.expect("non-system endpoints resolve a dial IP");
-            let mut ns = NameServerConfig::udp_and_tcp(ip);
-            ns.connections
-                .iter_mut()
-                .for_each(|c| c.port = plan.dial_port);
-            ResolverConfig::from_parts(None, vec![], vec![ns])
-        }
+        Endpoint::Plain { .. } => ResolverConfig::from_parts(
+            None,
+            vec![],
+            name_servers(&dial_ips, plan.dial_port, NameServerConfig::udp_and_tcp),
+        ),
     };
 
     // --- 4. Options ---
@@ -782,7 +775,7 @@ pub async fn build(plan: &ResolverPlan) -> Result<Built> {
     debug!(
         resolver = %plan.label,
         kind = plan.endpoint.kind(),
-        dial = ?dial_ip.map(|ip| SocketAddr::new(ip, plan.dial_port)),
+        dial = ?dial_ips.iter().map(|ip| SocketAddr::new(*ip, plan.dial_port)).collect::<Vec<_>>(),
         server_name = ?plan.server_name,
         ech = ech_bytes.is_some(),
         verify = plan.verify.label(),

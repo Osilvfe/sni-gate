@@ -23,6 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::dns::ResolvedAddrs;
+
 /// The HTTP/2 client connection preface (RFC 9113 §3.4). A server that speaks
 /// h2c responds to this with its own SETTINGS frame.
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -37,19 +39,41 @@ const FRAME_HEADER_LEN: usize = 9;
 /// The SETTINGS frame type code.
 const FRAME_TYPE_SETTINGS: u8 = 0x04;
 
-/// Check that the backend at `addr` speaks prior-knowledge h2c.
+/// Check that the backend behind `addrs` speaks prior-knowledge h2c.
 ///
 /// Opens a TCP connection, writes the client preface plus an empty SETTINGS
-/// frame, and requires the peer's first reply to be a SETTINGS frame. The whole
-/// exchange is bounded by `budget`.
+/// frame, and requires the peer's first reply to be a SETTINGS frame.
 ///
 /// Errors describe the *specific* failure, because the remedy differs sharply:
 /// an HTTP/1.1 response means the backend needs `http2` turned on, whereas a
 /// refused connection usually just means it has not started yet.
-pub async fn probe_h2c(addr: SocketAddr, budget: Duration) -> Result<()> {
+///
+/// When the upstream resolved in both address families the data path races
+/// them, so a verdict from one address alone is not the route's verdict: a
+/// failure on the first is retried on the second, and only a failure on both is
+/// reported. Retrying usually just reconfirms the first answer — it is the same
+/// backend — and exists for the case where one family is simply unreachable.
+/// Each attempt gets its own `budget`, so two addresses can cost two of them;
+/// this runs once at startup, where a correct verdict outranks a fast one.
+pub async fn probe_h2c(addrs: ResolvedAddrs, budget: Duration) -> Result<()> {
+    let Some(fallback) = addrs.fallback else {
+        return attempt(addrs.primary, budget).await;
+    };
+    match attempt(addrs.primary, budget).await {
+        Ok(()) => Ok(()),
+        Err(primary_err) => attempt(fallback, budget)
+            .await
+            .map_err(|fallback_err| anyhow!("{primary_err:#}; {fallback_err:#}")),
+    }
+}
+
+/// Probe one address, bounded by `budget`. Every error names the address, so a
+/// two-address report says which half failed how.
+async fn attempt(addr: SocketAddr, budget: Duration) -> Result<()> {
     timeout(budget, exchange(addr))
         .await
-        .map_err(|_| anyhow!("timed out after {budget:?}"))?
+        .map_err(|_| anyhow!("{addr}: timed out after {budget:?}"))?
+        .with_context(|| format!("probing {addr}"))
 }
 
 async fn exchange(addr: SocketAddr) -> Result<()> {
@@ -162,10 +186,12 @@ mod tests {
             let (_s, _) = listener.accept().await.unwrap();
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        let err = probe_h2c(addr, Duration::from_millis(150))
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = format!(
+            "{:#}",
+            probe_h2c(ResolvedAddrs::single(addr), Duration::from_millis(150))
+                .await
+                .unwrap_err()
+        );
         assert!(err.contains("timed out"), "unexpected error: {err}");
     }
 
@@ -179,13 +205,76 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let err = probe_h2c(addr, Duration::from_millis(500))
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = format!(
+            "{:#}",
+            probe_h2c(ResolvedAddrs::single(addr), Duration::from_millis(500))
+                .await
+                .unwrap_err()
+        );
         assert!(
             err.contains("connecting to") || err.contains("timed out"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A dual-stack upstream whose first address is unreachable is still probed
+    /// on the second — otherwise the probe would condemn a route the data path
+    /// reaches perfectly well over the other family.
+    #[tokio::test]
+    async fn a_dead_primary_is_retried_on_the_fallback() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Drain the whole greeting before replying: leaving bytes unread in
+            // the receive buffer makes the close below an RST on Windows, which
+            // the prober would see instead of the SETTINGS frame.
+            let mut greeting = [0u8; PREFACE.len() + EMPTY_SETTINGS.len()];
+            let _ = s.read_exact(&mut greeting).await;
+            let _ = s.write_all(&EMPTY_SETTINGS).await;
+            let _ = s.flush().await;
+            // Outlive the prober's read; the test's budget closes it out.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        // Built by hand rather than via `dual`: the families are irrelevant
+        // here, only that there are two addresses and the first is dead.
+        let addrs = ResolvedAddrs {
+            primary: dead_addr,
+            fallback: Some(good_addr),
+        };
+        probe_h2c(addrs, Duration::from_millis(500))
+            .await
+            .expect("the reachable address should decide the verdict");
+    }
+
+    /// Both addresses failing must report both, so the operator sees that it is
+    /// the backend and not one broken path.
+    #[tokio::test]
+    async fn a_dual_failure_names_both_addresses() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (a, b) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+        drop(first);
+        drop(second);
+
+        let addrs = ResolvedAddrs {
+            primary: a,
+            fallback: Some(b),
+        };
+        let err = format!(
+            "{:#}",
+            probe_h2c(addrs, Duration::from_millis(400))
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains(&a.to_string()) && err.contains(&b.to_string()),
+            "error names only one address: {err}"
         );
     }
 }

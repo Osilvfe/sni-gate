@@ -996,7 +996,7 @@ async fn run_probes(targets: Vec<ProbeTarget>) -> Result<()> {
                 .await
                 .with_context(|| format!("resolving h2c probe target {}:{}", key.host, key.port));
             let outcome = match resolved {
-                Ok(addr) => probe::probe_h2c(addr, group.budget).await,
+                Ok(addrs) => probe::probe_h2c(addrs, group.budget).await,
                 Err(e) => Err(e),
             };
             (group.routes, key.host, key.port, group.policy, outcome)

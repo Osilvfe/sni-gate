@@ -24,6 +24,44 @@ use hickory_resolver::TokioResolver;
 use crate::config::AddressFamily;
 use crate::nat64::Nat64Prefix;
 
+/// Where to dial an upstream: one address, or two from different families for
+/// the connection layer to race.
+///
+/// A second address is present only when it is a genuinely different *path* to
+/// the upstream — a native A record alongside a native AAAA. Under NAT64 there
+/// is no such thing: a synthesized address is another IPv6 address on the same
+/// stack, so racing it would prove nothing about reachability, and the raw IPv4
+/// it was synthesized from is unroutable on the v6-only host the prefix
+/// declares. Those cases collapse to [`Self::single`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedAddrs {
+    /// The address to dial first; IPv6 whenever both families answered.
+    pub primary: SocketAddr,
+    /// A different-family address to race `primary` against, or `None` when
+    /// only one path to the upstream exists.
+    pub fallback: Option<SocketAddr>,
+}
+
+impl ResolvedAddrs {
+    /// The one address this name resolves to.
+    pub fn single(addr: SocketAddr) -> Self {
+        Self {
+            primary: addr,
+            fallback: None,
+        }
+    }
+
+    /// Two paths to the same upstream. IPv6 leads, per RFC 6724 destination
+    /// address selection; the race in [`crate::proxy`] decides what actually
+    /// carries the connection.
+    pub fn dual(v6: SocketAddr, v4: SocketAddr) -> Self {
+        Self {
+            primary: v6,
+            fallback: Some(v4),
+        }
+    }
+}
+
 /// A parsed resolver specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolverSpec {
@@ -124,48 +162,88 @@ impl ResolverSpec {
     }
 }
 
-/// Resolve an upstream host to a connectable `SocketAddr`, honoring the address
+/// Resolve an upstream host to a connectable address, honoring the address
 /// family and applying NAT64 synthesis when only IPv4 is available.
+///
+/// Under `Dual` a name that publishes both families yields both, because DNS
+/// cannot tell whether either path actually carries traffic — an AAAA record
+/// exists for the *destination*, and says nothing about whether this host has a
+/// working route to it. Deciding that is [`crate::proxy`]'s job, and it needs
+/// both addresses to do it.
 pub async fn resolve_upstream(
     resolver: &TokioResolver,
     host: &str,
     port: u16,
     family: AddressFamily,
     nat64: Option<&Nat64Prefix>,
-) -> Result<SocketAddr> {
+) -> Result<ResolvedAddrs> {
     // A literal IP needs no lookup. A literal IPv4 still goes through NAT64
     // synthesis when a prefix is configured (unless ipv6-only mode, where NAT64
     // is disabled), so a v4 destination is reachable from a v6-only host.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(match ip {
+        let addr = match ip {
             IpAddr::V4(v4) if family != AddressFamily::Ipv6 => nat64_or_v4(v4, port, nat64),
             other => SocketAddr::new(other, port),
-        });
+        };
+        return Ok(ResolvedAddrs::single(addr));
     }
 
     let resolved = match family {
         AddressFamily::Ipv6 => {
             // AAAA only; NAT64 disabled.
             let v6 = lookup_v6(resolver, host).await?;
-            SocketAddr::new(IpAddr::V6(v6), port)
+            ResolvedAddrs::single(SocketAddr::new(IpAddr::V6(v6), port))
         }
         AddressFamily::Ipv4 => {
             let v4 = lookup_v4(resolver, host).await?;
-            nat64_or_v4(v4, port, nat64)
+            ResolvedAddrs::single(nat64_or_v4(v4, port, nat64))
         }
+        // A NAT64 prefix declares a v6-only host, so every destination is
+        // reached over IPv6 and there is no second path to find. That makes the
+        // A record dead weight whenever an AAAA answers — ask for it only when
+        // there is no AAAA to use.
+        AddressFamily::Dual if nat64.is_some() => match lookup_v6(resolver, host).await {
+            Ok(v6) => ResolvedAddrs::single(SocketAddr::new(IpAddr::V6(v6), port)),
+            Err(v6_err) => match lookup_v4(resolver, host).await {
+                Ok(v4) => ResolvedAddrs::single(nat64_or_v4(v4, port, nat64)),
+                Err(v4_err) => return Err(neither_family_resolved(host, &v6_err, v4_err)),
+            },
+        },
         AddressFamily::Dual => {
-            // Prefer AAAA; fall back to A (with optional NAT64).
-            match lookup_v6(resolver, host).await {
-                Ok(v6) => SocketAddr::new(IpAddr::V6(v6), port),
-                Err(_) => {
-                    let v4 = lookup_v4(resolver, host).await?;
-                    nat64_or_v4(v4, port, nat64)
+            // Both records are real alternatives here, so both are worth having
+            // and neither lookup depends on the other's answer — issue them
+            // together rather than paying two round trips in series.
+            let (v6, v4) = tokio::join!(lookup_v6(resolver, host), lookup_v4(resolver, host));
+            match (v6, v4) {
+                (Ok(v6), Ok(v4)) => ResolvedAddrs::dual(
+                    SocketAddr::new(IpAddr::V6(v6), port),
+                    nat64_or_v4(v4, port, nat64),
+                ),
+                (Ok(v6), Err(_)) => ResolvedAddrs::single(SocketAddr::new(IpAddr::V6(v6), port)),
+                (Err(_), Ok(v4)) => ResolvedAddrs::single(nat64_or_v4(v4, port, nat64)),
+                (Err(v6_err), Err(v4_err)) => {
+                    return Err(neither_family_resolved(host, &v6_err, v4_err))
                 }
             }
         }
     };
-    tracing::debug!(host, %resolved, ?family, nat64 = nat64.is_some(), "resolved upstream");
+    tracing::debug!(host, primary = %resolved.primary, fallback = ?resolved.fallback, ?family, nat64 = nat64.is_some(), "resolved upstream");
     Ok(resolved)
+}
+
+/// Both families failed for `host`, so report both reasons.
+///
+/// "No AAAA record" on its own is not why a dual-stack lookup gave up, and an
+/// operator reading a startup failure needs to see which half was the real
+/// problem. The A error keeps its chain intact because callers inspect it —
+/// [`crate::ech::is_ech_reject_chain`] decides from it whether the resolver
+/// itself needs rebuilding — so the AAAA reason is folded in as text.
+fn neither_family_resolved(
+    host: &str,
+    v6_err: &anyhow::Error,
+    v4_err: anyhow::Error,
+) -> anyhow::Error {
+    v4_err.context(format!("resolving {host}: AAAA also failed: {v6_err:#}"))
 }
 
 fn nat64_or_v4(v4: Ipv4Addr, port: u16, nat64: Option<&Nat64Prefix>) -> SocketAddr {
@@ -374,7 +452,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, "[64:ff9b::102:304]:443".parse().unwrap());
+        assert_eq!(
+            out,
+            ResolvedAddrs::single("[64:ff9b::102:304]:443".parse().unwrap())
+        );
 
         // A literal IPv6 upstream is returned as-is.
         let out6 = resolve_upstream(
@@ -386,7 +467,64 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out6, "[2a01:4f8::1]:443".parse().unwrap());
+        assert_eq!(
+            out6,
+            ResolvedAddrs::single("[2a01:4f8::1]:443".parse().unwrap())
+        );
+    }
+
+    /// A literal address is one path by definition — there is no second record
+    /// to race it against, whatever the family setting says.
+    #[tokio::test]
+    async fn a_literal_never_produces_a_second_address() {
+        let resolver = ResolverSpec::System.build(AddressFamily::Dual).unwrap();
+        for host in ["1.2.3.4", "2a01:4f8::1"] {
+            let out = resolve_upstream(&resolver, host, 443, AddressFamily::Dual, None)
+                .await
+                .unwrap();
+            assert_eq!(out.fallback, None, "{host} should resolve to one address");
+        }
+    }
+
+    /// The two shapes a resolution can take, and the ordering the dialer relies
+    /// on: IPv6 leads whenever both families are present.
+    #[test]
+    fn resolved_addrs_orders_ipv6_first() {
+        let v6: SocketAddr = "[2606:4700::1]:443".parse().unwrap();
+        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+
+        let single = ResolvedAddrs::single(v4);
+        assert_eq!(single.primary, v4);
+        assert_eq!(single.fallback, None);
+
+        let dual = ResolvedAddrs::dual(v6, v4);
+        assert_eq!(dual.primary, v6);
+        assert_eq!(dual.fallback, Some(v4));
+    }
+
+    /// Both families failing must report both reasons — "no AAAA" alone would
+    /// send an operator looking in the wrong place — while keeping the A error's
+    /// chain intact for the ECH-rejection check that inspects it.
+    #[test]
+    fn a_dual_failure_names_both_families() {
+        let v6 = anyhow!("AAAA lookup for h.test: no records");
+        let v4 = anyhow!("A lookup for h.test: refused").context("through bootstrap");
+        let err = neither_family_resolved("h.test", &v6, v4);
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("no records"),
+            "lost the AAAA reason: {rendered}"
+        );
+        assert!(
+            rendered.contains("refused"),
+            "lost the A reason: {rendered}"
+        );
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().contains("through bootstrap")),
+            "the A error's chain must survive: {rendered}"
+        );
     }
 
     /// A literal address needs no lookup, and the family filter still applies —

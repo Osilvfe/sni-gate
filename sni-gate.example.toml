@@ -30,6 +30,9 @@ resolver = "system"                            # e.g. "https://dns.example/dns-q
 ech_refresh = "1h"                             # ECH config refresh bound
 # nat64_prefix = "64:ff9b::"                   # /96 prefix, hierarchical
 # address_family = "dual"                      # dual (default) | ipv4 | ipv6
+#   dual races AAAA against A (RFC 8305) so a broken local IPv6 path cannot
+#   strand an upstream; setting nat64_prefix turns the race off, because a
+#   synthesized address is the same v6 path rather than a second one.
 # Fail/unmatched policy. Field-less modes take a bare string; passthrough needs
 # a table:  unmatched = "close"  |  "system-outbound"  |
 #           { mode = "passthrough", addr = "127.0.0.1:80" }
