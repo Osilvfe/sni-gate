@@ -1,6 +1,6 @@
 [package]
 name = "sni-gate"
-version = "2.5.0"
+version = "2.5.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Multi-listener SNI/Host-routing TLS gateway: dynamic per-SNI certificate issuance on termination, with ECH / TLS / HTTP / raw upstreams"
