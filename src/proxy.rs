@@ -569,7 +569,21 @@ async fn serve_mirrored(
     );
 
     let tls = start.into_stream(config).await?;
-    splice(tls, up, rt.idle_timeout).await
+
+    // Extract upstream address before moving streams into splice
+    let upstream_addr = up.get_ref().0.peer_addr().ok();
+    let start_time = std::time::Instant::now();
+    let result = splice(tls, up, rt.idle_timeout).await;
+
+    // Report passive throughput observation to pool
+    if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
+        if let Upstream::Pool(handle) = &rt.upstream {
+            let elapsed = start_time.elapsed();
+            let total_bytes = bytes_c2u + bytes_u2c;
+            handle.observe_transfer(addr.ip(), total_bytes, elapsed);
+        }
+    }
+    result.map(|_| ())
 }
 
 /// Forward a cleartext inbound connection (no inbound TLS).
@@ -604,7 +618,17 @@ where
     match rt.route_type {
         RouteType::Http => {
             let up = dial(upstream_addrs, rt.connect_timeout).await?;
-            splice(inbound, up, rt.idle_timeout).await
+            let upstream_addr = up.peer_addr().ok();
+            let start_time = std::time::Instant::now();
+            let result = splice(inbound, up, rt.idle_timeout).await;
+            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
+                if let Upstream::Pool(handle) = &rt.upstream {
+                    let elapsed = start_time.elapsed();
+                    let total_bytes = bytes_c2u + bytes_u2c;
+                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
+                }
+            }
+            result.map(|_| ())
         }
         // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
         // where inbound was negotiated as http/1.1 — so offer nothing upstream
@@ -616,13 +640,33 @@ where
             // later connection for the same name can, and this is a free look at
             // what the upstream's certificate covers.
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
-            splice(inbound, up, rt.idle_timeout).await
+            let upstream_addr = up.get_ref().0.peer_addr().ok();
+            let start_time = std::time::Instant::now();
+            let result = splice(inbound, up, rt.idle_timeout).await;
+            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
+                if let Upstream::Pool(handle) = &rt.upstream {
+                    let elapsed = start_time.elapsed();
+                    let total_bytes = bytes_c2u + bytes_u2c;
+                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
+                }
+            }
+            result.map(|_| ())
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
             let up = dial_ech(upstream_addrs, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
-            splice(inbound, up, rt.idle_timeout).await
+            let upstream_addr = up.get_ref().0.peer_addr().ok();
+            let start_time = std::time::Instant::now();
+            let result = splice(inbound, up, rt.idle_timeout).await;
+            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
+                if let Upstream::Pool(handle) = &rt.upstream {
+                    let elapsed = start_time.elapsed();
+                    let total_bytes = bytes_c2u + bytes_u2c;
+                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
+                }
+            }
+            result.map(|_| ())
         }
         RouteType::Raw => unreachable!("raw handled before termination"),
     }
@@ -910,7 +954,9 @@ fn is_ech_reject(e: &std::io::Error) -> bool {
 /// direction does not tear down the other), so request/response and duplex
 /// protocols both work. The splice ends when both directions have closed, or
 /// when the idle timeout fires, whichever comes first.
-async fn splice<A, B>(a: A, b: B, idle: Duration) -> Result<()>
+///
+/// Returns `(bytes_a_to_b, bytes_b_to_a)` on success.
+async fn splice<A, B>(a: A, b: B, idle: Duration) -> Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -924,9 +970,9 @@ where
         let a2b = pump_direction(&mut ar, &mut bw, &activity);
         let b2a = pump_direction(&mut br, &mut aw, &activity);
         let (r1, r2) = tokio::join!(a2b, b2a);
-        r1.context("proxying data (c->u)")?;
-        r2.context("proxying data (u->c)")?;
-        Ok::<(), anyhow::Error>(())
+        let bytes_a2b = r1.context("proxying data (c->u)")?;
+        let bytes_b2a = r2.context("proxying data (u->c)")?;
+        Ok::<(u64, u64), anyhow::Error>((bytes_a2b, bytes_b2a))
     };
 
     tokio::select! {
@@ -936,26 +982,28 @@ where
 }
 
 /// Copy one direction, signaling `activity` on every chunk. On EOF it
-/// half-closes the writer (so the peer sees the close) and returns, leaving the
-/// other direction free to continue.
+/// half-closes the writer (so the peer sees the close) and returns the total
+/// bytes transferred, leaving the other direction free to continue.
 async fn pump_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
     activity: &tokio::sync::Notify,
-) -> Result<()>
+) -> Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; COPY_BUF_SIZE];
+    let mut total = 0u64;
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             let _ = writer.shutdown().await;
-            return Ok(());
+            return Ok(total);
         }
         writer.write_all(&buf[..n]).await?;
+        total += n as u64;
         activity.notify_one();
     }
 }
@@ -997,7 +1045,19 @@ async fn raw_passthrough(
     .await;
 
     match dialed {
-        Ok(up) => splice_tcp(client, up, rt.idle_timeout).await,
+        Ok(up) => {
+            let upstream_addr = up.peer_addr().ok();
+            let start_time = std::time::Instant::now();
+            let result = splice_tcp(client, up, rt.idle_timeout).await;
+            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
+                if let Upstream::Pool(handle) = &rt.upstream {
+                    let elapsed = start_time.elapsed();
+                    let total_bytes = bytes_c2u + bytes_u2c;
+                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
+                }
+            }
+            result.map(|_| ())
+        }
         Err(e) => {
             debug!(%peer, route = %rt.name, error = %format!("{e:#}"), "raw upstream failed; applying fail policy");
             apply_fail(client, peer, inbound, &rt.fail, "raw-fail").await
@@ -1006,7 +1066,7 @@ async fn raw_passthrough(
 }
 
 /// Raw TCP splice with the same true-idle-timeout semantics as [`splice`].
-async fn splice_tcp(a: TcpStream, b: TcpStream, idle: Duration) -> Result<()> {
+async fn splice_tcp(a: TcpStream, b: TcpStream, idle: Duration) -> Result<(u64, u64)> {
     splice(a, b, idle).await
 }
 
@@ -1025,7 +1085,9 @@ async fn apply_fail(
         }
         FailPolicy::Passthrough { addr } => {
             let up = dial(ResolvedAddrs::single(*addr), Duration::from_secs(10)).await?;
-            splice_tcp(client, up, Duration::from_secs(120)).await
+            splice_tcp(client, up, Duration::from_secs(120))
+                .await
+                .map(|_| ())
         }
         FailPolicy::SystemOutbound => {
             let host = inbound
@@ -1035,7 +1097,9 @@ async fn apply_fail(
             let host = strip_port(host);
             let up = TcpStream::connect((host.as_str(), port)).await?;
             up.set_nodelay(true).ok();
-            splice_tcp(client, up, Duration::from_secs(120)).await
+            splice_tcp(client, up, Duration::from_secs(120))
+                .await
+                .map(|_| ())
         }
     }
 }
@@ -1175,7 +1239,9 @@ mod tests {
 
         // splice() bridges the two gate ends.
         let spliced = tokio::spawn(async move {
-            splice(client_gate, upstream_gate, Duration::from_secs(5)).await
+            splice(client_gate, upstream_gate, Duration::from_secs(5))
+                .await
+                .map(|_| ())
         });
 
         let big = vec![0xABu8; 256 * 1024];

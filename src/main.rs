@@ -20,6 +20,7 @@ mod proxy;
 mod psl;
 mod resolver;
 mod router;
+mod scoring;
 mod store;
 mod suffix;
 mod trust;

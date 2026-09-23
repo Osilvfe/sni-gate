@@ -50,9 +50,12 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
+
+use crate::scoring::{default_nig_prior, score, KalmanRtt, NigThroughput, SubnetKey};
 use url::Url;
 
 use crate::config::{AddressFamily, EffectiveProbeEch, PoolDef, ProbeSpec, Selector, TargetDef};
@@ -76,22 +79,30 @@ const TAG_NAT64: &str = "nat64";
 /// is enforced at load time with an error naming the fix.
 const MAX_CIDR_EXPANSION: usize = 64;
 
-/// Upper bound on concurrent probes within one pool, so a large pool cannot open
-/// hundreds of sockets in one cycle.
-const MAX_CONCURRENT_PROBES: usize = 16;
+/// Default upper bound on concurrent probes within one pool, so a large pool cannot open
+/// hundreds of sockets in one cycle. Configurable via `probe.max_concurrent_probes`.
+const DEFAULT_MAX_CONCURRENT_PROBES: usize = 16;
 
-/// Weight of a new sample in the RTT moving average.
-///
-/// An exponentially-weighted average rather than the last measurement: a single
-/// unlucky sample must not hand the top of the ranking to a worse endpoint, and a
-/// genuinely faster endpoint should still take it within a few cycles. This
-/// replaces the "wait N successful probes before ranking" rule it supersedes —
-/// smoothing the value is what that rule was reaching for, and it costs no
-/// startup delay.
-const RTT_EWMA_ALPHA: f64 = 0.3;
+/// Default Kalman process-noise Q (ms²). Low enough to give a stable steady-state
+/// estimate but high enough to let the filter track gradual CDN RTT drift.
+const DEFAULT_KALMAN_Q: f64 = 0.01;
+
+/// Default Kalman observation-noise R (ms²). Calibrated to typical probe jitter.
+const DEFAULT_KALMAN_R: f64 = 0.1;
+
+/// Default throughput discount factor applied before each new observation.
+const DEFAULT_THROUGHPUT_DISCOUNT: f64 = 0.95;
+
+/// How long a candidate that has left the live set is retained in the parked map
+/// before its state is truly discarded. CDN IP rotation often brings the same
+/// address back within minutes; retaining its Kalman and NIG state avoids
+/// a cold-start penalty on re-entry.
+const PARK_DURATION: Duration = Duration::from_secs(600);
 
 /// Relative margin a challenger must beat the incumbent by to overtake it.
-const HYSTERESIS_FRACTION: u32 = 5; // 1/5 == 20%
+/// Applied to the score (seconds), not raw Duration, so the same percentage
+/// applies whether scoring by RTT alone or by rtt + payload/throughput.
+const HYSTERESIS_FRACTION: f64 = 0.20; // 20%
 
 /// Absolute floor on that margin, for endpoints that are all fast.
 const HYSTERESIS_FLOOR: Duration = Duration::from_millis(5);
@@ -206,11 +217,22 @@ enum TlsSource {
     },
 }
 
-/// The cadence half of a probe definition, with defaults applied.
+/// The cadence and scoring parameters for one pool, with defaults applied.
 struct ProbeTiming {
     interval: Duration,
     degraded_interval: Duration,
     fail_threshold: u32,
+    /// Upper bound on probes running concurrently within one cycle.
+    max_concurrent_probes: usize,
+    /// Reference payload size for the `rtt + payload/throughput` score formula.
+    /// Zero disables throughput scoring and falls back to pure RTT ranking.
+    score_payload_bytes: u64,
+    /// NIG time-discount factor applied before each passive throughput observation.
+    throughput_discount: f64,
+    /// Kalman process-noise Q (ms²).
+    kalman_q: f64,
+    /// Kalman observation-noise R (ms²).
+    kalman_r: f64,
 }
 
 /// The ECH inputs a pool cannot resolve for itself.
@@ -366,8 +388,10 @@ impl Candidate {
 /// change (a domain's records rotating, a dead sample being replaced).
 #[derive(Debug, Clone)]
 struct Health {
-    /// Smoothed round-trip time. `None` until the first success.
-    rtt: Option<Duration>,
+    /// Kalman filter over RTT; provides the posterior mean used for ranking.
+    kalman: KalmanRtt,
+    /// NIG conjugate posterior over log-throughput; used for Thompson Sampling.
+    nig: NigThroughput,
     consecutive_failures: u32,
     degraded: bool,
     /// When this endpoint is next due. Per-candidate, which is what lets a
@@ -378,9 +402,10 @@ struct Health {
 }
 
 impl Health {
-    fn new(due: Instant, backoff: Duration) -> Self {
+    fn new(due: Instant, backoff: Duration, q: f64, r: f64) -> Self {
         Self {
-            rtt: None,
+            kalman: KalmanRtt::new(q, r),
+            nig: default_nig_prior(),
             consecutive_failures: 0,
             degraded: false,
             next_probe: due,
@@ -388,11 +413,25 @@ impl Health {
         }
     }
 
+    /// Current RTT estimate as a `Duration`, available only after the Kalman
+    /// filter has converged (i.e. after at least one successful probe has moved
+    /// variance below `CUSUM_ACTIVATE_P`).
+    fn rtt(&self) -> Option<Duration> {
+        if self.kalman.is_converged() {
+            Some(self.kalman.estimate())
+        } else {
+            None
+        }
+    }
+
     fn record_success(&mut self, sample: Duration, interval: Duration, base_backoff: Duration) {
-        self.rtt = Some(match self.rtt {
-            None => sample,
-            Some(prev) => ewma(prev, sample),
-        });
+        let alarm = self.kalman.update(sample);
+        if alarm {
+            warn!(
+                rtt_ms = sample.as_millis(),
+                "CUSUM detected an upward RTT regime change; Kalman variance reset for fast reconvergence"
+            );
+        }
         self.consecutive_failures = 0;
         self.degraded = false;
         self.backoff = base_backoff;
@@ -421,13 +460,15 @@ impl Health {
         };
         self.next_probe = Instant::now() + delay;
     }
-}
 
-/// Blend a new RTT sample into the running average.
-fn ewma(prev: Duration, sample: Duration) -> Duration {
-    let prev_ns = prev.as_nanos() as f64;
-    let new_ns = sample.as_nanos() as f64;
-    Duration::from_nanos((prev_ns * (1.0 - RTT_EWMA_ALPHA) + new_ns * RTT_EWMA_ALPHA) as u64)
+    /// Incorporate one passive throughput observation from a completed connection.
+    fn observe_throughput(&mut self, bytes: u64, elapsed: Duration, discount: f64) {
+        if elapsed.is_zero() || bytes == 0 {
+            return;
+        }
+        let bps = bytes as f64 / elapsed.as_secs_f64();
+        self.nig.observe(bps, discount);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,11 +537,34 @@ impl PoolHandle {
     pub fn pick(&self, port: u16) -> Result<SocketAddr> {
         self.pool.pick(self.view, port)
     }
+
+    /// Report one passive throughput observation from a completed connection.
+    ///
+    /// Called by `proxy.rs` after `splice` finishes. Non-blocking: the
+    /// observation is queued for the probe task; if the pool has been dropped
+    /// the send is silently discarded.
+    pub fn observe_transfer(&self, addr: IpAddr, bytes: u64, elapsed: Duration) {
+        let _ = self.pool.obs_tx.send(PassiveObs {
+            addr,
+            bytes,
+            elapsed,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The pool
 // ---------------------------------------------------------------------------
+
+/// One passive throughput observation reported by the proxy after a connection closes.
+pub struct PassiveObs {
+    /// The upstream IP address that served the connection.
+    pub addr: IpAddr,
+    /// Total bytes transferred (both directions).
+    pub bytes: u64,
+    /// Wall time of the data transfer phase (excluding connection setup).
+    pub elapsed: Duration,
+}
 
 /// Everything a pool needs at runtime, plus its published ranking.
 pub struct Pool {
@@ -521,6 +585,8 @@ pub struct Pool {
     /// never blocks the data path and a reader in flight keeps using the snapshot
     /// it started with. Same shape as [`crate::dns_resolvers::DnsResolver`].
     ranking: RwLock<Arc<Ranking>>,
+    /// Sink for passive throughput observations from the proxy.
+    obs_tx: mpsc::UnboundedSender<PassiveObs>,
 }
 
 /// NAT64 projection parameters, resolved at build.
@@ -632,6 +698,17 @@ impl PoolBuilder {
                     .degraded_interval
                     .unwrap_or(DEFAULT_DEGRADED_INTERVAL),
                 fail_threshold: def.probe.fail_threshold.unwrap_or(DEFAULT_FAIL_THRESHOLD),
+                max_concurrent_probes: def
+                    .probe
+                    .max_concurrent_probes
+                    .unwrap_or(DEFAULT_MAX_CONCURRENT_PROBES),
+                score_payload_bytes: def.probe.score_payload_bytes.unwrap_or(0),
+                throughput_discount: def
+                    .probe
+                    .throughput_discount
+                    .unwrap_or(DEFAULT_THROUGHPUT_DISCOUNT),
+                kalman_q: def.probe.rtt_process_noise.unwrap_or(DEFAULT_KALMAN_Q),
+                kalman_r: def.probe.rtt_obs_noise.unwrap_or(DEFAULT_KALMAN_R),
             },
             resolver,
             views: Vec::new(),
@@ -678,6 +755,7 @@ impl PoolBuilder {
             };
 
         let view_count = self.views.len();
+        let (obs_tx, obs_rx) = mpsc::unbounded_channel::<PassiveObs>();
         let pool = Arc::new(Pool {
             name: self.name,
             targets: self.targets,
@@ -688,6 +766,7 @@ impl PoolBuilder {
             resolver: self.resolver,
             views: self.views,
             ranking: RwLock::new(Arc::new(Ranking::empty(view_count))),
+            obs_tx,
         });
 
         // The task holds only a `Weak`, so it stops on its own if the pool is
@@ -695,7 +774,7 @@ impl PoolBuilder {
         // refresher in `dns_resolvers`, and the reason no cancellation-token
         // plumbing is needed to shut a pool down.
         let weak = Arc::downgrade(&pool);
-        tokio::spawn(async move { run_probe_loop(weak).await });
+        tokio::spawn(async move { run_probe_loop(weak, obs_rx).await });
 
         Ok(pool)
     }
@@ -911,6 +990,19 @@ struct PoolState {
     health: HashMap<IpAddr, Health>,
     /// The previous global order, used to apply hysteresis.
     order: Vec<IpAddr>,
+    /// Candidates that recently left the live set, retained for `PARK_DURATION`
+    /// so their Kalman and NIG history survives a DNS rotation cycle.
+    parked: HashMap<IpAddr, (Health, Instant)>,
+    /// Per-subnet NIG prior, propagated from any candidate that shares the prefix.
+    /// New candidates inherit from this prior so Thompson Sampling is effective
+    /// even before an individual address has received a direct observation.
+    subnet_priors: HashMap<SubnetKey, NigThroughput>,
+    /// Passive throughput observations queued by the proxy.
+    obs_rx: mpsc::UnboundedReceiver<PassiveObs>,
+    /// Best address from the last logged cycle, used to suppress redundant INFO logs.
+    last_logged_best: Option<IpAddr>,
+    /// Healthy count from the last logged cycle.
+    last_logged_healthy: usize,
     /// Addresses replaced because they never came up, so a dead CIDR sample is
     /// not retried forever.
     resampled: HashSet<IpAddr>,
@@ -929,8 +1021,8 @@ struct PoolState {
     resolved_at: Option<Instant>,
 }
 
-async fn run_probe_loop(weak: Weak<Pool>) {
-    let mut state = PoolState::new();
+async fn run_probe_loop(weak: Weak<Pool>, obs_rx: mpsc::UnboundedReceiver<PassiveObs>) {
+    let mut state = PoolState::new(obs_rx);
 
     // Small startup jitter so several pools starting together do not fire their
     // first cycle in the same instant. This delays the first fallback publish by
@@ -943,6 +1035,9 @@ async fn run_probe_loop(weak: Weak<Pool>) {
             debug!("pool dropped; stopping probe loop");
             return;
         };
+
+        // Drain any passive throughput observations that arrived since the last cycle.
+        drain_observations(&mut state, &pool.timing);
 
         let candidates = build_candidates(&pool, &mut state).await;
 
@@ -964,9 +1059,9 @@ async fn run_probe_loop(weak: Weak<Pool>) {
         publish(&pool, &state, &candidates);
 
         run_cycle(&pool, &mut state, &candidates).await;
-        recompute_order(&mut state, &candidates);
+        recompute_order(&mut state, &pool.timing, &candidates);
         publish(&pool, &state, &candidates);
-        log_cycle(&pool, &state, &candidates);
+        log_cycle(&pool, &mut state, &candidates);
 
         // Sleep until the next scheduled work. Holding no `Arc` across the sleep
         // is what lets the pool actually be dropped while idle.
@@ -976,7 +1071,50 @@ async fn run_probe_loop(weak: Weak<Pool>) {
     }
 }
 
-/// How long to wait before re-resolving domain targets.
+/// Drain queued passive throughput observations into health and subnet priors.
+///
+/// Called at the top of every probe loop iteration, before `build_candidates`,
+/// so even a cycle with no due probes still absorbs observations from traffic.
+fn drain_observations(state: &mut PoolState, timing: &ProbeTiming) {
+    let mut count = 0;
+    while let Ok(obs) = state.obs_rx.try_recv() {
+        if obs.elapsed.is_zero() || obs.bytes == 0 {
+            continue;
+        }
+        let bps = obs.bytes as f64 / obs.elapsed.as_secs_f64();
+
+        // Log large transfers for visibility
+        if obs.bytes > 100_000 {
+            let throughput_mbps = bps / 1_000_000.0;
+            debug!(
+                addr = %obs.addr,
+                bytes = obs.bytes,
+                throughput_mbps = format!("{:.2}", throughput_mbps),
+                "observed passive throughput"
+            );
+        }
+
+        if let Some(h) = state.health.get_mut(&obs.addr) {
+            h.observe_throughput(obs.bytes, obs.elapsed, timing.throughput_discount);
+        }
+        // Update the subnet prior so siblings benefit from this observation.
+        let key = SubnetKey::of(obs.addr);
+        let subnet = state
+            .subnet_priors
+            .entry(key)
+            .or_insert_with(default_nig_prior);
+        subnet.observe(bps, timing.throughput_discount);
+        count += 1;
+    }
+
+    if count > 0 {
+        debug!(
+            observations = count,
+            subnet_priors = state.subnet_priors.len(),
+            "drained passive throughput observations"
+        );
+    }
+}
 ///
 /// `interval` once every domain target has an answer, but `degraded_interval`
 /// while any of them has none. Without that distinction a failed *first*
@@ -1159,17 +1297,49 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
     // probes run once per address, and the ranking contains each address once.
 
     // Give every new address a health entry, due immediately.
+    // New arrivals inherit from the parked map first, then from the subnet prior,
+    // so Kalman and NIG state survives a DNS rotation cycle.
     let now = Instant::now();
-    for c in &out {
-        state
-            .health
-            .entry(c.addr)
-            .or_insert_with(|| Health::new(now, pool.timing.degraded_interval));
-    }
-    // Forget addresses that are no longer candidates, so a rotating domain does
-    // not grow the map without bound.
     let live: HashSet<IpAddr> = out.iter().map(|c| c.addr).collect();
-    state.health.retain(|addr, _| live.contains(addr));
+
+    // Move departing candidates into the parked map rather than discarding their state.
+    let park_until = now + PARK_DURATION;
+    let departing: Vec<IpAddr> = state
+        .health
+        .keys()
+        .filter(|a| !live.contains(*a))
+        .copied()
+        .collect();
+    for addr in departing {
+        if let Some(h) = state.health.remove(&addr) {
+            state.parked.insert(addr, (h, park_until));
+        }
+    }
+    // Evict parked candidates whose retention window has expired.
+    state.parked.retain(|_, (_, expires)| *expires > now);
+
+    for c in &out {
+        if !state.health.contains_key(&c.addr) {
+            let h = if let Some((parked_h, _)) = state.parked.remove(&c.addr) {
+                // Restore the full history from the parked map.
+                parked_h
+            } else {
+                // New candidate: inherit subnet prior when available.
+                let mut h = Health::new(
+                    now,
+                    pool.timing.degraded_interval,
+                    pool.timing.kalman_q,
+                    pool.timing.kalman_r,
+                );
+                let key = SubnetKey::of(c.addr);
+                if let Some(subnet) = state.subnet_priors.get(&key) {
+                    h.nig = subnet.clone();
+                }
+                h
+            };
+            state.health.insert(c.addr, h);
+        }
+    }
 
     out
 }
@@ -1214,7 +1384,9 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
         return;
     }
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        pool.timing.max_concurrent_probes,
+    ));
     let mut set = tokio::task::JoinSet::new();
     for c in due {
         let pool = pool.clone();
@@ -1285,10 +1457,15 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
 }
 
 impl PoolState {
-    fn new() -> Self {
+    fn new(obs_rx: mpsc::UnboundedReceiver<PassiveObs>) -> Self {
         Self {
             health: HashMap::new(),
             order: Vec::new(),
+            parked: HashMap::new(),
+            subnet_priors: HashMap::new(),
+            obs_rx,
+            last_logged_best: None,
+            last_logged_healthy: 0,
             resampled: HashSet::new(),
             replacements: HashMap::new(),
             resolved: HashMap::new(),
@@ -1316,7 +1493,7 @@ impl PoolState {
             // Only replace an endpoint that has never answered. An endpoint that
             // worked before may simply be in a temporary outage, and its RTT history
             // remains useful when it recovers.
-            if !h.degraded || h.rtt.is_some() || h.backoff < pool.timing.interval {
+            if !h.degraded || h.rtt().is_some() || h.backoff < pool.timing.interval {
                 continue;
             }
             let target = &pool.targets[c.target];
@@ -1399,8 +1576,8 @@ fn replace_recorded_sample(
 /// relative to the *previous* order, so an order that is recomputed and then
 /// discarded leaves every cycle starting from scratch — which is a plain sort, and
 /// exactly the churn the margin exists to prevent.
-fn recompute_order(state: &mut PoolState, candidates: &[Candidate]) {
-    let order = reorder_with_hysteresis(&state.order, state, candidates);
+fn recompute_order(state: &mut PoolState, timing: &ProbeTiming, candidates: &[Candidate]) {
+    let order = reorder_with_hysteresis(&state.order, state, timing, candidates);
     state.order = order;
 }
 
@@ -1451,14 +1628,15 @@ fn publish(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
 fn reorder_with_hysteresis(
     prev: &[IpAddr],
     state: &PoolState,
+    timing: &ProbeTiming,
     candidates: &[Candidate],
 ) -> Vec<IpAddr> {
-    let healthy = |addr: &IpAddr| -> Option<Duration> {
+    let healthy = |addr: &IpAddr| -> Option<f64> {
         let h = state.health.get(addr)?;
-        if h.degraded {
+        if h.degraded || !h.kalman.is_converged() {
             return None;
         }
-        h.rtt
+        Some(score(&h.kalman, &h.nig, timing.score_payload_bytes))
     };
     let live: HashSet<IpAddr> = candidates.iter().map(|c| c.addr).collect();
 
@@ -1472,12 +1650,12 @@ fn reorder_with_hysteresis(
     // Append newcomers, best first, so a new endpoint enters at its measured
     // position rather than at the front.
     let mut known: HashSet<IpAddr> = order.iter().copied().collect();
-    let mut fresh: Vec<(IpAddr, Duration)> = candidates
+    let mut fresh: Vec<(IpAddr, f64)> = candidates
         .iter()
         .filter(|c| known.insert(c.addr))
-        .filter_map(|c| healthy(&c.addr).map(|rtt| (c.addr, rtt)))
+        .filter_map(|c| healthy(&c.addr).map(|s| (c.addr, s)))
         .collect();
-    fresh.sort_by_key(|(_, rtt)| *rtt);
+    fresh.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     order.extend(fresh.into_iter().map(|(a, _)| a));
 
     // Insertion pass with a threshold: move each entry forward only while it
@@ -1497,16 +1675,36 @@ fn reorder_with_hysteresis(
             }
         }
     }
+
+    // Log top 5 ranked candidates when debug logging is enabled
+    if tracing::enabled!(tracing::Level::DEBUG) && !order.is_empty() {
+        for (i, addr) in order.iter().take(5).enumerate() {
+            if let Some(h) = state.health.get(addr) {
+                let s = score(&h.kalman, &h.nig, timing.score_payload_bytes);
+                debug!(
+                    rank = i + 1,
+                    addr = %addr,
+                    score_s = format!("{:.3}", s),
+                    rtt_ms = h.rtt().map(|d| d.as_millis()),
+                    "ranked candidate"
+                );
+            }
+        }
+    }
+
     order
 }
 
 /// Whether `challenger` is enough faster than `incumbent` to overtake it.
-fn beats(challenger: Duration, incumbent: Duration) -> bool {
-    let margin = (incumbent / HYSTERESIS_FRACTION).max(HYSTERESIS_FLOOR);
+///
+/// The score is in seconds, so the margin is applied in seconds. 20% or 5ms,
+/// whichever is larger.
+fn beats(challenger: f64, incumbent: f64) -> bool {
+    let margin = (incumbent * HYSTERESIS_FRACTION).max(HYSTERESIS_FLOOR.as_secs_f64());
     challenger + margin < incumbent
 }
 
-fn log_cycle(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
+fn log_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candidate]) {
     let live: HashSet<IpAddr> = candidates.iter().map(|c| c.addr).collect();
     let total = live.len();
     let healthy = live
@@ -1523,17 +1721,30 @@ fn log_cycle(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
         .and_then(|v| v.ordered.first().copied());
     let best_rtt = best
         .and_then(|a| state.health.get(&a))
-        .and_then(|h| h.rtt)
+        .and_then(|h| h.rtt())
         .map(|d| d.as_millis());
 
-    info!(
-        pool = %pool.name,
-        healthy,
-        total,
-        best = best.map(|b| b.to_string()).unwrap_or_else(|| "<none>".into()),
-        best_rtt_ms = best_rtt.unwrap_or(0),
-        "probe cycle complete"
-    );
+    // Only log at INFO level when the state has changed; otherwise use DEBUG.
+    let changed = state.last_logged_best != best || state.last_logged_healthy != healthy;
+    if changed {
+        info!(
+            pool = %pool.name,
+            healthy,
+            total,
+            best = best.map(|b| b.to_string()).unwrap_or_else(|| "<none>".into()),
+            best_rtt_ms = best_rtt.unwrap_or(0),
+            "probe cycle complete"
+        );
+        state.last_logged_best = best;
+        state.last_logged_healthy = healthy;
+    } else {
+        debug!(
+            pool = %pool.name,
+            healthy,
+            total,
+            "probe cycle complete (no change)"
+        );
+    }
 
     if healthy == 0 && total > 0 {
         warn!(
@@ -1969,49 +2180,55 @@ mod tests {
             candidate(addr, 1, &["ipv4", "second"]),
         ];
         let state = state_with(&[(addr, Some(20), false)]);
-        let order = reorder_with_hysteresis(&[], &state, &candidates);
+        let timing = ProbeTiming {
+            interval: Duration::from_secs(300),
+            degraded_interval: Duration::from_secs(30),
+            fail_threshold: 2,
+            max_concurrent_probes: 16,
+            score_payload_bytes: 0,
+            throughput_discount: 0.95,
+            kalman_q: 0.01,
+            kalman_r: 0.1,
+        };
+        let order = reorder_with_hysteresis(&[], &state, &timing, &candidates);
         assert_eq!(order, vec![addr.parse::<IpAddr>().unwrap()]);
-    }
-
-    #[test]
-    fn ewma_smooths_a_single_outlier() {
-        let base = Duration::from_millis(20);
-        // One 200ms spike must not move the average anywhere near 200ms.
-        let after = ewma(base, Duration::from_millis(200));
-        assert!(
-            after < Duration::from_millis(90),
-            "a single spike moved the average to {after:?}"
-        );
-        // Repeated high samples do converge upward.
-        let mut v = base;
-        for _ in 0..20 {
-            v = ewma(v, Duration::from_millis(200));
-        }
-        assert!(v > Duration::from_millis(180), "did not converge: {v:?}");
     }
 
     #[test]
     fn hysteresis_margin_ignores_noise_but_yields_to_real_gains() {
         // 1ms apart at 50ms: noise, no overtake.
-        assert!(!beats(Duration::from_millis(49), Duration::from_millis(50)));
+        assert!(!beats(0.049, 0.050));
         // 20% better: overtake.
-        assert!(beats(Duration::from_millis(35), Duration::from_millis(50)));
+        assert!(beats(0.035, 0.050));
         // At sub-millisecond RTTs the absolute floor governs.
-        assert!(!beats(Duration::from_micros(900), Duration::from_millis(1)));
-        assert!(beats(Duration::from_millis(1), Duration::from_millis(10)));
+        assert!(!beats(0.0009, 0.001));
+        assert!(beats(0.001, 0.010));
     }
 
     fn state_with(rtts: &[(&str, Option<u64>, bool)]) -> PoolState {
+        let (tx, rx) = mpsc::unbounded_channel();
         let mut health = HashMap::new();
         for (addr, ms, degraded) in rtts {
-            let mut h = Health::new(Instant::now(), Duration::from_secs(30));
-            h.rtt = ms.map(Duration::from_millis);
+            let mut h = Health::new(
+                Instant::now(),
+                Duration::from_secs(30),
+                DEFAULT_KALMAN_Q,
+                DEFAULT_KALMAN_R,
+            );
+            if let Some(ms) = ms {
+                // Simulate convergence by feeding the same value repeatedly.
+                for _ in 0..30 {
+                    h.kalman.update(Duration::from_millis(*ms));
+                }
+            }
             h.degraded = *degraded;
             health.insert(addr.parse::<IpAddr>().unwrap(), h);
         }
+        drop(tx); // drop the sender so the receiver never blocks
         PoolState {
             health,
-            ..PoolState::new()
+            obs_rx: rx,
+            ..PoolState::new(mpsc::unbounded_channel().1)
         }
     }
 
@@ -2032,7 +2249,17 @@ mod tests {
 
         // Cycle 1: nothing measured yet, so nothing is ranked.
         let mut state = state_with(&[("1.1.1.1", None, false), ("2.2.2.2", None, false)]);
-        recompute_order(&mut state, &candidates);
+        let timing = ProbeTiming {
+            interval: Duration::from_secs(300),
+            degraded_interval: Duration::from_secs(30),
+            fail_threshold: 2,
+            max_concurrent_probes: 16,
+            score_payload_bytes: 0,
+            throughput_discount: 0.95,
+            kalman_q: 0.01,
+            kalman_r: 0.1,
+        };
+        recompute_order(&mut state, &timing, &candidates);
         assert!(state.order.is_empty());
 
         // Cycle 2: 1.1.1.1 measured first and leads.
@@ -2040,8 +2267,30 @@ mod tests {
             .health
             .get_mut(&"1.1.1.1".parse().unwrap())
             .unwrap()
-            .rtt = Some(Duration::from_millis(50));
-        recompute_order(&mut state, &candidates);
+            .kalman
+            .update(Duration::from_millis(50));
+        for _ in 0..29 {
+            state
+                .health
+                .get_mut(&"1.1.1.1".parse().unwrap())
+                .unwrap()
+                .kalman
+                .update(Duration::from_millis(50));
+        }
+        recompute_order(
+            &mut state,
+            &ProbeTiming {
+                interval: Duration::from_secs(300),
+                degraded_interval: Duration::from_secs(30),
+                fail_threshold: 2,
+                max_concurrent_probes: 16,
+                score_payload_bytes: 0,
+                throughput_discount: 0.95,
+                kalman_q: 0.01,
+                kalman_r: 0.1,
+            },
+            &candidates,
+        );
         assert_eq!(
             state.order,
             vec!["1.1.1.1".parse::<IpAddr>().unwrap()],
@@ -2050,12 +2299,25 @@ mod tests {
 
         // Cycle 3: 2.2.2.2 arrives 1ms faster. Stored order + margin means the
         // leader holds; without storage this would flip to a bare sort.
-        state
-            .health
-            .get_mut(&"2.2.2.2".parse().unwrap())
-            .unwrap()
-            .rtt = Some(Duration::from_millis(49));
-        recompute_order(&mut state, &candidates);
+        for _ in 0..30 {
+            state
+                .health
+                .get_mut(&"2.2.2.2".parse().unwrap())
+                .unwrap()
+                .kalman
+                .update(Duration::from_millis(49));
+        }
+        let timing = ProbeTiming {
+            interval: Duration::from_secs(300),
+            degraded_interval: Duration::from_secs(30),
+            fail_threshold: 2,
+            max_concurrent_probes: 16,
+            score_payload_bytes: 0,
+            throughput_discount: 0.95,
+            kalman_q: 0.01,
+            kalman_r: 0.1,
+        };
+        recompute_order(&mut state, &timing, &candidates);
         assert_eq!(
             state.order.first(),
             Some(&"1.1.1.1".parse::<IpAddr>().unwrap()),
@@ -2063,12 +2325,15 @@ mod tests {
         );
 
         // Cycle 4: a decisive gain does take the lead.
-        state
-            .health
-            .get_mut(&"2.2.2.2".parse().unwrap())
-            .unwrap()
-            .rtt = Some(Duration::from_millis(20));
-        recompute_order(&mut state, &candidates);
+        for _ in 0..30 {
+            state
+                .health
+                .get_mut(&"2.2.2.2".parse().unwrap())
+                .unwrap()
+                .kalman
+                .update(Duration::from_millis(20));
+        }
+        recompute_order(&mut state, &timing, &candidates);
         assert_eq!(
             state.order.first(),
             Some(&"2.2.2.2".parse::<IpAddr>().unwrap()),
@@ -2086,7 +2351,17 @@ mod tests {
         ];
         let state = state_with(&[("1.1.1.1", Some(50), false), ("2.2.2.2", Some(49), false)]);
         let prev = vec!["1.1.1.1".parse().unwrap()];
-        let order = reorder_with_hysteresis(&prev, &state, &candidates);
+        let timing = ProbeTiming {
+            interval: Duration::from_secs(300),
+            degraded_interval: Duration::from_secs(30),
+            fail_threshold: 2,
+            max_concurrent_probes: 16,
+            score_payload_bytes: 0,
+            throughput_discount: 0.95,
+            kalman_q: 0.01,
+            kalman_r: 0.1,
+        };
+        let order = reorder_with_hysteresis(&prev, &state, &timing, &candidates);
         assert_eq!(
             order[0],
             "1.1.1.1".parse::<IpAddr>().unwrap(),
@@ -2095,7 +2370,7 @@ mod tests {
 
         // A decisive gain does flip it.
         let state = state_with(&[("1.1.1.1", Some(50), false), ("2.2.2.2", Some(20), false)]);
-        let order = reorder_with_hysteresis(&prev, &state, &candidates);
+        let order = reorder_with_hysteresis(&prev, &state, &timing, &candidates);
         assert_eq!(order[0], "2.2.2.2".parse::<IpAddr>().unwrap());
     }
 
@@ -2111,7 +2386,17 @@ mod tests {
             ("2.2.2.2", Some(30), false),
             ("3.3.3.3", None, false), // never measured
         ]);
-        let order = reorder_with_hysteresis(&[], &state, &candidates);
+        let timing = ProbeTiming {
+            interval: Duration::from_secs(300),
+            degraded_interval: Duration::from_secs(30),
+            fail_threshold: 2,
+            max_concurrent_probes: 16,
+            score_payload_bytes: 0,
+            throughput_discount: 0.95,
+            kalman_q: 0.01,
+            kalman_r: 0.1,
+        };
+        let order = reorder_with_hysteresis(&[], &state, &timing, &candidates);
         assert_eq!(order, vec!["2.2.2.2".parse::<IpAddr>().unwrap()]);
     }
 
@@ -2121,13 +2406,44 @@ mod tests {
     fn degraded_backoff_doubles_and_caps() {
         let interval = Duration::from_secs(300);
         let base = Duration::from_secs(30);
-        let mut h = Health::new(Instant::now(), base);
+        let mut h = Health::new(Instant::now(), base, DEFAULT_KALMAN_Q, DEFAULT_KALMAN_R);
+
+        for i in 0..5 {
+            h.record_failure(2, interval, base);
+            if i == 1 {
+                // After the second failure (threshold = 2), it becomes degraded
+                // and backoff starts at base.
+                assert!(h.degraded);
+                assert_eq!(h.backoff, base);
+            }
+        }
+        // After repeated failures, backoff should have doubled: 30 → 60 → 120 → 240.
+        // The final doubling would be 480, but that exceeds the 300s cap.
+        assert_eq!(h.backoff, Duration::from_secs(240));
+        h.record_failure(2, interval, base);
+        assert_eq!(
+            h.backoff, interval,
+            "backoff must cap at the healthy interval"
+        );
+
+        // A success resets degradation and backoff.
+        h.record_success(Duration::from_millis(25), interval, base);
+        assert!(!h.degraded);
+        assert_eq!(h.backoff, base);
+        let estimated = h.rtt().expect("RTT should be available after convergence");
+        assert!(
+            estimated.as_millis() >= 24 && estimated.as_millis() <= 26,
+            "RTT estimate {estimated:?} should be close to 25ms"
+        );
+
+        // After reset, degradation and doubling restart from scratch.
+        h.record_failure(2, interval, base);
+        assert!(!h.degraded, "one failure below threshold");
+        assert_eq!(h.backoff, base);
 
         h.record_failure(2, interval, base);
-        assert!(!h.degraded, "one failure is below the threshold of 2");
-        h.record_failure(2, interval, base);
-        assert!(h.degraded);
-        assert_eq!(h.backoff, base);
+        assert!(h.degraded, "second failure meets threshold");
+        assert_eq!(h.backoff, base, "newly degraded starts at base");
 
         for expected in [60u64, 120, 240, 300, 300] {
             h.record_failure(2, interval, base);
@@ -2139,7 +2455,7 @@ mod tests {
     fn recovery_clears_degradation_and_resets_backoff() {
         let interval = Duration::from_secs(300);
         let base = Duration::from_secs(30);
-        let mut h = Health::new(Instant::now(), base);
+        let mut h = Health::new(Instant::now(), base, DEFAULT_KALMAN_Q, DEFAULT_KALMAN_R);
         h.record_failure(1, interval, base);
         h.record_failure(1, interval, base);
         assert!(h.degraded);
@@ -2148,7 +2464,11 @@ mod tests {
         assert!(!h.degraded);
         assert_eq!(h.consecutive_failures, 0);
         assert_eq!(h.backoff, base);
-        assert_eq!(h.rtt, Some(Duration::from_millis(25)));
+        let estimated = h.rtt().expect("RTT should be available after convergence");
+        assert!(
+            estimated.as_millis() >= 24 && estimated.as_millis() <= 26,
+            "RTT estimate {estimated:?} should be close to 25ms"
+        );
     }
 
     #[test]

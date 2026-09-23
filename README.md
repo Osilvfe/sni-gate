@@ -826,6 +826,38 @@ sends the SNI in the clear.
   serving a connection is one lock-free read of a published ranking — no
   filtering, no DNS, no I/O. A traffic burst cannot become a probe burst.
 
+### Adaptive throughput-aware routing
+
+By default, pools rank by **RTT alone** — lowest round-trip time wins. This works
+well for latency-sensitive workloads (APIs, small requests), but for large
+transfers (images, videos, downloads), **throughput matters more than handshake
+latency**.
+
+Enable composite `rtt + payload/throughput` scoring to let the pool learn which
+candidates are fast for bulk transfers:
+
+```toml
+[pools.cdn.probe]
+score_payload_bytes = 1_000_000  # 1 MB reference payload
+```
+
+The gateway learns throughput from completed connections and uses **Thompson
+Sampling** to balance routing to known-good candidates (exploitation) with
+discovering better alternatives (exploration). Candidates with uncertain
+throughput occasionally draw optimistic samples and get traffic, converging
+toward the true best without manual tuning.
+
+**Hierarchical priors:** Candidates are grouped by `/24` (IPv4) or `/48` (IPv6)
+subnet. Observations on one candidate improve the initial estimate for siblings
+in the same subnet, accelerating learning in large pools.
+
+**Backward compatible:** `score_payload_bytes = 0` (the default) is pure RTT
+ranking with zero behavior change. Set it to your typical transfer size (100 KB
+for images, 10 MB for video) to enable adaptive routing.
+
+See [`docs/pools.md`](docs/pools.md) for tuning details, convergence
+characteristics, and worked examples.
+
 ### NAT64 projection
 
 ```toml

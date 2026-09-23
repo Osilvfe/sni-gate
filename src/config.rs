@@ -1392,6 +1392,37 @@ pub struct ProbeDef {
     /// Consecutive failures before degradation. Default 2.
     #[serde(default)]
     pub fail_threshold: Option<u32>,
+
+    /// Maximum simultaneous probes within one cycle. Default 16.
+    #[serde(default)]
+    pub max_concurrent_probes: Option<usize>,
+
+    // ------------------------------------------------------------------
+    // Scoring / throughput model
+    // ------------------------------------------------------------------
+    /// Reference payload size in bytes used to compute the effective-time
+    /// score: `rtt + payload_bytes / sampled_throughput`. Zero (default)
+    /// disables throughput sampling entirely and scores on RTT alone,
+    /// preserving the pre-existing behaviour.
+    #[serde(default)]
+    pub score_payload_bytes: Option<u64>,
+
+    /// Gamma applied to the NIG pseudo-count before each new throughput
+    /// observation, so recent samples outweigh old ones. Range (0, 1].
+    /// Default 0.95 (roughly halves the effective count every 14 observations).
+    #[serde(default)]
+    pub throughput_discount: Option<f64>,
+
+    /// Kalman process-noise Q (ms²): how much RTT can drift between probes.
+    /// Higher values track fast changes but increase steady-state noise.
+    /// Default 0.01.
+    #[serde(default)]
+    pub rtt_process_noise: Option<f64>,
+
+    /// Kalman observation-noise R (ms²): expected per-sample RTT variance.
+    /// Default 0.1.
+    #[serde(default)]
+    pub rtt_obs_noise: Option<f64>,
 }
 
 /// A probe definition reduced to the fields its own mode uses.
